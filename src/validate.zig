@@ -12,8 +12,10 @@
 //!  - **Mandatory keywords** — presence, the leading order (`SIMPLE`/`XTENSION`, then `BITPIX`,
 //!    `NAXIS`, `NAXIS1..NAXISn`), and that there is **no duplicate** of a mandatory keyword
 //!    (§4.2.1.1); a duplicate of a non-mandatory value keyword is a `warning`.
-//!  - **Value ranges** — `BITPIX` in {8,16,32,64,-32,-64}; `NAXISn` non-negative; `GCOUNT`
-//!    positive; and `BLANK` only with a **positive** (integer) `BITPIX` (§4.4.2.5/§5.3).
+//!  - **Value ranges** — `BITPIX` in {8,16,32,64,-32,-64}; `GCOUNT` positive; and `BLANK` only
+//!    with a **positive** (integer) `BITPIX` (§4.4.2.5/§5.3). (`NAXISn` non-negativity is
+//!    already enforced at HDU parse — `hdu.axes` is `u64` — so a negative value cannot reach
+//!    `verify`.)
 //!  - **Table geometry** — binary tables: `NAXIS1` equals the summed `TFORM` field widths;
 //!    ASCII tables: each `TBCOLn-1 + width <= NAXIS1` (`NAXIS1` MAY exceed the field extent).
 //!  - **Declared vs actual size** — the padded data unit does not run past the device length.

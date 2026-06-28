@@ -34,6 +34,19 @@ jobs:
       - run: zig build test --summary all
       - run: zig build        # static library artifact
 
+  windows-aarch64-cross:
+    name: windows-aarch64 cross-compile (NFR-PORT-1, design §24.3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # No hosted Windows/aarch64 runner, so cross-compile the library for aarch64-windows to
+      # keep that {os,arch} cell of the portability matrix exercised (it type-checks the full
+      # OS-adjacent path for the target; the binary cannot be executed on this host).
+      - run: zig build -Dtarget=aarch64-windows
+
   wasm-freestanding:
     name: wasm32-freestanding core build (NFR-PORT-3)
     runs-on: ubuntu-latest

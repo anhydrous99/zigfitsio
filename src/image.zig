@@ -59,7 +59,7 @@ const CHUNK_ELEMS: usize = 4096; // elements per streamed chunk
 /// Transfer direction for the section walk.
 const Dir = enum { read, write };
 
-/// Errors produced by image operations. The structural-redefinition path (`reshape`, IMG-7)
+/// Errors produced by image operations. The structural-redefinition path (`reshape`, FR-IMG-10)
 /// edits header cards and re-lands the geometry through the file handle, so this set also
 /// folds in `HeaderError`/`ValueError`/`Allocator.Error` (it then equals `Fits.FitsError`).
 pub const ImageError = errors.StructError || errors.IoError || errors.ConvError ||
@@ -96,7 +96,7 @@ pub const ImageView = struct {
         return of(fits, hdu) catch unreachable;
     }
 
-    /// Resize / redefine this image's data array in place (IMG-7, FR-IMG-7; §4.4.1.1, §3.3.2).
+    /// Resize / redefine this image's data array in place (FR-IMG-10; §4.4.1.1, §3.3.2).
     ///
     /// Rewrites the structural keywords `BITPIX`/`NAXIS`/`NAXISn` on the HDU's header to the
     /// requested `new_bitpix` and `new_axes` (most-rapidly-varying first), then re-lands the new

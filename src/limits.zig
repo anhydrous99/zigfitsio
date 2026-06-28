@@ -70,7 +70,8 @@ const testing = std.testing;
 test "defaults are sane and overridable" {
     const d: Limits = .{};
     // Invariant: max_matches must stay ≤ name.MAX_MATCHES (4096), the comptime inline
-    // capacity. That cross-module assertion lives in header/name.zig once it exists.
+    // capacity. That cross-module assertion lives in header/name.zig (the comptime block
+    // guarding `MAX_MATCHES`).
     try testing.expect(d.max_matches <= 4096);
     const custom: Limits = .{ .max_naxis_product = 1024 };
     try testing.expectEqual(@as(u64, 1024), custom.max_naxis_product);

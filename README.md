@@ -19,6 +19,7 @@ backlog.
 zig build              # build the static library
 zig build test         # run the test suite
 zig build bench        # throughput benchmarks
+zig build fitsverify   # run the structural-validation CLI demo
 zig build fuzz         # fuzz the header/table parsers
 zig build wasm-check   # compile the core for wasm32-freestanding
 ```
@@ -37,10 +38,28 @@ exe.root_module.addImport("zigfitsio", fits.module("zigfitsio"));
 
 ## Status
 
-Under active development. The foundation (I/O layer, errors, endianness, numeric
-conversion, headers, HDU model, image core) lands first (milestone **M0**); core tables,
-variable-length arrays, scaling, and checksums follow (**M1**). See `tasks.md` for the
-milestone breakdown.
+Feature-complete and tested (429 tests green). Implemented end to end:
+
+- **Foundation:** I/O layer (in-memory, file, stream/gzip, and HTTP backends), typed
+  error sets, big-endian access, numeric-conversion policy, resource limits.
+- **Headers:** value parsing (null/empty/undefined distinction), 80-byte cards, full
+  read + edit operations, header-space pre-allocation, `CONTINUE` long strings,
+  `HIERARCH` long names, and complex-valued cards.
+- **HDUs & data:** HDU model with navigation/mutation; `ImageView` over all six `BITPIX`
+  with scaling, nulls, and strided sections; ASCII and binary tables (all `TFORM` codes,
+  `TDIM`, scaling, nulls); variable-length arrays with a compacting heap.
+- **WCS:** keyword set parse/serialize plus celestial (`TAN`/`SIN`/`ARC`/`STG`/`ZEA`/`CAR`),
+  spectral, and time-coordinate transforms.
+- **Compression:** GZIP_1/2, RICE_1, PLIO_1, and HCOMPRESS_1 tiled read **and** write,
+  with subtractive dithering; tile-compressed-table (`ZTABLE`) reading.
+- **Integrity & validation:** `DATASUM`/`CHECKSUM` compute/update/verify; a
+  `fitsverify`-style structural pass.
+- **Convenience:** CFITSIO-style extended filenames, ASCII header templates, hierarchical
+  grouping tables, and a transparent `.fits.gz` open path.
+
+The only remaining gap is **byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity** for
+the codecs, checksum, and WCS (verified by lossless self round-trip in the meantime); it
+needs an external CFITSIO/Astropy toolchain. See `tasks.md` for the milestone breakdown.
 
 ## Examples
 

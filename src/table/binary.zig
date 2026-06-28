@@ -14,8 +14,10 @@
 //!     real/imaginary scalar slots in the caller's buffer).
 //!   - `A` char: decode terminates at the first NUL, encode pads with spaces; a leading NUL is
 //!     a null string (FR-BTB-7). The non-standard `rAw` substring shorthand is out of scope.
-//!   - `P`/`Q` descriptors are parsed into a column but following them into the heap is phase 2
-//!     (VLA-1/`heap.zig`); access on such a column returns `error.BadDescriptor`.
+//!   - `P`/`Q` descriptors are parsed into a column and followed into the heap via
+//!     `table/heap.zig` (`readVlaCell`/`writeVlaCell`/`HeapManager`/`compact`, VLA-1). This
+//!     view's fixed-width scalar/bulk accessors return `error.BadDescriptor` for such a column;
+//!     callers reach the variable-length data through the `heap.zig` cell API.
 //!
 //! Scaling/nulls (FR-BTB-4): physical = `TZERO + TSCAL × stored`. When `TSCAL == 1` and
 //! `TZERO` is integral, the offset is applied in integer (`i128`) space so the CFITSIO

@@ -18,7 +18,9 @@
 //! (`NFR-INTEROP-1`). The write path (`writeCompressed`) emits GZIP for any BITPIX and RICE/PLIO/
 //! HCOMPRESS for integer 8/16/32-bit images. All declared sizes are validated against `Limits` and
 //! the device length before allocating (`NFR-SAFE-1`); a tile that decodes to the wrong size is
-//! `error.CorruptTile`.
+//! `error.CorruptTile`. `PLIO_1` uses the standard pixel-list wire format (FITS 4.0 Table 38)
+//! and `HCOMPRESS_1` the standard H-transform stream (White 1992); both round-trip losslessly
+//! here, with byte-exact CFITSIO parity pending external tools.
 //!
 //! Resolved spec ambiguities (no external toolchain here; correctness is proven by lossless
 //! write→read round-trips, `NFR-INTEROP-1`):
@@ -57,18 +59,21 @@ const Matches = @import("../header/name.zig").Matches;
 const Allocator = std.mem.Allocator;
 const native_endian = builtin.cpu.arch.endian();
 
-/// The tile compression algorithm named by `ZCMPTYPE`. Only `gzip_1`/`gzip_2` are decoded by
-/// this module; the rest are recognized (so they can be reported precisely) but unimplemented.
+/// The tile compression algorithm named by `ZCMPTYPE`. `gzip_1`/`gzip_2`, `rice_1`, `plio_1`
+/// and `hcompress_1` are all decoded **and** encoded on the tiled path; only an unrecognized
+/// name maps to `.unknown` (reported precisely as `error.UnsupportedCodec`).
 pub const Codec = enum {
     /// `GZIP_1`: gzip over the raw big-endian stored values.
     gzip_1,
     /// `GZIP_2`: gzip over the MSB-first type-aware byte shuffle of the stored values.
     gzip_2,
-    /// `RICE_1` (unimplemented in the read path — M3).
+    /// `RICE_1`: Rice-coded blocks (`rice.zig`), read+write.
     rice_1,
-    /// `PLIO_1` (unimplemented in the read path — M3).
+    /// `PLIO_1`: IRAF pixel-list run encoding in the standard wire format (Table 38, `plio.zig`),
+    /// read+write; byte-exact CFITSIO parity pending external tools.
     plio_1,
-    /// `HCOMPRESS_1` (unimplemented in the read path — M3).
+    /// `HCOMPRESS_1`: H-transform image compression in the standard wire format (White 1992,
+    /// `hcompress.zig`), read+write; byte-exact CFITSIO parity pending external tools.
     hcompress_1,
     /// An unrecognized `ZCMPTYPE` value.
     unknown,

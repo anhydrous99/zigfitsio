@@ -419,8 +419,11 @@ pub const Device = struct {
     // thin methods forwarding to vtable, asserting full reads/writes
 };
 
-// io/stream.zig — sequential only
-pub const Stream = struct { /* read/write/finish over std.Io.Reader/Writer */ };
+// io/stream.zig — sequential only: free functions over std.Io.Reader/Writer, no struct.
+// e.g. materialize(reader)→[]u8, drainAll(writer, bytes), and the gzip helpers
+// materializeGzip / compressToGzip / inflateGzipToDevice / compressDeviceToGzip.
+pub fn materialize(alloc: Allocator, reader: *std.Io.Reader, max_bytes: u64) ![]u8 { ... }
+pub fn drainAll(writer: *std.Io.Writer, bytes: []const u8) IoError!void { ... }
 ```
 
 **Why position-explicit (pread/pwrite) rather than stateful seek+read?** It makes random
@@ -434,8 +437,8 @@ the friendliest shape for concurrent reads of distinct ranges from one file
 | Backend | File | Capability | Notes |
 |---------|------|-----------|-------|
 | memory | `io/memory.zig` | `Device` (r/w, growable) | `[]u8` or `ArrayList`-backed; the **freestanding/WASM** path (`NFR-PORT-3`); also the in-memory buffer of `FR-RMT-1`. |
-| file | `io/file.zig` | `Device` (r/w) | wraps `std.fs.File` (`pread`/`pwrite`/`stat`/`setEndPos`); 64-bit offsets (`FR-IO-6`). |
-| stream | `io/stream.zig` | `Stream` | stdin/stdout (`FR-RMT-1`); also the output side of whole-file gzip. |
+| file | `io/file.zig` | `Device` (r/w) | wraps `std.Io.File` (`readPositionalAll`/`writePositionalAll`/`length`/`setLength`) driven by a `std.Io.Threaded` implementation; 64-bit offsets (`FR-IO-6`). |
+| stream | `io/stream.zig` | free functions over `std.Io.Reader`/`Writer` | stdin/stdout (`FR-RMT-1`); also the output side of whole-file gzip. |
 | gzip-file | `io/stream.zig` + `std.compress.flate` | `Stream` in, materialize to `Device` | `.fits.gz` (`FR-RMT-2`): decompress into a memory `Device` for random access; compress on flush. |
 | http | `io/http.zig` | `Device` (read-only) via Range GET | `std.http` (TLS 1.3 only); falls back to full download into memory `Device` if server lacks range support (`FR-RMT-3`). |
 
@@ -497,6 +500,7 @@ with free text in bytes 9–80 and is **preserved, never rejected**.
 ```zig
 fn classify(name: Name, b9: u8, b10: u8) Card.Kind {
     if (name.isEnd()) return .end;
+    if (name.isContinue()) return .continuation;         // CONTINUE long-string card
     if (name.isCommentaryName()) return .commentary;     // COMMENT/HISTORY/blank
     if (b9 == '=' and b10 == ' ') return .value;
     if (name.isBlank()) return .blank;
@@ -539,11 +543,12 @@ the value.
 
 ### 9.3 CONTINUE, HIERARCH, units (`FR-HDR-8/9/10`)
 
-- **CONTINUE** (`FR-HDR-8`): on read, a string value whose card ends with `&` is assembled
-  across following `CONTINUE` cards into one logical owned string (bounded by
-  `Limits.max_string_value`). On write, `continue.zig` splits a >68-char string back into
-  a primary card + `CONTINUE` cards. The assembled value is what the value API returns;
-  the raw cards remain available for byte-exact round-trip.
+- **CONTINUE** (`FR-HDR-8`): wired into the `Header` long-string API. On read,
+  `Header.getLongString` assembles a string value whose card ends with `&` across the
+  following `CONTINUE` cards into one logical owned string (bounded by
+  `Limits.max_string_value`). On write, `Header.appendLongString` uses `continue.zig` to
+  split a >68-char string back into a primary card + `CONTINUE` cards. The raw cards remain
+  available for byte-exact round-trip.
 - **HIERARCH** (`FR-HDR-9`, P2): `hierarch.zig` parses `HIERARCH a b c = val` long/hierarchical
   names. `Name` carries an optional long form; lookups accept either the HIERARCH spelling
   or the spaced token form.
@@ -555,18 +560,18 @@ the value.
 ```zig
 // header/header.zig
 pub const Header = struct {
-    cards: std.ArrayList(Card),                 // ordered; round-trip fidelity
-    index: NameIndex,                                    // case-insensitive name → card positions
+    cards: std.ArrayList(Card) = .empty,        // ordered; round-trip fidelity; lookups linear-scan it
     inherit: ?*const Header = null,                      // INHERIT fall-through (FR-HDR-14)
 
     // read
     pub fn get(self, name: []const u8) ValueError!*const Card;
     pub fn getValue(self, comptime T: type, name: []const u8) (ValueError||ConvError)!T;
-    pub fn card(self, n: usize) *const Card;             // nth card (FR-HDR-11)
+    pub fn getLongString(self, a: Allocator, name: []const u8) ![]u8; // assembles CONTINUE (FR-HDR-8)
+    pub fn at(self, n: usize) *const Card;               // nth card (FR-HDR-11)
     pub fn find(self, pattern: []const u8, out: *Matches) void;  // wildcards; sets out.overflow if truncated
-    pub fn findAlloc(self, a: Allocator, pattern: []const u8) Allocator.Error![]u32; // complete list (FR-UTL-4)
     // write
     pub fn append(self, a: Allocator, c: Card) !void;
+    pub fn appendLongString(self, a: Allocator, name: []const u8, str: []const u8, comment: ?[]const u8) !void; // splits to CONTINUE (FR-HDR-8)
     pub fn update(self, a: Allocator, name: []const u8, v: KeywordValue, comment: ?[]const u8) !void; // create-if-absent
     pub fn insert(self, a: Allocator, at: usize, c: Card) !void;
     pub fn delete(self, name: []const u8) ValueError!void;
@@ -576,9 +581,9 @@ pub const Header = struct {
 ```
 
 `END` is mandatory: the scanner reads cards until it finds the `END` card; a header that
-reaches its block budget without one is `error.MissingEnd` (`FR-HDR-7`). `NameIndex` is a
-case-insensitive multimap (normalized 8-byte key → list of positions) giving O(1) average
-lookup while preserving the ordered card list for serialization. Numeric reads go through
+reaches its block budget without one is `error.MissingEnd` (`FR-HDR-7`). Lookups are a
+case-insensitive **linear scan** of the (typically small) ordered card list — no separate
+name index — which keeps the model simple and serialization order authoritative. Numeric reads go through
 `convert.cast(T, …, .scalar)` (`FR-HDR-13`). Header-space pre-allocation
 (`reserveSpace`, `FR-HDR-12`) appends blank cards before `END` so later `update` calls can
 fill them in place without rewriting following HDUs.
@@ -697,12 +702,14 @@ by a comptime parameter, with `convert` bridging the two (`FR-IMG-9`).
 ```zig
 // image.zig
 pub const ImageView = struct {
-    fits: *Fits, hdu: *Hdu,                       // *Hdu is stable (individually allocated,
-                                                  // §10.3) — valid until close or HDU delete
-    bitpix: i8, naxis: u16, axes: []const u64,    // NAXIS 0..999 (FR-IMG-2)
-    scaling: Scaling,                              // BZERO/BSCALE/BLANK state
-    pub fn dims(self) []const u64;                 // per-axis sizes (FR-IMG-9)
-    pub fn elementType(self) StoredType;
+    fits: *Fits, hdu: *Hdu,                       // a thin delegating view; *Hdu is stable
+                                                  // (individually allocated, §10.3) — valid
+                                                  // until close or HDU delete
+    pub fn of(fits: *Fits, hdu: *Hdu) StructError!ImageView; // also resolves a tiled-compressed
+                                                  // BINTABLE to a transparent compressed-image view (§17)
+    pub fn bitpix(self) i64;                       // structural keywords read on demand from hdu.header
+    pub fn dims(self) []const u64;                 // per-axis sizes, NAXIS 0..999 (FR-IMG-2/9)
+    pub fn elementCount(self) u64;                 // product of dims()
 };
 ```
 
@@ -889,9 +896,10 @@ strings from `rPA`/`rQA` (§14). The non-standard CFITSIO `rAw` substring shorth
 ### 13.4 Row buffering & MultiArrayList
 
 Row data is read in block-aligned spans of whole rows into a scratch window; columnar
-extraction strides across rows in that window. For builders, an optional
-`std.MultiArrayList`-backed row staging buffer lets callers assemble rows column-wise
-before a single block-aligned flush (`NFR-PERF-1`).
+extraction strides across rows in that window. A `std.MultiArrayList`-backed row staging
+buffer for column-wise builders is a **future** convenience — it is **not implemented**
+(no `MultiArrayList` is used today); variable-length payloads are handled separately by the
+heap manager in `table/heap.zig` (§14).
 
 ---
 
@@ -973,11 +981,13 @@ new files), routed through the same block/scaling machinery.
   byte placement is part of the accumulated checksum.
 
 ```zig
-pub fn datasum(reader: *BlockReader, data_off: u64, padded_bytes: u64) !u32; // padded_bytes = ⌈data/2880⌉×2880, fill summed
-pub fn encodeChecksum(complement: u32, out: *[16]u8) void;                    // ASCII form
-pub fn decodeChecksum(card: *const [16]u8) u32;
+pub fn datasum(fits: *Fits, hdu: *Hdu) IoError!u32;          // sums the padded data unit, fill included
+pub fn encodeChecksum(value: u32, out: *[16]u8) void;        // ASCII form
+pub fn decodeChecksum(card16: *const [16]u8) u32;
 pub const Verify = enum { match, mismatch, not_present };
-pub fn verify(hdu: *Hdu, fits: *Fits) ChecksumError!struct { sum: Verify, data: Verify };
+pub const Report = struct { sum: Verify, data: Verify };     // CHECKSUM / DATASUM outcomes
+pub fn verify(fits: *Fits, hdu: *Hdu) VerifyError!Report;
+pub fn update(fits: *Fits, hdu: *Hdu) UpdateError!void;      // writes DATASUM then CHECKSUM (FR-SUM-3)
 ```
 
 **Accumulation.** The 32-bit sum is the CFITSIO `ff_csum` form: walk the (padded) unit in
@@ -1086,14 +1096,20 @@ pub const Wcs = struct {
 
 ### 18.2 Transforms (`FR-WCS-2/3/4`)
 
-`wcs/celestial.zig` provides pixel↔world transforms for the common projections (TAN, SIN,
-ARC, STG, ZEA, AIT, CAR, MER, …), using the linear `PC/CD`+`CDELT` step, the projection's
-plane↔native-spherical math, then the spherical rotation parameterized by
-`LONPOLEa`/`LATPOLEa`, with `RADESYSa`/`EQUINOXa` selecting the frame (`FR-WCS-2`):
+`wcs/celestial.zig` provides pixel↔world transforms for the implemented projections — the
+zenithal family `TAN`, `SIN`, `ARC`, `STG`, `ZEA` plus the plate carrée `CAR` — using the
+linear `PC/CD`+`CDELT` step, the projection's plane↔native-spherical math, then the
+spherical rotation parameterized by `LONPOLEa`/`LATPOLEa`, with `RADESYSa`/`EQUINOXa`
+selecting the frame (`FR-WCS-2`). Other projections (e.g. `AIT`, `MER`) are **future** work
+behind the same extensible registry; an unimplemented code is `error.UnsupportedProjection`.
+The transforms hang off a `Celestial` value built from a parsed `Wcs`:
 
 ```zig
-pub fn pixelToWorld(self: *const Wcs, pix: []const f64, world: []f64) WcsError!void;
-pub fn worldToPixel(self: *const Wcs, world: []const f64, pix: []f64) WcsError!void;
+pub const Celestial = struct {
+    pub fn fromWcs(w: *const Wcs) WcsError!Celestial;
+    pub fn pixelToWorld(self: *const Celestial, pix: [2]f64) WcsError![2]f64;
+    pub fn worldToPixel(self: *const Celestial, world: [2]f64) WcsError![2]f64;
+};
 ```
 
 Spectral keywords (`CTYPEn` spectral types, `RESTFRQ`, `RESTWAV`, `SPECSYS`) are handled in
@@ -1299,7 +1315,7 @@ try tbl.readColumn(f64, .{ .index = col }, 0, flux, .{ .scaling = .apply });
 ### 21.4 Verify checksums (FR-SUM-2)
 
 ```zig
-const r = try fits.checksum.verify(f.current(), &f);
+const r = try fits.checksum.verify(&f, f.current());
 if (r.sum == .mismatch or r.data == .mismatch) return error.ChecksumMismatch;
 ```
 

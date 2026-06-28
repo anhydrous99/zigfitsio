@@ -72,7 +72,7 @@ Every task must satisfy all of these before it is `done`:
 ## Milestone M0 — Foundation (P0)
 
 ### SETUP-1 — Build scaffolding & module skeleton
-- **Milestone:** M0 · **Module:** `build.zig`, `build.zig.zon`, `src/root.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `build.zig`, `build.zig.zon`, `src/root.zig` · **Size:** M · **Status:** done
 - **Depends on:** _(none)_
 - **Req:** GC-1, GC-2, GC-3, NFR-BUILD-1, NFR-BUILD-2, NFR-API-2 · **Design:** §3, §24 · **Spec:** §3.1
 - **Goal:** A buildable, dependency-free Zig package with the §3 source tree stubbed.
@@ -85,7 +85,7 @@ Every task must satisfy all of these before it is `done`:
   run `zig build` once and paste the value it reports.
 
 ### ERR-1 — Error sets & umbrella `Error`
-- **Milestone:** M0 · **Module:** `src/errors.zig` · **Size:** S · **Status:** todo · **Module-lock:** errors.zig
+- **Milestone:** M0 · **Module:** `src/errors.zig` · **Size:** S · **Status:** done · **Module-lock:** errors.zig
 - **Depends on:** SETUP-1
 - **Req:** FR-ERR-1, FR-ERR-2, GC-4 · **Design:** §4.1
 - **Goal:** Every area-scoped error set + the composed `Error` umbrella (§4.1), folding in
@@ -93,7 +93,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** a compile test asserts the sets compose with `||` and no signature needs `anyerror`.
 
 ### ERR-2 — Diagnostics context
-- **Milestone:** M0 · **Module:** `src/diag.zig` · **Size:** S · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/diag.zig` · **Size:** S · **Status:** done
 - **Depends on:** ERR-1
 - **Req:** FR-ERR-3 · **Design:** §4.3
 - **Goal:** Opt-in `Diagnostics` recording the most-recent failure (offset/keyword/HDU/inline card text),
@@ -102,14 +102,14 @@ Every task must satisfy all of these before it is `done`:
   populated record via `render(*std.Io.Writer)`.
 
 ### ERR-3 — Version & error-message text
-- **Milestone:** M0 · **Module:** `src/version.zig` · **Size:** S · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/version.zig` · **Size:** S · **Status:** done
 - **Depends on:** ERR-1
 - **Req:** FR-UTL-3 · **Design:** §4.3, §19.1
 - **Goal:** `version()` and a stable `errorText(err)` for every `Error`.
 - **Acceptance:** exhaustive switch test asserts a non-empty message per error value.
 
 ### LIM-1 — Limits & validate-before-allocate helper
-- **Milestone:** M0 · **Module:** `src/limits.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/limits.zig` · **Size:** M · **Status:** done
 - **Depends on:** ERR-1
 - **Req:** NFR-SAFE-1, GC-6 · **Design:** §7.2 · **Spec:** §3.1, §4.4.1, §7.3.5
 - **Goal:** The `Limits` struct (defaults + per-handle override) and the single size-validation helper
@@ -118,7 +118,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** overflowing `NAXISn` products / `PCOUNT` yield a typed error *before* any allocation.
 
 ### END-1 — Endianness module
-- **Milestone:** M0 · **Module:** `src/endian.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/endian.zig` · **Size:** M · **Status:** done
 - **Depends on:** SETUP-1
 - **Req:** GC-5, NFR-PORT-2, NFR-PERF-2 · **Design:** §7.1 · **Spec:** §3.3.2, §5
 - **Goal:** Typed big-endian `read`/`write` + vectorized in-place `swapToNative` (floats via int repr;
@@ -127,7 +127,7 @@ Every task must satisfy all of these before it is `done`:
   results (the genuine native big-endian path is exercised by the X-CI big-endian cell).
 
 ### CONV-1 — Numeric-conversion policy
-- **Milestone:** M0 · **Module:** `src/convert.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/convert.zig` · **Size:** M · **Status:** done
 - **Depends on:** ERR-1
 - **Req:** FR-CONV-1, FR-CONV-2, GC-6, NFR-PERF-2 · **Design:** §6 · **Spec:** §4.2.3–4.2.4, §5.2
 - **Goal:** The single `cast(comptime Dst, src, mode)` — `Mode{scalar,bulk}`; range-check before
@@ -137,7 +137,7 @@ Every task must satisfy all of these before it is `done`:
   `i64→f64`, `NaN→int`; documents the CFITSIO `(x±0.5)` divergence.
 
 ### IO-1 — `Device` vtable (seekable)
-- **Milestone:** M0 · **Module:** `src/io/device.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/io/device.zig` · **Size:** M · **Status:** done
 - **Depends on:** ERR-1
 - **Req:** FR-IO-3, FR-IO-5, FR-IO-6, GC-7 · **Design:** §8.1 · **Spec:** §3.1, §3.6
 - **Goal:** Position-explicit `pread`/`pwrite` device behind a vtable; null `pwrite` ⇒ read-only;
@@ -145,7 +145,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** read-only device ⇒ `NotWritable`; >2 GiB offsets exercised in a mock.
 
 ### IO-2 — `Stream` vtable (sequential)
-- **Milestone:** M0 · **Module:** `src/io/stream.zig` · **Size:** S · **Status:** todo · **Module-lock:** io/stream.zig
+- **Milestone:** M0 · **Module:** `src/io/stream.zig` · **Size:** S · **Status:** done · **Module-lock:** io/stream.zig
 - **Depends on:** ERR-1
 - **Req:** FR-IO-3, FR-RMT-1, GC-7 · **Design:** §8.1 · **Spec:** §3.6
 - **Goal:** Sequential-only stream over `std.Io.Reader`/`Writer` (stdin/stdout) + the
@@ -153,7 +153,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** stdin→memory-`Device` materialization round-trips a buffer.
 
 ### IO-3 — In-memory backend
-- **Milestone:** M0 · **Module:** `src/io/memory.zig` · **Size:** S · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/io/memory.zig` · **Size:** S · **Status:** done
 - **Depends on:** IO-1
 - **Req:** FR-IO-3, FR-RMT-1, NFR-PORT-3 · **Design:** §8.1 · **Spec:** §3.1
 - **Goal:** Growable `[]u8`/`ArrayList`-backed `Device` — the freestanding/WASM path and the `FR-RMT-1`
@@ -161,14 +161,14 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** `@memcpy` pread/pwrite; grows on `setSize`; usable with no OS file access.
 
 ### IO-4 — File backend
-- **Milestone:** M0 · **Module:** `src/io/file.zig` · **Size:** S · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/io/file.zig` · **Size:** S · **Status:** done
 - **Depends on:** IO-1
 - **Req:** FR-IO-3, FR-IO-5, FR-IO-6 · **Design:** §8.1 · **Spec:** §3.1
 - **Goal:** `std.fs.File`-backed `Device` (`pread`/`pwrite`/`stat`/`setEndPos`), 64-bit offsets.
 - **Acceptance:** create→write→reopen→read round-trip; read-only open rejects writes.
 
 ### IO-5 — Block model & buffering
-- **Milestone:** M0 · **Module:** `src/io/block.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/io/block.zig` · **Size:** L · **Status:** done
 - **Depends on:** IO-1, LIM-1
 - **Req:** FR-IO-1, FR-IO-2, FR-IO-4, NFR-PERF-1, NFR-PERF-3 · **Design:** §8.2 · **Spec:** §3.1, §3.3.1, §7.1.3
 - **Goal:** `BlockReader`/`BlockWriter` caching in multiples of 2880 B; `cardAt`/`bytes`; `pad(fill)` with
@@ -177,7 +177,7 @@ Every task must satisfy all of these before it is `done`:
   memory on a large mock device.
 
 ### NAME-1 — Keyword normalization, wildcards, `Matches`
-- **Milestone:** M0 · **Module:** `src/header/name.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/header/name.zig` · **Size:** M · **Status:** done
 - **Depends on:** ERR-1, LIM-1
 - **Req:** FR-HDR-2, FR-UTL-4 · **Design:** §9.1, §19.1 · **Spec:** §4.1.2.1, Appendix A
 - **Goal:** 8-char keyword normalization and case-insensitive wildcard matching with the explicit
@@ -190,7 +190,7 @@ Every task must satisfy all of these before it is `done`:
   idiom; the `Matches` declaration compiles on 0.16.
 
 ### HDR-1 — Keyword value parsing
-- **Milestone:** M0 · **Module:** `src/header/value.zig` · **Size:** L · **Status:** todo · **Module-lock:** header/value.zig
+- **Milestone:** M0 · **Module:** `src/header/value.zig` · **Size:** L · **Status:** done · **Module-lock:** header/value.zig
 - **Depends on:** ERR-1, CONV-1
 - **Req:** FR-HDR-3, FR-HDR-4 · **Design:** §9.2 · **Spec:** §4.2.1–4.2.7
 - **Goal:** The `KeywordValue` union and a fixed-**and**-free-format value FSM preserving the
@@ -199,7 +199,7 @@ Every task must satisfy all of these before it is `done`:
   reads accepted; mandatory writes fixed-format.
 
 ### HDR-2 — Card parse / serialize & classification
-- **Milestone:** M0 · **Module:** `src/header/card.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/header/card.zig` · **Size:** M · **Status:** done
 - **Depends on:** HDR-1, NAME-1
 - **Req:** FR-HDR-1, FR-HDR-2, FR-HDR-6 · **Design:** §9.1 · **Spec:** §4.1, §4.4.2.4, Appendix A
 - **Goal:** The 80-byte `Card` with raw-byte preservation and the exact value-vs-commentary rule
@@ -208,7 +208,7 @@ Every task must satisfy all of these before it is `done`:
   unmodified read→write; control char ⇒ `NonAsciiInHeader`.
 
 ### HDR-3a — Header container, index & read API
-- **Milestone:** M0 · **Module:** `src/header/header.zig` · **Size:** M · **Status:** todo · **Module-lock:** header/header.zig
+- **Milestone:** M0 · **Module:** `src/header/header.zig` · **Size:** M · **Status:** done · **Module-lock:** header/header.zig
 - **Depends on:** HDR-2, NAME-1, CONV-1
 - **Req:** FR-HDR-5, FR-HDR-7, FR-HDR-13 · **Design:** §9.4 · **Spec:** §4.1, §4.4.1
 - **Goal:** Ordered card list + case-insensitive name index; read API and mandatory `END` handling.
@@ -219,7 +219,7 @@ Every task must satisfy all of these before it is `done`:
   serialization preserved.
 
 ### HDU-1 — HDU model, kind detection & required-keyword validation
-- **Milestone:** M0 · **Module:** `src/hdu.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M0 · **Module:** `src/hdu.zig` · **Size:** M · **Status:** done
 - **Depends on:** HDR-3a
 - **Req:** FR-HDU-1, FR-HDU-2, FR-HDU-5, FR-HDU-6 · **Design:** §10.1, §10.2 · **Spec:** §3.3, §4.4.1, §7
 - **Goal:** `HduKind`, the `Hdu` struct, and finalize-time mandatory-keyword presence/order/type checks;
@@ -228,7 +228,7 @@ Every task must satisfy all of these before it is `done`:
   extensionful file with no `EXTEND` is not flagged.
 
 ### FITS-1a — File handle: open/create/scan/navigate
-- **Milestone:** M0 · **Module:** `src/fits.zig` · **Size:** L · **Status:** todo · **Module-lock:** fits.zig
+- **Milestone:** M0 · **Module:** `src/fits.zig` · **Size:** L · **Status:** done · **Module-lock:** fits.zig
 - **Depends on:** HDU-1, IO-3, IO-4, IO-5, LIM-1, ERR-2
 - **Req:** FR-HDU-1, FR-HDU-3, FR-IO-5, NFR-MEM-1, NFR-CONC-1 · **Design:** §10.3, §25 · **Spec:** §3.1, §3.4.3, §3.5
 - **Goal:** The `Fits` handle's read side: `Mode{read_only,read_write,create}`, lazy HDU scan, navigation
@@ -251,7 +251,7 @@ Every task must satisfy all of these before it is `done`:
   (FR-TPL-2); `appendImage`/`appendTable`/`fileDevice` exist for the README examples.
 
 ### IMG-1 — Image core: type model & contiguous pixel I/O
-- **Milestone:** M0 · **Module:** `src/image.zig` · **Size:** L · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M0 · **Module:** `src/image.zig` · **Size:** L · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** FITS-1a, FITS-1b, CONV-1, END-1, IO-5
 - **Req:** FR-IMG-1, FR-IMG-2, FR-IMG-3, FR-IMG-9 · **Design:** §11.1, §11.2 · **Spec:** §3.3.2, §4.4.1, §5, §7.1
 - **Goal:** `ImageView` over all six `BITPIX` and `NAXIS` 0–999; chunked block-aligned
@@ -265,7 +265,7 @@ Every task must satisfy all of these before it is `done`:
 ## Milestone M1 — Core library (P1)
 
 ### HDR-3b — Header edit operations
-- **Milestone:** M1 · **Module:** `src/header/header.zig` · **Size:** M · **Status:** todo · **Module-lock:** header/header.zig
+- **Milestone:** M1 · **Module:** `src/header/header.zig` · **Size:** M · **Status:** done · **Module-lock:** header/header.zig
 - **Depends on:** HDR-3a
 - **Req:** FR-HDR-11 · **Design:** §9.4 · **Spec:** §4.1
 - **Goal:** `append`/`update`(create-if-absent)/`insert`/`delete`/`rename` **plus an explicit
@@ -274,7 +274,7 @@ Every task must satisfy all of these before it is `done`:
   reordering; `update` creates when absent.
 
 ### HDR-4 — CONTINUE long-string convention
-- **Milestone:** M1 · **Module:** `src/header/continue.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M1 · **Module:** `src/header/continue.zig` · **Size:** M · **Status:** done
 - **Depends on:** HDR-3b
 - **Req:** FR-HDR-8 · **Design:** §9.3 · **Spec:** §4.2.1.2
 - **Goal:** Assemble `&`-continued strings on read; split >68-char values into primary + `CONTINUE` on
@@ -284,7 +284,7 @@ Every task must satisfy all of these before it is `done`:
   **orphaned `CONTINUE` card** is treated as commentary (the two cases are distinct, §4.2.1.2).
 
 ### IMG-2 — Linear scaling (BSCALE/BZERO)
-- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** IMG-1
 - **Req:** FR-IMG-5 · **Design:** §11.3 · **Spec:** §4.4.2.5, Eq. 3
 - **Goal:** Transparent `physical = BZERO + BSCALE×stored` on read, inverted on write, `.raw` switch.
@@ -292,14 +292,14 @@ Every task must satisfy all of these before it is `done`:
   representable values.
 
 ### IMG-3 — Unsigned-integer convention
-- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** IMG-2
 - **Req:** FR-IMG-6 · **Design:** §11.3 · **Spec:** §4.4.2.5, Table 11
 - **Goal:** Read/write `u16`/`u32`/`u64` via `BSCALE=1`, `BZERO=2^15/2^31/2^63`, offset in integer space.
 - **Acceptance:** values near `2^63` round-trip with no `f64` precision loss.
 
 ### IMG-4 — Null handling (BLANK / NaN)
-- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** IMG-2, X-FIXTURES
 - **Req:** FR-IMG-8 · **Design:** §11.4 · **Spec:** §4.4.2.5, §5.3, Appendix E
 - **Goal:** Honor integer `BLANK` and IEEE-NaN nulls with caller sentinels, comparing the **raw stored**
@@ -309,7 +309,7 @@ Every task must satisfy all of these before it is `done`:
   (X-FIXTURES) — not merely "any NaN reads as null".
 
 ### IMG-5 — Rectangular sections with stride
-- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M1 · **Module:** `src/image.zig` · **Size:** M · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** IMG-1
 - **Req:** FR-IMG-4 · **Design:** §11.2 · **Spec:** §3.3.2
 - **Goal:** `readSection`/`writeSection` over `lower..upper` per axis with optional stride, one innermost
@@ -317,14 +317,14 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** a strided 2-D sub-rectangle matches a manual gather; bounds validated.
 
 ### UTL-1 — Date/time helpers
-- **Milestone:** M1 · **Module:** `src/wcs/time.zig` (date/JD core) · **Size:** M · **Status:** todo · **Module-lock:** wcs/time.zig
+- **Milestone:** M1 · **Module:** `src/wcs/time.zig` (date/JD core) · **Size:** M · **Status:** done · **Module-lock:** wcs/time.zig
 - **Depends on:** ERR-1
 - **Req:** FR-UTL-1 · **Design:** §19.1 · **Spec:** §4.2.7, §9.1.1
 - **Goal:** Format/parse `DATE`/`DATE-OBS`; accept deprecated `DD/MM/YY` (⇒19YY); convert to/from JD/MJD.
 - **Acceptance:** ISO-8601 round-trips incl. fractional seconds; `DD/MM/YY`⇒19YY; JD/MJD match known epochs.
 
 ### TBL-1 — Column model & TFORM/TDISP parsing
-- **Milestone:** M1 · **Module:** `src/table/common.zig` · **Size:** M · **Status:** todo · **Module-lock:** table/common.zig
+- **Milestone:** M1 · **Module:** `src/table/common.zig` · **Size:** M · **Status:** done · **Module-lock:** table/common.zig
 - **Depends on:** ERR-1, CONV-1
 - **Req:** FR-UTL-2 · **Design:** §12.2, §13.1 · **Spec:** §7.2.4, §7.3.3, Tables 15–20
 - **Goal:** Shared `TFORM`/`TDISP` parsing (type code, repeat, width, decimals) + ASCII column-position
@@ -332,7 +332,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** every Table 15/18/16/20 code parses; `TBCOLn` math validated.
 
 ### ATB-1 — ASCII TABLE extension
-- **Milestone:** M1 · **Module:** `src/table/ascii.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M1 · **Module:** `src/table/ascii.zig` · **Size:** L · **Status:** done
 - **Depends on:** TBL-1, FITS-1a, HDR-3a, IO-5, CONV-1
 - **Req:** FR-ATB-1, FR-ATB-2, FR-ATB-3, FR-ATB-4 · **Design:** §12 · **Spec:** §7.2
 - **Goal:** `XTENSION='TABLE'` read/write with fixed-width FORTRAN-style formatting/parsing, null fields,
@@ -342,7 +342,7 @@ Every task must satisfy all of these before it is `done`:
   field extent; width overflow is a typed error, not truncation.
 
 ### BTB-1 — BINARY TABLE structure & TFORM codes
-- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** L · **Status:** todo · **Module-lock:** table/binary.zig
+- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** L · **Status:** done · **Module-lock:** table/binary.zig
 - **Depends on:** TBL-1, FITS-1a, HDR-3a, END-1, IO-5
 - **Req:** FR-BTB-1, FR-BTB-2, FR-BTB-3 · **Design:** §13.1 · **Spec:** §7.3
 - **Goal:** `XTENSION='BINTABLE'` with all standard `TFORMn` codes (`L X B I J K A E D C M` + `P`/`Q`),
@@ -352,7 +352,7 @@ Every task must satisfy all of these before it is `done`:
   undefined fill** (FITS §7.3.2) — not required to equal it.
 
 ### BTB-2 — Binary scaling, nulls & unsigned/signed types
-- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** M · **Status:** todo · **Module-lock:** table/binary.zig
+- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** M · **Status:** done · **Module-lock:** table/binary.zig
 - **Depends on:** BTB-1, CONV-1
 - **Req:** FR-BTB-4 · **Design:** §13.2 · **Spec:** §7.3.2, Table 19
 - **Goal:** Per-column `TSCALn`/`TZEROn`, integer `TNULLn`, IEEE-NaN float nulls, and the unsigned/signed
@@ -361,7 +361,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** the Table 19 offsets surface the unsigned/`i8` types; NaN pattern matches IMG-4.
 
 ### BTB-3a — Binary column access & A-format
-- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** L · **Status:** todo · **Module-lock:** table/binary.zig
+- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** L · **Status:** done · **Module-lock:** table/binary.zig
 - **Depends on:** BTB-1, NAME-1, CONV-1
 - **Req:** FR-BTB-5, FR-BTB-7 · **Design:** §13.3, §13.4 · **Spec:** §7.3.3, §7.3.4
 - **Goal:** Column locate-by-name(wildcard)/number; read/write whole columns, cell ranges, single
@@ -382,7 +382,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** row/column edits preserve `NAXIS1`/`NAXIS2`/`TFIELDS` invariants and re-index correctly.
 
 ### VLA-1 — Variable-length arrays & heap
-- **Milestone:** M1 · **Module:** `src/table/heap.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M1 · **Module:** `src/table/heap.zig` · **Size:** L · **Status:** done
 - **Depends on:** BTB-1, LIM-1
 - **Req:** FR-VLA-1, FR-VLA-2, FR-VLA-3, FR-VLA-4 · **Design:** §14 · **Spec:** §7.3.5, §7.3.6
 - **Goal:** `rPt`/`rQt` descriptor columns following into the heap with strict geometry validation and a
@@ -394,7 +394,7 @@ Every task must satisfy all of these before it is `done`:
   `BadDescriptor`; rewrites don't grow the heap unboundedly.
 
 ### SUM-1 — DATASUM & CHECKSUM
-- **Milestone:** M1 · **Module:** `src/checksum.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M1 · **Module:** `src/checksum.zig` · **Size:** L · **Status:** done
 - **Depends on:** IO-5, HDR-3a, FITS-1a, END-1
 - **Req:** FR-SUM-1, FR-SUM-2, FR-SUM-3 · **Design:** §16 · **Spec:** §4.4.2.7, Appendix J
 - **Goal:** `DATASUM` over the **padded** data unit (fill summed, big-endian groups via `endian.read`) as
@@ -412,7 +412,7 @@ Every task must satisfy all of these before it is `done`:
 ## Milestone M2 — Full standard (P2)
 
 ### HDR-3c — Header-space pre-allocation
-- **Milestone:** M2 · **Module:** `src/header/header.zig` · **Size:** S · **Status:** todo · **Module-lock:** header/header.zig
+- **Milestone:** M2 · **Module:** `src/header/header.zig` · **Size:** S · **Status:** done · **Module-lock:** header/header.zig
 - **Depends on:** HDR-3b
 - **Req:** FR-HDR-12 · **Design:** §9.4 · **Spec:** §4.4.2.4
 - **Goal:** `reserveSpace(n)` appends blank cards before `END` so later `update` calls fill in place
@@ -420,14 +420,14 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** `reserveSpace` then `update` fills in place without rewriting following HDUs.
 
 ### HDR-5 — HIERARCH convention
-- **Milestone:** M2 · **Module:** `src/header/hierarch.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/header/hierarch.zig` · **Size:** M · **Status:** done
 - **Depends on:** HDR-2, HDR-3b
 - **Req:** FR-HDR-9 · **Design:** §9.3 · **Spec:** Registry (HIERARCH)
 - **Goal:** Parse/write `HIERARCH a b c = val`; lookups accept either spelling.
 - **Acceptance:** long-name round-trip; lookup by both spellings.
 
 ### HDR-6 — Keyword units (`[unit]` comment convention)
-- **Milestone:** M2 · **Module:** `src/header/value.zig` · **Size:** S · **Status:** todo · **Module-lock:** header/value.zig
+- **Milestone:** M2 · **Module:** `src/header/value.zig` · **Size:** S · **Status:** done · **Module-lock:** header/value.zig
 - **Depends on:** HDR-1, HDR-2
 - **Req:** FR-HDR-10 · **Design:** §9.3 · **Spec:** §4.3.2
 - **Goal:** Parse the leading `[unit]` comment convention into an optional `units` accessor without
@@ -435,7 +435,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** `EXPTIME = 1200. / [s] exposure` ⇒ `units = "s"`; non-unit bracket text not misread.
 
 ### HDR-7 — INHERIT convention
-- **Milestone:** M2 · **Module:** `src/header/header.zig` · **Size:** M · **Status:** todo · **Module-lock:** header/header.zig
+- **Milestone:** M2 · **Module:** `src/header/header.zig` · **Size:** M · **Status:** done · **Module-lock:** header/header.zig
 - **Depends on:** HDR-3a
 - **Req:** FR-HDR-14 · **Design:** §9.4 · **Spec:** §4.4.2.6, Appendix K
 - **Goal:** Opt-in, read-only-in-effect fall-through from an extension header to the primary; never
@@ -447,7 +447,7 @@ Every task must satisfy all of these before it is `done`:
   disabled by default; serialization unchanged.
 
 ### IMG-6 — Signed-byte convention
-- **Milestone:** M2 · **Module:** `src/image.zig` · **Size:** S · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M2 · **Module:** `src/image.zig` · **Size:** S · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** IMG-2
 - **Req:** FR-IMG-7 · **Design:** §11.3 · **Spec:** §4.4.2.5, Table 11
 - **Goal:** `BITPIX=8` + `BZERO=−128` read/written as `i8`.
@@ -462,7 +462,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** following HDUs stay valid and aligned after a data-size-changing reshape.
 
 ### RG-1 — Random groups
-- **Milestone:** M2 · **Module:** `src/groups.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/groups.zig` · **Size:** L · **Status:** done
 - **Depends on:** IMG-2, HDR-3b
 - **Req:** FR-RG-1, FR-RG-2 · **Design:** §15 · **Spec:** §6
 - **Goal:** Read the §6 random-groups structure (order, `NAXIS1=0`, `GROUPS=T`, `PTYPEn`/`PSCALn`/
@@ -473,7 +473,7 @@ Every task must satisfy all of these before it is `done`:
   explicitly marked descoped if not implemented — FR-RG-2 is MAY).
 
 ### WCS-1 — WCS keyword set
-- **Milestone:** M2 · **Module:** `src/wcs/keys.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/wcs/keys.zig` · **Size:** L · **Status:** done
 - **Depends on:** HDR-3a, HDR-3b
 - **Req:** FR-WCS-1 · **Design:** §18.1 · **Spec:** §8.1, §8.2, Tables 21–22
 - **Goal:** Parse (`fromHeader`, HDR-3a) and serialize (`writeTo`, HDR-3b) the WCS keyword set incl.
@@ -482,7 +482,7 @@ Every task must satisfy all of these before it is `done`:
   `PC/PV/PS`.
 
 ### WCS-2 — Celestial transforms
-- **Milestone:** M2 · **Module:** `src/wcs/celestial.zig` · **Size:** XL · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/wcs/celestial.zig` · **Size:** XL · **Status:** done
 - **Depends on:** WCS-1, X-FIXTURES
 - **Req:** FR-WCS-2 · **Design:** §18.2 · **Spec:** §8.3, Table 23
 - **Goal:** pixel↔world for the common projections (TAN, SIN, ARC, STG, ZEA, AIT, CAR, MER, …) via
@@ -492,7 +492,7 @@ Every task must satisfy all of these before it is `done`:
   **astropy/WCSLIB reference points** (X-FIXTURES) within a stated tolerance (e.g. `< 1e-9 deg`).
 
 ### WCS-3 — Spectral coordinates
-- **Milestone:** M2 · **Module:** `src/wcs/spectral.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/wcs/spectral.zig` · **Size:** M · **Status:** done
 - **Depends on:** WCS-1, X-FIXTURES
 - **Req:** FR-WCS-3 · **Design:** §18.2 · **Spec:** §8.4, Tables 25–27
 - **Goal:** Spectral `CTYPEn` types, `RESTFRQ`/`RESTWAV`, `SPECSYS`.
@@ -500,7 +500,7 @@ Every task must satisfy all of these before it is `done`:
   committed Table-25/27 fixture (X-FIXTURES).
 
 ### WCS-4 — Time coordinates
-- **Milestone:** M2 · **Module:** `src/wcs/time.zig` · **Size:** M · **Status:** todo · **Module-lock:** wcs/time.zig
+- **Milestone:** M2 · **Module:** `src/wcs/time.zig` · **Size:** M · **Status:** done · **Module-lock:** wcs/time.zig
 - **Depends on:** WCS-1, UTL-1
 - **Req:** FR-WCS-4 · **Design:** §18.2 · **Spec:** §9, Tables 30–35
 - **Goal:** `MJDREF[I|F]`/`JDREF`/`DATEREF`, `TIMESYS`, `TIMEUNIT`, `TREFPOS`, `DATE-OBS`,
@@ -508,7 +508,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** global time keywords parse/serialize; `TIMESYS`/`TREFPOS` validated vs Tables 30/31.
 
 ### CMP-1 — GZIP_2 byte shuffle
-- **Milestone:** M2 · **Module:** `src/compress/shuffle.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/compress/shuffle.zig` · **Size:** M · **Status:** done
 - **Depends on:** END-1
 - **Req:** FR-CMP-2 · **Design:** §17.2 · **Spec:** §10.4.2
 - **Goal:** The MSB-first type-aware byte shuffle (split N W-byte values into W planes) + exact inverse —
@@ -516,7 +516,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** `unshuffle(shuffle(x)) == x` per width; the §10.4.2 byte ordering reproduced.
 
 ### CMP-2 — GZIP_1 / GZIP_2 codecs
-- **Milestone:** M2 · **Module:** `src/compress/gzip.zig` · **Size:** S · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/compress/gzip.zig` · **Size:** S · **Status:** done
 - **Depends on:** CMP-1
 - **Req:** FR-CMP-2 · **Design:** §17.2 · **Spec:** §10.4.2
 - **Goal:** Use `std.compress.flate` with `Container.gzip` (which already supplies the RFC-1952 header /
@@ -526,7 +526,7 @@ Every task must satisfy all of these before it is `done`:
   round-trips; `GZIP_2` shuffles numeric types only.
 
 ### CMP-3a — Tiled-image structure & codec registry
-- **Milestone:** M2 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** todo · **Module-lock:** compress/tiled.zig
+- **Milestone:** M2 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** done · **Module-lock:** compress/tiled.zig
 - **Depends on:** BTB-1, VLA-1
 - **Req:** FR-CMP-1 · **Design:** §17.1 · **Spec:** §10.1
 - **Goal:** Parse the compressed-image structure and define the codec interface. Parse the mandatory
@@ -539,7 +539,7 @@ Every task must satisfy all of these before it is `done`:
   dimensions.
 
 ### CMP-3b — Tiled-image decode & ImageView
-- **Milestone:** M2 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** todo · **Module-lock:** compress/tiled.zig
+- **Milestone:** M2 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** done · **Module-lock:** compress/tiled.zig
 - **Depends on:** CMP-3a, CMP-2, IMG-2, IMG-4
 - **Req:** FR-CMP-1 · **Design:** §17.1 · **Spec:** §10.1
 - **Goal:** Decode the covering tile(s) via the registry and present a normal `ImageView` with per-tile
@@ -548,7 +548,7 @@ Every task must satisfy all of these before it is `done`:
   whose dimensions are not a tile multiple (edge/partial tiles) and a read spanning ≥2 tiles**.
 
 ### ITR-1 — Work-function iterator
-- **Milestone:** M2 · **Module:** `src/iterator.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/iterator.zig` · **Size:** L · **Status:** done
 - **Depends on:** IMG-1, BTB-3a, CONV-1
 - **Req:** FR-ITR-1, FR-ITR-2 · **Design:** §19.2
 - **Goal:** Drive a caller work-function over image pixels / **binary-table** columns in block-aligned
@@ -560,7 +560,7 @@ Every task must satisfy all of these before it is `done`:
   also measured by X-BENCH).
 
 ### UTL-2 — TDISP rendering
-- **Milestone:** M2 · **Module:** `src/table/common.zig` · **Size:** M · **Status:** todo · **Module-lock:** table/common.zig
+- **Milestone:** M2 · **Module:** `src/table/common.zig` · **Size:** M · **Status:** done · **Module-lock:** table/common.zig
 - **Depends on:** TBL-1, X-FIXTURES
 - **Req:** FR-UTL-5 · **Design:** §19.1 · **Spec:** §7.2.2/§7.3.4, Tables 16/20
 - **Goal:** Apply `TDISPn`/`TDISP` to render values as text and compute display width
@@ -569,7 +569,7 @@ Every task must satisfy all of these before it is `done`:
   CFITSIO `fits_get_col_display_width` golden table** (X-FIXTURES).
 
 ### VLD-1 — Structural validation (`fitsverify`-style)
-- **Milestone:** M2 · **Module:** `src/validate.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M2 · **Module:** `src/validate.zig` · **Size:** L · **Status:** done
 - **Depends on:** HDU-1, ATB-1, BTB-1, VLA-1, RG-1, SUM-1
 - **Req:** FR-VAL-1, FR-VAL-2 · **Design:** §19.3 · **Spec:** §3, §4.4.1, §7
 - **Goal:** A pass reporting **all** findings classified error vs warning. Checks: block sizing;
@@ -653,7 +653,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** a gzip-compressed FITS file opens, reads, and re-compresses identically in content.
 
 ### RMT-2 — HTTP(S) range-GET backend
-- **Milestone:** M3 · **Module:** `src/io/http.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/io/http.zig` · **Size:** L · **Status:** done
 - **Depends on:** IO-1, IO-3
 - **Req:** FR-RMT-3 · **Design:** §20.2
 - **Goal:** Read-only `Device` over `std.http.Client` Range requests (TLS 1.3 only), falling back to a
@@ -682,7 +682,7 @@ Every task must satisfy all of these before it is `done`:
   member updates the `MEMBER_*` rows and `GRPIDn`/`GRPLCn` and re-resolves correctly** (FR-GRP-2).
 
 ### ERR-4 — CFITSIO status-code map
-- **Milestone:** M3 · **Module:** `src/errors.zig` · **Size:** S · **Status:** todo · **Module-lock:** errors.zig
+- **Milestone:** M3 · **Module:** `src/errors.zig` · **Size:** S · **Status:** done · **Module-lock:** errors.zig
 - **Depends on:** ERR-1
 - **Req:** FR-ERR-4 · **Design:** §4.2
 - **Goal:** Pure `cfitsioStatus(err) c_int` mapping each `Error` to the nearest CFITSIO status (e.g.
@@ -694,7 +694,7 @@ Every task must satisfy all of these before it is `done`:
 ## Cross-cutting tracks (continuous, from M0)
 
 ### X-CI — Portability CI matrix (incl. big-endian)
-- **Milestone:** X · **Module:** CI config · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** CI config · **Size:** M · **Status:** done
 - **Depends on:** SETUP-1
 - **Req:** NFR-PORT-1, NFR-PORT-2 · **Design:** §24.3
 - **Goal:** `{Linux, macOS, Windows} × {x86_64, aarch64}` running `zig build test`, **plus a big-endian
@@ -703,7 +703,8 @@ Every task must satisfy all of these before it is `done`:
   the LE-only `{x86_64, aarch64}` matrix cannot, by itself, prove endian-neutrality.
 
 ### X-FIXTURES — Corpus & golden-file provenance
-- **Milestone:** X · **Module:** `test/corpus/`, `test/golden/`, CI config · **Size:** L · **Status:** todo
+- **Milestone:** X · **Module:** `test/corpus/`, `test/golden/`, CI config · **Size:** L · **Status:** blocked
+- **Note:** externally blocked — authoring the CFITSIO 4.6.4 / Astropy golden corpus needs that toolchain; a self-authored sample corpus (`test/corpus/`) is committed in the meantime.
 - **Depends on:** SETUP-1
 - **Req:** NFR-TEST-2, NFR-TEST-3, NFR-INTEROP-1 · **Design:** §23
 - **Goal:** Author/commit the externally-produced fixtures every other test consumes, and declare the
@@ -717,7 +718,7 @@ Every task must satisfy all of these before it is `done`:
   toolchain reproduces them.
 
 ### X-GUARD — Invariant guards (no-C, convert-Mode, public surface)
-- **Milestone:** X · **Module:** `test/guard/` · **Size:** S · **Status:** todo
+- **Milestone:** X · **Module:** `test/guard/` · **Size:** S · **Status:** done
 - **Depends on:** SETUP-1, CONV-1, HDR-3a, IMG-1, ATB-1, BTB-3a
 - **Req:** GC-1, FR-CONV-1, NFR-API-2 · **Design:** §1, §6, §3
 - **Goal:** Automated guards for invariants otherwise enforced only by review.
@@ -738,7 +739,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** the freestanding build compiles in CI and excludes every OS-backed leaf.
 
 ### X-DOC — License, SemVer, changelog & usage guide
-- **Milestone:** X · **Module:** `LICENSE`, `README.md`, `CHANGELOG.md` · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** `LICENSE`, `README.md`, `CHANGELOG.md` · **Size:** M · **Status:** done
 - **Depends on:** SETUP-1
 - **Req:** NFR-DOC-1, NFR-DOC-2, NFR-API-1 · **Design:** §24.3, §27
 - **Goal:** Choose & apply a CFITSIO-independent license (open question — MIT/Apache-2.0/BSD-3); SemVer +
@@ -748,7 +749,7 @@ Every task must satisfy all of these before it is `done`:
   open question before 1.0.)
 
 ### X-FUZZ — Header & table fuzz harnesses
-- **Milestone:** X · **Module:** `test/fuzz/` · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** `test/fuzz/` · **Size:** M · **Status:** done
 - **Depends on:** HDR-3a, BTB-1, VLA-1
 - **Req:** NFR-SAFE-2, NFR-SAFE-1, GC-6 · **Design:** §23
 - **Goal:** `zig build fuzz` harnesses for the header and table/VLA parsers, seeded from the corpus,
@@ -758,7 +759,7 @@ Every task must satisfy all of these before it is `done`:
   errors, never panics/leaks; crashes/leaks are release blockers.
 
 ### X-CORPUS — Sample-file corpus & round-trip
-- **Milestone:** X · **Module:** `test/` · **Size:** L · **Status:** todo
+- **Milestone:** X · **Module:** `test/` · **Size:** L · **Status:** done
 - **Depends on:** IMG-1, ATB-1, BTB-1, VLA-1, CMP-3b, CMP-8, X-FIXTURES
 - **Req:** NFR-TEST-2, NFR-INTEROP-2 · **Design:** §23
 - **Goal:** Exercise the X-FIXTURES corpus (images, ASCII/binary tables, VLA, **compressed**) for read +
@@ -767,7 +768,8 @@ Every task must satisfy all of these before it is `done`:
   where the format permits; compressed members read (CMP-3b) and round-trip (CMP-8).
 
 ### X-XVAL — Cross-validation vs CFITSIO/Astropy
-- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** blocked
+- **Note:** externally blocked — comparing output against CFITSIO/Astropy needs that toolchain provisioned in CI (depends on X-FIXTURES).
 - **Depends on:** X-CORPUS, SUM-1, X-FIXTURES
 - **Req:** NFR-TEST-3 · **Design:** §23
 - **Goal:** Compare `zigfitsio` output against CFITSIO/Astropy for the same inputs (goldens from
@@ -775,7 +777,8 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** outputs agree on the committed golden set.
 
 ### X-CONF — Conformance fixtures runner (valid + malformed)
-- **Milestone:** X · **Module:** `test/` · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** `test/` · **Size:** M · **Status:** blocked
+- **Note:** externally blocked — runs over the valid/malformed corpus authored in X-FIXTURES, which needs the external CFITSIO/Astropy toolchain.
 - **Depends on:** VLD-1, X-FIXTURES
 - **Req:** NFR-TEST-4 · **Design:** §23 · **Spec:** §3, §4, §7
 - **Goal:** Run `validate.zig` over the valid/malformed fixtures **authored in X-FIXTURES** (the fixtures
@@ -783,7 +786,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** each malformed fixture produces its expected finding(s).
 
 ### X-CONC — Concurrency test & single-handle caveat
-- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** todo
+- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** done
 - **Depends on:** FITS-1a
 - **Req:** NFR-TEST-5 (a), NFR-CONC-1 · **Design:** §25
 - **Goal:** A multi-threaded test driving **distinct** `Fits` handles concurrently + a doc-presence check
@@ -792,7 +795,8 @@ Every task must satisfy all of these before it is `done`:
   on `Fits`.
 
 ### X-INTEROP — Inbound & outbound interoperability
-- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** blocked
+- **Note:** externally blocked — reading CFITSIO/Astropy-written files and opening zigfitsio output with them needs that toolchain in CI.
 - **Depends on:** X-CORPUS, X-FIXTURES
 - **Req:** NFR-TEST-5 (b), NFR-INTEROP-1 · **Design:** §23
 - **Goal:** Read CFITSIO/Astropy-written files (inbound) **and** open every `zigfitsio`-written corpus
@@ -801,7 +805,8 @@ Every task must satisfy all of these before it is `done`:
   silently mis-read.
 
 ### X-SUM — Checksum golden parity fixture
-- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** todo
+- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** blocked
+- **Note:** externally blocked — the committed-file recompute needs the CFITSIO-written checksum fixture (the algorithmic golden is already covered by SUM-1's own unit test).
 - **Depends on:** SUM-1, X-FIXTURES
 - **Req:** NFR-TEST-1, NFR-INTEROP-1 · **Design:** §16, §23 · **Spec:** Appendix J
 - **Goal:** Run the committed CFITSIO ASCII-table vector and the Appendix J example as locked fixtures
@@ -810,7 +815,7 @@ Every task must satisfy all of these before it is `done`:
   Appendix J example reproduces `CHECKSUM='hcHjjc9ghcEghc9g'`.
 
 ### X-API — Zig 0.16 API-regression fixtures
-- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** todo
+- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** done
 - **Depends on:** ITR-1, FITS-1b, NAME-1
 - **Req:** GC-3, GC-4 · **Design:** §23
 - **Goal:** Compile-fixtures asserting the corrected snippets build and the original defects do **not**
@@ -830,14 +835,14 @@ Every task must satisfy all of these before it is `done`:
   (measured, not a release gate).
 
 ### X-TOOL — `fitsverify` CLI demo
-- **Milestone:** X · **Module:** `tools/fitsverify.zig` · **Size:** S · **Status:** todo
+- **Milestone:** X · **Module:** `tools/fitsverify.zig` · **Size:** S · **Status:** done
 - **Depends on:** VLD-1
 - **Req:** FR-VAL-2 (demo), NFR-DOC-1 · **Design:** §3
 - **Goal:** A CLI over `validate.zig` producing a `fitsverify`-style report.
 - **Acceptance:** runs on a sample file and prints classified findings.
 
 ### X-DOCAPI — Doc-comment & public-surface audit
-- **Milestone:** X · **Module:** all `src/` · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** all `src/` · **Size:** M · **Status:** done
 - **Depends on:** ERR-1, ERR-2, ERR-3, ERR-4, LIM-1, CONV-1, NAME-1, IO-1, IO-2, IO-3, IO-4, IO-5, HDR-1, HDR-2, HDR-3a, HDR-3b, HDR-3c, HDR-4, HDR-5, HDR-6, HDR-7, HDU-1, FITS-1a, FITS-1b, IMG-1, IMG-2, IMG-3, IMG-4, IMG-5, IMG-6, IMG-7, TBL-1, ATB-1, BTB-1, BTB-2, BTB-3a, BTB-3b, VLA-1, SUM-1, UTL-1, UTL-2, RG-1, WCS-1, WCS-2, WCS-3, WCS-4, CMP-1, CMP-2, CMP-3a, CMP-3b, CMP-4, CMP-5, CMP-6, CMP-7, CMP-8, CMP-9, ITR-1, VLD-1, EFN-1, RMT-1, RMT-2, TPL-1, GRP-1
 - **Req:** NFR-DOC-1, NFR-API-2 · **Design:** §3, §24
 - **Goal:** Final pass ensuring every public declaration is documented and `root.zig` re-exports only the

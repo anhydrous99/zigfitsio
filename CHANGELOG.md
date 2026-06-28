@@ -41,8 +41,29 @@ All notable changes to `zigfitsio` are documented here. The format follows
   benchmarks (`X-BENCH`); and the **full** upper-layer stack now compiles for
   wasm32-freestanding (`X-WASM`).
 
+### Fixed / changed
+- **FITS-conformance correctness pass:** ASCII-table fields now space-fill (not NUL/zero) per
+  `FR-IO-2`; the `CONTINUE`/`HIERARCH`/complex-value header API is wired through
+  `getLongString`/`appendLongString`/`getHierarch`/`getComplex`; float-exponent formatting
+  follows §4.2.4 and FORTRAN-real parsing accepts `D`/`E` exponents; `TDISP` `EN`/`ES`/`G`
+  rendering; `copyHdu` rolls back cleanly on partial failure; write-path keyword-order
+  validation; WCS `CAR`/`LATPOLE` pole rotation corrected; `MJDREF` precedence + a time-keyword
+  writer and completeness fixes; image-section streaming; `TDIM` string arrays; heap-bounds
+  hardening; and grouping-table fixes.
+- **Standard-wire-format codec rewrites:** `PLIO_1` now follows the FITS Table 38 instruction
+  set and `HCOMPRESS_1` the White-1992 quadtree wire format; tiled `ZBLANK`, transparent
+  compressed-image reads (`ImageView.of`), and the write-side codec wiring are all in place.
+- **Iterator** null substitution.
+
+### Added (this batch)
+- **HTTP(S) range-GET backend (`RMT-2`):** `src/io/http.zig`'s `HttpDevice` serves a remote
+  FITS file as a seekable read-only `Device` via Range GETs, falling back to a full in-memory
+  download when the server lacks range support; excluded from the freestanding build graph.
+- A transparent `.fits.gz` open path and a committed sample FITS corpus.
+
 ### Notes
-- Tile-codec byte-exact parity against committed CFITSIO/Astropy fixtures (RICE/PLIO/HCOMPRESS,
-  the `X-FIXTURES`/`X-SUM` golden corpus) is still pending — it needs a CFITSIO 4.6.4 + Astropy
-  environment. The codecs are verified by lossless round-trip in the meantime.
-- The HTTP(S) range-GET backend (`RMT-2`) is not yet implemented.
+- The HTTP(S) range-GET backend (`RMT-2`) is **done**.
+- The still-pending item is **byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity** for the
+  tile codecs (RICE/PLIO/HCOMPRESS), checksum, and WCS — the `X-FIXTURES`/`X-SUM` golden corpus
+  needs a CFITSIO 4.6.4 + Astropy environment. Meanwhile the codecs/checksum are verified by
+  lossless self round-trip and WCS by `CRPIX`→`CRVAL` + pixel→world→pixel round-trip.

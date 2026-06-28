@@ -6,8 +6,9 @@
 //! pipeline is: pixel → intermediate world coords (CRPIX offset, `PCi_j`/`CDi_j` matrix,
 //! `CDELT`) → native spherical (the projection's deprojection) → celestial (spherical rotation
 //! about the native pole). An unimplemented projection is `error.UnsupportedProjection`. The
-//! registry is extensible; reference-point accuracy against WCSLIB/astropy is pinned by
-//! X-FIXTURES, while pixel→world→pixel round-trips are checked here.
+//! registry is extensible; reference-point accuracy is verified here by the `CRPIX`→`CRVAL`
+//! self-assertion and pixel→world→pixel round-trips, with external WCSLIB/Astropy golden
+//! parity still pending.
 //!
 //! The native→celestial rotation is parameterised by the celestial coordinates of the native
 //! pole `(α_p, δ_p)` together with `LONPOLE` (`φ_p`). These are derived from each projection's

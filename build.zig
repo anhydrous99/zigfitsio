@@ -4,6 +4,7 @@
 //!   zig build              — install the static library artifact (NFR-BUILD-2)
 //!   zig build test         — run the unit/integration suite (NFR-BUILD-2)
 //!   zig build bench        — run throughput benchmarks (NFR-PERF-1)
+//!   zig build fitsverify   — run the structural-validation CLI demo (X-TOOL)
 //!   zig build fuzz         — run the header/table fuzz harnesses (NFR-SAFE-2)
 //!   zig build wasm-check   — compile the freestanding core for wasm32 (NFR-PORT-3)
 const std = @import("std");

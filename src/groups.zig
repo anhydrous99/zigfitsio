@@ -164,6 +164,11 @@ pub const RandomGroups = struct {
     /// Read the `PCOUNT` parameters of group `group` (0-based) into `out` (exactly `pcount`
     /// elements), with each parameter's `PSCALn`/`PZEROn` scaling applied (FR-RG-2).
     /// `error.BadDimensions` for an out-of-range group or a wrong-length `out`.
+    ///
+    /// Each `out[i]` is the raw value of parameter `i` — when two or more `PTYPEn` cards share a
+    /// name (§6.1.2, a parameter whose precision needs more than one element) the slots are
+    /// returned **un-summed**; the caller adds the like-named entries (identified via
+    /// `rg.ptype[]`) to recover the full-precision value.
     pub fn readParams(self: *RandomGroups, comptime T: type, group: u64, out: []T) AccessError!void {
         if (group >= self.gcount) return error.BadDimensions;
         if (@as(u64, out.len) != self.pcount) return error.BadDimensions;

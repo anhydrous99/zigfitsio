@@ -49,7 +49,7 @@ pub const GzipError = error{Corrupt};
 /// leaf functions cheap on stack and to honor the passed allocator.
 const window_len = std.compress.flate.max_window_len;
 
-/// Transparently decompress a whole-file gzip stream (`*.fits.gz`, FR-RMT-1) into a fresh
+/// Transparently decompress a whole-file gzip stream (`*.fits.gz`, FR-RMT-2) into a fresh
 /// in-memory `Device` so the higher layers get the random access they assume (§8.1). The
 /// RFC-1952 container (10-byte header, CRC32 + ISIZE footer) is parsed by
 /// `std.compress.flate.Decompress` with `Container.gzip` — never hand-rolled.
@@ -83,7 +83,7 @@ pub fn materializeGzip(
     return MemoryDevice.initBytes(allocator, data);
 }
 
-/// gzip-compress `bytes` into `writer` (the output side of whole-file gzip, FR-RMT-1) and
+/// gzip-compress `bytes` into `writer` (the output side of whole-file gzip, FR-RMT-2) and
 /// flush. The RFC-1952 container is produced by `std.compress.flate.Compress` with
 /// `Container.gzip` (header at init, CRC32 + ISIZE footer at `finish`) — never hand-rolled.
 ///
@@ -177,7 +177,7 @@ test "drainAll writes through a writer" {
     try testing.expectEqualStrings("hello", w.buffered());
 }
 
-// --- whole-file gzip (FR-RMT-1) --------------------------------------------------------------
+// --- whole-file gzip (FR-RMT-2) --------------------------------------------------------------
 
 /// Compress `plain` into a heap slice the caller owns (a small helper so the gzip tests can
 /// hand realistic compressed bytes to `materializeGzip`).

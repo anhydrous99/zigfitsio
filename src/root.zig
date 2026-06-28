@@ -7,11 +7,17 @@
 const std = @import("std");
 
 // ── Cross-cutting foundation (§4, §6, §7) ──────────────────────────────────────────────
+/// The library's typed error sets and `Error` union plus mapping helpers (FR-ERR-1/2).
 pub const errors = @import("errors.zig");
+/// The flat union of every error this library can return (FR-ERR-1).
 pub const Error = errors.Error;
+/// Optional non-fatal warning/finding sink threaded through parse and validate (FR-ERR-3).
 pub const Diagnostics = @import("diag.zig").Diagnostics;
+/// Caller-tunable safety ceilings checked before any allocation or read (NFR-SAFE-1).
 pub const Limits = @import("limits.zig").Limits;
+/// Checked numeric crossings between FITS stored and caller types (FR-CONV-1).
 pub const convert = @import("convert.zig");
+/// Big-endian (FITS on-disk) ↔ native scalar read/write primitives (GC-5).
 pub const endian = @import("endian.zig");
 
 const version_mod = @import("version.zig");
@@ -23,12 +29,16 @@ pub const errorText = version_mod.errorText;
 pub const cfitsioStatus = errors.cfitsioStatus;
 
 // ── I/O layer (§8) ─────────────────────────────────────────────────────────────────────
+/// The random-access byte-`Device` interface every backend implements (FR-IO-1).
 pub const Device = @import("io/device.zig").Device;
+/// In-memory, growable `Device` — the freestanding/WASM backend (FR-IO-2, NFR-PORT-3).
 pub const MemoryDevice = @import("io/memory.zig").MemoryDevice;
+/// OS file-backed `Device` over `std.fs` (FR-IO-2). Not in the freestanding graph.
 pub const FileDevice = @import("io/file.zig").FileDevice;
 /// Read-only `Device` over HTTP(S) Range GETs (FR-RMT-3). OS/network leaf; not in the
 /// freestanding graph.
 pub const HttpDevice = @import("io/http.zig").HttpDevice;
+/// 2880-byte FITS block sizing/padding helpers (§3.1).
 pub const block = @import("io/block.zig");
 /// Sequential-stream + whole-file gzip backend helpers (FR-IO-3, FR-RMT-1).
 pub const stream = @import("io/stream.zig");

@@ -2,7 +2,8 @@
 //!
 //! Parses the spectral WCS keywords for the spectral axis of a header: the spectral `CTYPEi`
 //! code and unit, the rest frequency/wavelength (`RESTFRQ`/`RESTWAV`), and the reference frame
-//! (`SPECSYS`, plus `SSYSOBS`/`VELOSYS`). It exposes the recognized spectral variable and a
+//! (`SPECSYS` plus the `VELOSYS` source velocity; `SSYSOBS` is not parsed). It exposes the
+//! recognized spectral variable and a
 //! linear pixel↔spectral-value mapping (the common case where the chosen spectral variable is
 //! linear along the axis). Non-linear spectral algorithm codes (e.g. `FREQ-F2W`) are parsed and
 //! their type reported, but resampling between variables is left to higher layers.
