@@ -69,6 +69,10 @@ pub const ImageView = image_mod.ImageView;
 /// Linear scaling state (BSCALE/BZERO/BLANK).
 pub const Scaling = image_mod.Scaling;
 
+// ── World Coordinate System (§18) ──────────────────────────────────────────────────────
+/// The WCS keyword set parse/serialize (FR-WCS-1).
+pub const Wcs = @import("wcs/keys.zig").Wcs;
+
 // ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
 /// FITS date/time + Julian-Date helpers (FR-UTL-1).
 pub const DateTime = @import("wcs/time.zig").DateTime;
@@ -97,6 +101,7 @@ test {
     _ = @import("hdu.zig");
     _ = @import("fits.zig");
     _ = @import("image.zig");
+    _ = @import("wcs/keys.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
