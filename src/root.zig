@@ -28,6 +28,14 @@ pub const MemoryDevice = @import("io/memory.zig").MemoryDevice;
 pub const FileDevice = @import("io/file.zig").FileDevice;
 pub const block = @import("io/block.zig");
 
+// ── Header layer (§9) ──────────────────────────────────────────────────────────────────
+/// Wildcard match accumulator with the explicit multi-match contract (FR-UTL-4).
+pub const Matches = @import("header/name.zig").Matches;
+/// A parsed FITS keyword value (FR-HDR-3).
+pub const KeywordValue = @import("header/value.zig").KeywordValue;
+/// An 80-byte header card with byte-exact round-trip (FR-HDR-1).
+pub const Card = @import("header/card.zig").Card;
+
 // ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
 /// FITS date/time + Julian-Date helpers (FR-UTL-1).
 pub const DateTime = @import("wcs/time.zig").DateTime;
@@ -49,6 +57,9 @@ test {
     _ = @import("io/file.zig");
     _ = @import("io/stream.zig");
     _ = @import("io/block.zig");
+    _ = @import("header/name.zig");
+    _ = @import("header/value.zig");
+    _ = @import("header/card.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
