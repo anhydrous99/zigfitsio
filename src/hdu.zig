@@ -110,6 +110,22 @@ pub const Hdu = struct {
         return abs / 8;
     }
 
+    /// Recompute `bitpix`/`naxis`/`axes`/`pcount`/`gcount`/`data_bytes` from the HDU's CURRENT
+    /// header — used after structural keywords (`BITPIX`/`NAXIS`/`NAXISn`/`PCOUNT`/`GCOUNT`) were
+    /// mutated in place — WITHOUT touching the kind or any byte offset (§4.4.1.1). The old `axes`
+    /// allocation is released and re-allocated for the new `NAXIS`. On error the HDU is left with
+    /// an empty (safe-to-free) `axes` slice rather than a dangling one.
+    pub fn recomputeGeometry(self: *Hdu, alloc: Allocator, lim: Limits) (StructError || errors.ConvError || errors.ValueError || errors.HeaderError || errors.LimitError || Allocator.Error)!void {
+        alloc.free(self.axes);
+        self.axes = &.{};
+        self.computeGeometry(alloc, lim) catch |e| {
+            // computeGeometry's own errdefer frees a partially-built axes slice; normalize the
+            // field to empty so a later deinit/retry never double-frees a dangling pointer.
+            self.axes = &.{};
+            return e;
+        };
+    }
+
     fn computeGeometry(self: *Hdu, alloc: Allocator, lim: Limits) (StructError || errors.ConvError || errors.ValueError || errors.HeaderError || errors.LimitError || Allocator.Error)!void {
         self.bitpix = self.header.getValue(i64, "BITPIX") catch return error.MissingRequiredKeyword;
         if (!validBitpix(self.bitpix)) return error.BadBitpix;
@@ -317,6 +333,58 @@ test "validation: bad first keyword and bad BITPIX" {
         }
         try testing.expectError(error.BadBitpix, Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{}));
     }
+}
+
+test "recomputeGeometry refreshes axes and data_bytes after a NAXISn edit" {
+    const p = try parseHeader(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "BITPIX  =                   16",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    4",
+        "NAXIS2  =                    3",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    var hdu = try Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{});
+    defer hdu.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 2 * 4 * 3), hdu.data_bytes);
+
+    // Mutate the header in place: bump NAXIS2 and add a third axis.
+    try hdu.header.update(testing.allocator, "NAXIS", .{ .int = 3 }, null);
+    try hdu.header.update(testing.allocator, "NAXIS2", .{ .int = 5 }, null);
+    try hdu.header.update(testing.allocator, "NAXIS3", .{ .int = 2 }, null);
+
+    try hdu.recomputeGeometry(testing.allocator, .{});
+    try testing.expectEqual(@as(u16, 3), hdu.naxis);
+    try testing.expectEqualSlices(u64, &.{ 4, 5, 2 }, hdu.axes);
+    try testing.expectEqual(@as(u64, 2 * 4 * 5 * 2), hdu.data_bytes);
+}
+
+test "recomputeGeometry leaves a safe-to-free axes slice on error" {
+    const p = try parseHeader(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "BITPIX  =                   16",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    4",
+        "NAXIS2  =                    3",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    var hdu = try Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{});
+    defer hdu.deinit(testing.allocator); // must not double-free after the failed recompute
+
+    // Claim a third axis but omit NAXIS3 ⇒ recompute fails partway; axes must end up empty.
+    try hdu.header.update(testing.allocator, "NAXIS", .{ .int = 3 }, null);
+    try testing.expectError(error.MissingRequiredKeyword, hdu.recomputeGeometry(testing.allocator, .{}));
+    try testing.expectEqual(@as(usize, 0), hdu.axes.len);
 }
 
 test "oversized NAXIS product is a typed limit error before allocation" {

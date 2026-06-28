@@ -309,6 +309,248 @@ pub const Fits = struct {
         return header;
     }
 
+    // ── structural editing: data/header resize + following-HDU shift (Phase-1 contract) ────
+    //
+    // Editing a FITS file in place means moving every byte that follows the edited region, then
+    // re-aligning to 2880-byte blocks (§3.1). All of these ops first force a full scan (you can
+    // only shift a fully-known file), require a writable device/mode, move bytes in bounded
+    // chunks (never per byte, never per-byte allocation), patch the in-memory offsets of the
+    // HDUs that moved, and re-init the block reader (its window cache goes stale after a byte
+    // move). The lone primitive underneath them is `shiftTail`.
+
+    // Bounded staging buffer for byte moves and zero-fills (NFR-PERF-3): 64 KiB, on the stack.
+    const CHUNK: usize = 64 * 1024;
+
+    // Move the byte range [from_off, EOF) by `delta` (a signed multiple of BLOCK) and re-align
+    // the device size. GROW (delta>0): grow the device first, copy back-to-front so the shifted
+    // copy never overwrites a not-yet-read source byte, then zero-fill the vacated gap
+    // [from_off, from_off+delta). SHRINK (delta<0): copy front-to-back, then shrink the device.
+    fn shiftTail(self: *Fits, from_off: u64, delta: i64) FitsError!void {
+        if (delta == 0) return;
+        if (!self.dev.isWritable()) return error.NotWritable;
+        const size = try self.dev.getSize();
+        const tail_len = if (from_off < size) size - from_off else 0;
+        var buf: [CHUNK]u8 = undefined;
+        if (delta > 0) {
+            const d: u64 = @intCast(delta);
+            try self.dev.setSize(try limits.add(size, d)); // grow before copying into the new space
+            var remaining = tail_len; // back-to-front to avoid overlap
+            while (remaining > 0) {
+                const n: usize = @intCast(@min(@as(u64, buf.len), remaining));
+                const src = from_off + remaining - n;
+                try self.dev.readAll(buf[0..n], src);
+                try self.dev.writeAll(buf[0..n], src + d);
+                remaining -= n;
+            }
+            @memset(buf[0..], 0); // zero-fill the vacated gap [from_off, from_off+d)
+            var z = d;
+            var zo = from_off;
+            while (z > 0) {
+                const n: usize = @intCast(@min(@as(u64, buf.len), z));
+                try self.dev.writeAll(buf[0..n], zo);
+                zo += n;
+                z -= n;
+            }
+        } else {
+            const d: u64 = @intCast(-delta);
+            var done: u64 = 0; // front-to-back to avoid overlap
+            while (done < tail_len) {
+                const n: usize = @intCast(@min(@as(u64, buf.len), tail_len - done));
+                const src = from_off + done;
+                try self.dev.readAll(buf[0..n], src);
+                try self.dev.writeAll(buf[0..n], src - d);
+                done += n;
+            }
+            try self.dev.setSize(size - d); // drop the now-unused tail
+        }
+    }
+
+    // Zero exactly `len` bytes at `off`, in bounded chunks.
+    fn zeroRange(self: *Fits, off: u64, len: u64) FitsError!void {
+        if (len == 0) return;
+        var buf: [CHUNK]u8 = [_]u8{0} ** CHUNK;
+        var remaining = len;
+        var o = off;
+        while (remaining > 0) {
+            const n: usize = @intCast(@min(@as(u64, buf.len), remaining));
+            try self.dev.writeAll(buf[0..n], o);
+            o += n;
+            remaining -= n;
+        }
+    }
+
+    // Add `delta` to the header/data offsets of every HDU AFTER `pivot`, and to `scan_off`.
+    fn shiftFollowing(self: *Fits, pivot: *const Hdu, delta: i64) void {
+        var seen = false;
+        for (self.hdus.items) |h| {
+            if (seen) {
+                h.header_off = applyDelta(h.header_off, delta);
+                h.data_off = applyDelta(h.data_off, delta);
+            }
+            if (h == pivot) seen = true;
+        }
+        self.scan_off = applyDelta(self.scan_off, delta);
+    }
+
+    // Re-create the block reader: after a byte move its cached window is stale (NFR-CORR). Builds
+    // the replacement before freeing the old one so a failed allocation leaves the handle intact.
+    fn reinitReader(self: *Fits) FitsError!void {
+        const fresh = try block.BlockReader.init(self.alloc, self.dev, 0);
+        self.reader.deinit();
+        self.reader = fresh;
+    }
+
+    /// Resize the data unit of `hdu` to `new_data_bytes`, shifting all following HDUs and
+    /// re-aligning to 2880-byte blocks; zero-fills any growth (the FITS data fill, §3.3.2). The
+    /// header keywords are NOT touched (the caller updates `NAXISn` etc. and may pair this with
+    /// `rewriteHeaderInPlace`). Updates the in-memory offsets of moved HDUs and `scan_off`, and
+    /// re-inits the block reader (FR-HDU-4).
+    pub fn resizeHduData(self: *Fits, hdu: *Hdu, new_data_bytes: u64) FitsError!void {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        try self.ensureScannedAll();
+
+        const old_data_bytes = hdu.data_bytes;
+        const data_off = hdu.data_off;
+        const next_off = hdu.nextOff(); // first byte after the OLD (padded) data unit
+        const old_blocks = block.roundUpBlocks(old_data_bytes);
+        const new_blocks = block.roundUpBlocks(new_data_bytes);
+
+        const delta: i64 = @as(i64, @intCast(new_blocks)) - @as(i64, @intCast(old_blocks));
+        if (delta != 0) {
+            try self.shiftTail(next_off, delta);
+            self.shiftFollowing(hdu, delta);
+        }
+        hdu.data_bytes = new_data_bytes;
+
+        // Zero everything from the last preserved byte to the new block-padded end: the grown
+        // data region plus any block padding (and, on shrink, the vacated padding bytes).
+        const keep = @min(old_data_bytes, new_data_bytes);
+        try self.zeroRange(data_off + keep, new_blocks - keep);
+
+        try self.reinitReader();
+    }
+
+    /// Recompute `hdu`.{bitpix,naxis,axes,pcount,gcount,data_bytes} from its CURRENT header
+    /// (after structural keywords were mutated) WITHOUT moving bytes. Returns the new data byte
+    /// count (§4.4.1.1). Pair with `resizeHduData`/`rewriteHeaderInPlace` to commit the change.
+    pub fn refreshGeometry(self: *Fits, hdu: *Hdu) FitsError!u64 {
+        try self.ensureScannedAll();
+        try hdu.recomputeGeometry(self.alloc, self.limits);
+        return hdu.data_bytes;
+    }
+
+    /// Re-serialize `hdu`'s (possibly card-count-changed) header in place: re-align the header
+    /// block count, shift following HDUs, recompute `data_off`, then — if the geometry implied by
+    /// the new header changed the data size — re-align the data too. Call after editing
+    /// structural keywords (`NAXISn`/`TFORM`/`TFIELDS`/`BITPIX`). Re-inits the block reader.
+    pub fn rewriteHeaderInPlace(self: *Fits, hdu: *Hdu) FitsError!void {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        try self.ensureScannedAll();
+        try hdu.header.ensureEnd(self.alloc);
+
+        const old_header_blocks = hdu.data_off - hdu.header_off; // already block-aligned
+        const new_header_blocks = block.roundUpBlocks(@as(u64, hdu.header.count()) * block.CARD);
+        const header_delta: i64 =
+            @as(i64, @intCast(new_header_blocks)) - @as(i64, @intCast(old_header_blocks));
+        if (header_delta != 0) {
+            try self.shiftTail(hdu.data_off, header_delta);
+            self.shiftFollowing(hdu, header_delta);
+            hdu.data_off = hdu.header_off + new_header_blocks;
+        }
+
+        // Re-write the header cards at their (possibly unchanged) offset, padding with spaces.
+        var bw = try block.BlockWriter.init(self.alloc, self.dev, hdu.header_off, 0);
+        defer bw.deinit();
+        try hdu.header.writeTo(&bw);
+
+        // Refresh the structural fields and re-align the data if the new geometry changed its size.
+        const old_data_bytes = hdu.data_bytes;
+        try hdu.recomputeGeometry(self.alloc, self.limits);
+        const new_data_bytes = hdu.data_bytes;
+        if (new_data_bytes != old_data_bytes) {
+            hdu.data_bytes = old_data_bytes; // restore so resizeHduData sees the on-disk size
+            try self.resizeHduData(hdu, new_data_bytes); // re-inits the reader
+        } else {
+            try self.reinitReader();
+        }
+    }
+
+    /// Delete HDU `n` (1-based): shift the tail down over its bytes, drop and free it, and fix the
+    /// offsets/CHDU of everything that followed. Refuses to delete the primary (FITS requires one)
+    /// with `error.WrongHduType` (FR-HDU-4).
+    pub fn deleteHdu(self: *Fits, n: usize) FitsError!void {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        try self.ensureScannedAll();
+        if (n == 0 or n > self.hdus.items.len) return error.WrongHduType;
+        if (n == 1) return error.WrongHduType; // a FITS file must keep its primary HDU
+
+        const h = self.hdus.items[n - 1];
+        const total = h.nextOff() - h.header_off; // padded header + padded data, block-aligned
+        try self.shiftTail(h.nextOff(), -@as(i64, @intCast(total))); // also truncates the gap
+        for (self.hdus.items[n..]) |fh| {
+            fh.header_off -= total;
+            fh.data_off -= total;
+        }
+        self.scan_off -= total;
+
+        h.deinit(self.alloc);
+        self.alloc.destroy(h);
+        _ = self.hdus.orderedRemove(n - 1);
+
+        if (self.chdu > n - 1) self.chdu -= 1;
+        if (self.chdu >= self.hdus.items.len) self.chdu = self.hdus.items.len - 1;
+        try self.reinitReader();
+    }
+
+    /// Copy HDU `src_n` (1-based) and append the duplicate after the last HDU; returns the new
+    /// `*Hdu`. The on-disk bytes are an exact copy (FR-HDU-4). Note the duplicate is appended as
+    /// an extension, so copying the primary (which carries `SIMPLE`, not `XTENSION`) is rejected
+    /// when the copy is parsed.
+    pub fn copyHdu(self: *Fits, src_n: usize) FitsError!*Hdu {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        try self.ensureScannedAll();
+        if (src_n == 0 or src_n > self.hdus.items.len) return error.WrongHduType;
+
+        const src = self.hdus.items[src_n - 1];
+        const start = src.header_off;
+        const len = src.nextOff() - start; // whole HDU, block-aligned
+        const dest = self.scan_off; // immediately after the last HDU
+
+        const new_size = try limits.add(dest, len);
+        if (new_size > try self.dev.getSize()) try self.dev.setSize(new_size);
+        // Source and destination never overlap (dest ≥ end of the last HDU ≥ src end), so a plain
+        // forward copy is safe.
+        var buf: [CHUNK]u8 = undefined;
+        var done: u64 = 0;
+        while (done < len) {
+            const n: usize = @intCast(@min(@as(u64, buf.len), len - done));
+            try self.dev.readAll(buf[0..n], start + done);
+            try self.dev.writeAll(buf[0..n], dest + done);
+            done += n;
+        }
+
+        try self.reinitReader(); // read the freshly-written copy through a clean window
+        const first_card = dest / block.CARD;
+        const max_cards = @as(u64, self.limits.max_header_blocks) * block.CARDS_PER_BLOCK;
+        const res = try Header.parse(self.alloc, &self.reader, first_card, @intCast(max_cards));
+
+        const hdu_ptr = self.alloc.create(Hdu) catch |e| {
+            var hdr = res.header;
+            hdr.deinit(self.alloc);
+            return e;
+        };
+        errdefer self.alloc.destroy(hdu_ptr);
+        // Always an extension (a primary already exists); Hdu.init takes ownership of res.header.
+        hdu_ptr.* = try Hdu.init(self.alloc, res.header, false, dest, res.cards_consumed, self.limits);
+        errdefer hdu_ptr.deinit(self.alloc);
+        try self.hdus.append(self.alloc, hdu_ptr);
+
+        self.scan_off = hdu_ptr.nextOff();
+        self.fully_scanned = true;
+        self.chdu = self.hdus.items.len - 1;
+        return hdu_ptr;
+    }
+
     /// Flush buffered writes to the device, optionally updating checksums first (FR-SUM-3).
     pub fn flush(self: *Fits) FitsError!void {
         if (self.checksum_on_close) {
@@ -328,6 +570,12 @@ fn validBitpix(b: i64) bool {
         8, 16, 32, 64, -32, -64 => true,
         else => false,
     };
+}
+
+// Apply a signed byte delta to an unsigned offset. Callers only ever shift offsets that lie at
+// or beyond the moved region, so a negative delta never underflows a real offset.
+fn applyDelta(off: u64, delta: i64) u64 {
+    return if (delta >= 0) off + @as(u64, @intCast(delta)) else off - @as(u64, @intCast(-delta));
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────────────
@@ -458,6 +706,253 @@ fn concBuild(alloc: Allocator, idx: u32) !void {
     var rb: [4]u8 = undefined;
     try f2.dev.readAll(&rb, h.data_off);
     if (@import("endian.zig").read(i32, &rb) != @as(i32, @intCast(idx))) return error.BadDimensions;
+}
+
+// ── structural-editing tests (resizeHduData / refreshGeometry / rewriteHeaderInPlace /
+//    deleteHdu / copyHdu) ───────────────────────────────────────────────────────────────────
+
+const endian = @import("endian.zig");
+
+// A writable in-memory handle that owns its MemoryDevice (freed on deinit via owns_device... but
+// MemoryDevice.close is a no-op, so the test frees the device explicitly). Returns both so the
+// test can poke the device directly.
+const Built = struct {
+    f: Fits,
+    mem: *MemoryDevice,
+    fn deinit(self: *Built, alloc: Allocator) void {
+        self.f.deinit();
+        self.mem.deinit();
+        alloc.destroy(self.mem);
+    }
+};
+
+fn newHandle(alloc: Allocator) !Built {
+    const mem = try alloc.create(MemoryDevice);
+    mem.* = MemoryDevice.init(alloc);
+    const f = try Fits.create(alloc, mem.device(), .{});
+    return .{ .f = f, .mem = mem };
+}
+
+// Fill `len` bytes at `off` with a recognizable, position-dependent pattern.
+fn writePattern(dev: Device, off: u64, len: usize, seed: u8) !void {
+    var buf: [4096]u8 = undefined;
+    var done: usize = 0;
+    while (done < len) {
+        const n = @min(buf.len, len - done);
+        for (buf[0..n], 0..) |*b, i| b.* = @truncate(seed +% @as(u8, @truncate(done + i)));
+        try dev.writeAll(buf[0..n], off + done);
+        done += n;
+    }
+}
+
+fn expectPattern(dev: Device, off: u64, len: usize, seed: u8) !void {
+    var buf: [4096]u8 = undefined;
+    var done: usize = 0;
+    while (done < len) {
+        const n = @min(buf.len, len - done);
+        try dev.readAll(buf[0..n], off + done);
+        for (buf[0..n], 0..) |b, i| {
+            try testing.expectEqual(@as(u8, @truncate(seed +% @as(u8, @truncate(done + i)))), b);
+        }
+        done += n;
+    }
+}
+
+test "resizeHduData grow then shrink keeps a trailing HDU byte-intact" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // primary, no data
+    const h2 = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{10} }); // 10 data bytes
+    const h3 = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } }); // 24 data bytes
+    try writePattern(f.dev, h3.data_off, 24, 0x40);
+
+    // Grow h2's data so it spans two blocks, pushing h3 forward. h3 now begins right after h2.
+    try f.resizeHduData(h2, 5000);
+    try testing.expectEqual(@as(u64, 5000), h2.data_bytes);
+    try testing.expectEqual(h2.nextOff(), h3.header_off);
+    try testing.expectEqual(h2.data_off + block.roundUpBlocks(5000), h3.header_off);
+    try expectPattern(f.dev, h3.data_off, 24, 0x40); // trailing HDU survived the move
+
+    // Shrink h2 back down; h3 returns to its original neighbourhood and stays intact.
+    try f.resizeHduData(h2, 10);
+    try testing.expectEqual(@as(u64, 10), h2.data_bytes);
+    try testing.expectEqual(h2.nextOff(), h3.header_off);
+    try testing.expectEqual(h2.data_off + block.BLOCK, h3.header_off);
+    try expectPattern(f.dev, h3.data_off, 24, 0x40);
+
+    // Re-scanning the file from scratch must see the same structure.
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    try testing.expectEqual(@as(usize, 3), try f2.hduCount());
+}
+
+test "resizeHduData grow within one block zero-fills the new bytes" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const h2 = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{8} });
+    try writePattern(f.dev, h2.data_off, 8, 0x11);
+    try f.resizeHduData(h2, 20); // still one block
+    try expectPattern(f.dev, h2.data_off, 8, 0x11); // original bytes preserved
+    var z: [12]u8 = undefined;
+    try f.dev.readAll(&z, h2.data_off + 8); // grown bytes are zero
+    try testing.expectEqualSlices(u8, &[_]u8{0} ** 12, &z);
+}
+
+test "refreshGeometry recomputes data_bytes after a NAXISn edit" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const h2 = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } }); // 24 bytes
+    try h2.header.update(f.alloc, "NAXIS2", .{ .int = 5 }, null);
+    const nb = try f.refreshGeometry(h2);
+    try testing.expectEqual(@as(u64, 2 * 4 * 5), nb);
+    try testing.expectEqual(@as(u64, 40), h2.data_bytes);
+    try testing.expectEqualSlices(u64, &.{ 4, 5 }, h2.axes);
+}
+
+test "rewriteHeaderInPlace: adding NAXIS3 grows the data and shifts the trailing HDU" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const h2 = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{ 2000, 1 } }); // 2000 bytes → 1 block
+    const h3 = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{7} }); // 7 bytes
+    try writePattern(f.dev, h3.data_off, 7, 0x77);
+    const old_h3_data_off = h3.data_off;
+
+    // Promote to a 3-D cube: 2000×1×2 = 4000 bytes → 2 blocks.
+    try h2.header.update(f.alloc, "NAXIS", .{ .int = 3 }, null);
+    try h2.header.update(f.alloc, "NAXIS3", .{ .int = 2 }, null);
+    try f.rewriteHeaderInPlace(h2);
+
+    try testing.expectEqual(@as(u16, 3), h2.naxis);
+    try testing.expectEqual(@as(u64, 4000), h2.data_bytes);
+    try testing.expectEqual(old_h3_data_off + block.BLOCK, h3.data_off); // shifted one block
+    try expectPattern(f.dev, h3.data_off, 7, 0x77);
+
+    // The rewritten header parses back identically on a fresh open.
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    const r2 = try f2.select(2);
+    try testing.expectEqual(@as(u16, 3), r2.naxis);
+    try testing.expectEqualSlices(u64, &.{ 2000, 1, 2 }, r2.axes);
+}
+
+test "rewriteHeaderInPlace: header card growth shifts following HDUs without touching data size" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const h2 = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{ 2000, 1 } });
+    const h3 = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{7} });
+    try writePattern(f.dev, h3.data_off, 7, 0x55);
+    const old_h2_data_off = h2.data_off;
+    const old_h3_header_off = h3.header_off;
+
+    // Add enough keywords to push the header from one block (36 cards) into two.
+    var name_buf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 41) : (i += 1) {
+        const kw = std.fmt.bufPrint(&name_buf, "KEY{d:0>3}", .{i}) catch unreachable;
+        try h2.header.update(f.alloc, kw, .{ .int = @intCast(i) }, null);
+    }
+    try f.rewriteHeaderInPlace(h2);
+
+    try testing.expectEqual(@as(u64, 2000), h2.data_bytes); // data size unchanged
+    try testing.expectEqual(old_h2_data_off + block.BLOCK, h2.data_off); // header grew one block
+    try testing.expectEqual(old_h3_header_off + block.BLOCK, h3.header_off);
+    try expectPattern(f.dev, h3.data_off, 7, 0x55);
+
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    const r2 = try f2.select(2);
+    try testing.expectEqual(@as(i64, 40), try r2.header.getValue(i64, "KEY040"));
+}
+
+test "deleteHdu removes the named HDU and the rest stay valid" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{10} }); // h2 (to be deleted)
+    const h3 = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } }); // h3, known data
+    try writePattern(f.dev, h3.data_off, 24, 0x90);
+
+    try testing.expectEqual(@as(usize, 3), try f.hduCount());
+    try f.deleteHdu(2);
+    try testing.expectEqual(@as(usize, 2), f.hdus.items.len);
+
+    // The old h3 is now HDU 2; its bytes moved down but stayed intact.
+    const moved = try f.select(2);
+    try testing.expectEqual(hdu_mod.HduKind.image, moved.kind);
+    try testing.expectEqualSlices(u64, &.{ 4, 3 }, moved.axes);
+    try expectPattern(f.dev, moved.data_off, 24, 0x90);
+
+    // A fresh open agrees.
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    try testing.expectEqual(@as(usize, 2), try f2.hduCount());
+    const r2 = try f2.select(2);
+    try testing.expectEqualSlices(u64, &.{ 4, 3 }, r2.axes);
+}
+
+test "deleteHdu refuses to delete the primary" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{4} });
+    try testing.expectError(error.WrongHduType, f.deleteHdu(1));
+    try testing.expectError(error.WrongHduType, f.deleteHdu(9)); // out of range
+}
+
+test "copyHdu produces a byte-identical duplicate" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const h2 = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+    try writePattern(f.dev, h2.data_off, 24, 0xA0);
+    const src_start = h2.header_off;
+    const src_len = h2.nextOff() - src_start;
+
+    const dup = try f.copyHdu(2);
+    try testing.expectEqual(@as(usize, 3), f.hdus.items.len);
+    try testing.expectEqual(hdu_mod.HduKind.image, dup.kind);
+    try testing.expectEqualSlices(u64, &.{ 4, 3 }, dup.axes);
+
+    // The two on-disk byte ranges are identical.
+    const a = try testing.allocator.alloc(u8, @intCast(src_len));
+    defer testing.allocator.free(a);
+    const c = try testing.allocator.alloc(u8, @intCast(src_len));
+    defer testing.allocator.free(c);
+    try f.dev.readAll(a, src_start);
+    try f.dev.readAll(c, dup.header_off);
+    try testing.expectEqualSlices(u8, a, c);
+
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    try testing.expectEqual(@as(usize, 3), try f2.hduCount());
+}
+
+test "structural edits are rejected on a read-only handle" {
+    const mem = try twoHduFile(testing.allocator);
+    defer {
+        mem.deinit();
+        testing.allocator.destroy(mem);
+    }
+    var f = try Fits.open(testing.allocator, mem.device(), .read_only, .{});
+    defer f.deinit();
+    const h2 = try f.select(2);
+    try testing.expectError(error.NotWritable, f.resizeHduData(h2, 100));
+    try testing.expectError(error.NotWritable, f.rewriteHeaderInPlace(h2));
+    try testing.expectError(error.NotWritable, f.deleteHdu(2));
+    try testing.expectError(error.NotWritable, f.copyHdu(2));
 }
 
 test "distinct Fits handles run concurrently from multiple threads" {
