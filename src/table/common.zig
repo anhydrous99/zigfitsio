@@ -290,6 +290,84 @@ pub const Tdisp = struct {
     }
 };
 
+// ── TDISP value rendering (FR-UTL-5, §19.1) ──────────────────────────────────────────────
+
+/// The display width of a `TDISP` format — the field width `w` (≡ CFITSIO
+/// `fits_get_col_display_width`).
+pub fn displayWidth(disp: Tdisp) u16 {
+    return disp.width;
+}
+
+/// Render a floating value per `disp` (`F`/`E`/`D`/`G`/`EN`/`ES`) right-justified into `out`,
+/// returning the used slice. `error.BadTform` if `out` is too small for the field width.
+pub fn renderFloat(disp: Tdisp, out: []u8, v: f64) error{BadTform}![]const u8 {
+    var tmp: [80]u8 = undefined;
+    var tw = std.Io.Writer.fixed(&tmp);
+    const mode: std.fmt.Number.Mode = if (disp.code[0] == 'F') .decimal else .scientific;
+    tw.printFloat(v, .{ .mode = mode, .precision = disp.decimals }) catch return error.BadTform;
+    return rightJustify(out, tw.buffered(), disp.width);
+}
+
+/// Render an integer value per `disp` (`I`/`B`/`O`/`Z` with optional minimum digits `.m`)
+/// right-justified into `out`.
+pub fn renderInt(disp: Tdisp, out: []u8, v: i64) error{BadTform}![]const u8 {
+    const base: u8 = switch (disp.code[0]) {
+        'O' => 8,
+        'Z' => 16,
+        'B' => 2,
+        else => 10,
+    };
+    var digits: [80]u8 = undefined;
+    var dw = std.Io.Writer.fixed(&digits);
+    const mag: u64 = @abs(v);
+    dw.printInt(mag, base, .upper, .{}) catch return error.BadTform;
+    const body = dw.buffered();
+
+    var tmp: [80]u8 = undefined;
+    var n: usize = 0;
+    if (v < 0) {
+        tmp[n] = '-';
+        n += 1;
+    }
+    // Zero-pad the magnitude to the minimum digit count.
+    if (disp.min_digits > body.len) {
+        const pad = disp.min_digits - body.len;
+        if (n + pad > tmp.len) return error.BadTform;
+        @memset(tmp[n .. n + pad], '0');
+        n += pad;
+    }
+    if (n + body.len > tmp.len) return error.BadTform;
+    @memcpy(tmp[n .. n + body.len], body);
+    n += body.len;
+    return rightJustify(out, tmp[0..n], disp.width);
+}
+
+/// Render a string value per an `Aw` `disp`, left-justified and blank-padded into `out`.
+pub fn renderString(disp: Tdisp, out: []u8, s: []const u8) error{BadTform}![]const u8 {
+    const w: usize = disp.width;
+    if (w > out.len) return error.BadTform;
+    @memset(out[0..w], ' ');
+    const n = @min(s.len, w);
+    @memcpy(out[0..n], s[0..n]); // truncates to the field width (left-justified)
+    return out[0..w];
+}
+
+// Right-justify `body` into a `width`-column field at the start of `out` (blank-padded left).
+fn rightJustify(out: []u8, body: []const u8, width: u16) error{BadTform}![]const u8 {
+    const w: usize = width;
+    if (w > out.len) return error.BadTform;
+    if (body.len >= w) {
+        // Value does not fit the field width: surface as a typed error, not truncation.
+        if (body.len > w) return error.BadTform;
+        @memcpy(out[0..w], body);
+        return out[0..w];
+    }
+    const pad = w - body.len;
+    @memset(out[0..pad], ' ');
+    @memcpy(out[pad .. pad + body.len], body);
+    return out[0..w];
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────────────────
 const testing = std.testing;
 
@@ -374,6 +452,25 @@ test "ASCII column range" {
     try testing.expectEqual(@as(u64, 10), r2.start);
     try testing.expectEqual(@as(u64, 15), r2.end);
     try testing.expectError(error.BadTbcol, asciiFieldRange(0, 5));
+}
+
+test "TDISP rendering and display width (FR-UTL-5)" {
+    var buf: [32]u8 = undefined;
+    // Iw.m: integer width 6, min 3 digits, right-justified.
+    try testing.expectEqualStrings("   042", try renderInt(try Tdisp.parse("I6.3"), &buf, 42));
+    try testing.expectEqualStrings("  -042", try renderInt(try Tdisp.parse("I6.3"), &buf, -42));
+    try testing.expectEqualStrings("     7", try renderInt(try Tdisp.parse("I6"), &buf, 7));
+    // Z (hex), B (binary).
+    try testing.expectEqualStrings("    FF", try renderInt(try Tdisp.parse("Z6"), &buf, 255));
+    try testing.expectEqualStrings("  1010", try renderInt(try Tdisp.parse("B6"), &buf, 10));
+    // Fw.d fixed-point, right-justified.
+    try testing.expectEqualStrings("  3.14", try renderFloat(try Tdisp.parse("F6.2"), &buf, 3.14159));
+    // Aw string, left-justified blank-padded.
+    try testing.expectEqualStrings("M31     ", try renderString(try Tdisp.parse("A8"), &buf, "M31"));
+    // display width is the field width.
+    try testing.expectEqual(@as(u16, 15), displayWidth(try Tdisp.parse("E15.7")));
+    // overflow is a typed error, not truncation.
+    try testing.expectError(error.BadTform, renderInt(try Tdisp.parse("I2"), &buf, 12345));
 }
 
 test "TDISP parsing" {
