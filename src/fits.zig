@@ -420,3 +420,56 @@ test "read-only device rejects appends" {
     try testing.expectError(error.NotWritable, f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }));
 }
 
+
+// ── X-CONC: distinct handles are usable concurrently (NFR-CONC-1, NFR-TEST-5a) ────────────
+// NOTE: a single `Fits` handle is NOT thread-safe (it mutates its block cache, CHDU index,
+// and lazily-grown HDU list); this is documented on `Fits` above. Distinct handles share no
+// state and are safe to use from different threads, which this test exercises.
+
+fn concWorker(alloc: Allocator, ok: *bool, idx: u32) void {
+    concBuild(alloc, idx) catch {
+        ok.* = false;
+        return;
+    };
+    ok.* = true;
+}
+
+fn concBuild(alloc: Allocator, idx: u32) !void {
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    {
+        var f = try Fits.create(alloc, mem.device(), .{});
+        defer f.deinit();
+        const hdu = try f.appendImageHdu(.{ .bitpix = 32, .axes = &.{ 4, 4 } });
+        // Write 16 big-endian i32 pixels = idx, directly through the device.
+        var bytes: [64]u8 = undefined;
+        var k: usize = 0;
+        while (k < 16) : (k += 1) {
+            @import("endian.zig").write(i32, @intCast(idx), bytes[k * 4 ..][0..4]);
+        }
+        try f.dev.writeAll(&bytes, hdu.data_off);
+        try f.flush();
+    }
+    // Reopen the same (distinct) device and verify the geometry and a pixel round-trip.
+    var f2 = try Fits.open(alloc, mem.device(), .read_only, .{});
+    defer f2.deinit();
+    const h = try f2.select(1);
+    if (h.naxis != 2 or h.axes[0] != 4 or h.axes[1] != 4) return error.BadDimensions;
+    var rb: [4]u8 = undefined;
+    try f2.dev.readAll(&rb, h.data_off);
+    if (@import("endian.zig").read(i32, &rb) != @as(i32, @intCast(idx))) return error.BadDimensions;
+}
+
+test "distinct Fits handles run concurrently from multiple threads" {
+    // A thread-safe allocator (the testing allocator's leak tracking is not thread-safe; leak
+    // checking is covered by the single-threaded tests).
+    const alloc = std.heap.smp_allocator;
+    const N = 8;
+    var oks = [_]bool{false} ** N;
+    var threads: [N]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, concWorker, .{ alloc, &oks[i], @as(u32, @intCast(i + 1)) });
+    }
+    for (&threads) |t| t.join();
+    for (oks) |ok| try testing.expect(ok);
+}
