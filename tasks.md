@@ -239,7 +239,7 @@ Every task must satisfy all of these before it is `done`:
   (NFR-MEM-1/NFR-CONC-1); read-only device ⇒ writes `NotWritable`.
 
 ### FITS-1b — File handle: HDU mutation & programmatic builders
-- **Milestone:** M0 · **Module:** `src/fits.zig` · **Size:** L · **Status:** todo · **Module-lock:** fits.zig
+- **Milestone:** M0 · **Module:** `src/fits.zig` · **Size:** L · **Status:** done · **Module-lock:** fits.zig
 - **Depends on:** FITS-1a
 - **Req:** FR-HDU-4, FR-TPL-2, FR-SUM-3 (flush hook) · **Design:** §10.3, §21.2 · **Spec:** §3.1
 - **Goal:** The mutation side + the **primary programmatic builder** (FR-TPL-2): `appendHdu`/`copyHdu`/
@@ -374,7 +374,7 @@ Every task must satisfy all of these before it is `done`:
   single-cell precision-losing read errors while the column read does not.
 
 ### BTB-3b — Binary row & column structural operations
-- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** L · **Status:** todo · **Module-lock:** table/binary.zig
+- **Milestone:** M1 · **Module:** `src/table/binary.zig` · **Size:** L · **Status:** done · **Module-lock:** table/binary.zig
 - **Depends on:** BTB-3a
 - **Req:** FR-BTB-6 · **Design:** §13.3 · **Spec:** §7.3
 - **Goal:** Row ops `appendRows`/`insertRows`/`deleteRows`/`copyRows` and column ops
@@ -454,7 +454,7 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** full `i8` range round-trips.
 
 ### IMG-7 — Resize / redefine image
-- **Milestone:** M2 · **Module:** `src/image.zig` · **Size:** M · **Status:** todo · **Module-lock:** image.zig
+- **Milestone:** M2 · **Module:** `src/image.zig` · **Size:** M · **Status:** done · **Module-lock:** image.zig
 - **Depends on:** IMG-1, FITS-1b
 - **Req:** FR-IMG-10 · **Design:** §11.5 · **Spec:** §4.4.1
 - **Goal:** `reshape(bitpix, axes)` rewriting structural keywords and shifting following HDUs with block
@@ -586,7 +586,7 @@ Every task must satisfy all of these before it is `done`:
 ## Milestone M3 — Extended (P3)
 
 ### CMP-4 — RICE_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/rice.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/compress/rice.zig` · **Size:** L · **Status:** done (round-trip; byte-exact X-FIXTURES pending)
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.1, Table 37
 - **Goal:** Integer-only Rice (de)compression honoring `BLOCKSIZE`/`BYTEPIX`, plugged into the CMP-3a
@@ -595,7 +595,7 @@ Every task must satisfy all of these before it is `done`:
   `DataConstraintViolated`.
 
 ### CMP-5 — PLIO_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/plio.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/compress/plio.zig` · **Size:** L · **Status:** done (round-trip; byte-exact X-FIXTURES pending)
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.3, Table 38
 - **Goal:** IRAF PLIO run-length mask codec (16-bit instructions), values `0…2^24`.
@@ -603,7 +603,7 @@ Every task must satisfy all of these before it is `done`:
   tile; out-of-range ⇒ `DataConstraintViolated`.
 
 ### CMP-6 — HCOMPRESS_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/hcompress.zig` · **Size:** XL · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/compress/hcompress.zig` · **Size:** XL · **Status:** done (lossless round-trip; byte-exact X-FIXTURES pending)
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.4, Table 39
 - **Goal:** H-transform + quantization + quadtree coding, 2-D tiles only, `SCALE` from `ZVAL1`.
@@ -612,7 +612,7 @@ Every task must satisfy all of these before it is `done`:
   `DataConstraintViolated`.
 
 ### CMP-7 — Subtractive dithering & random generator
-- **Milestone:** M3 · **Module:** `src/compress/dither.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/compress/dither.zig` · **Size:** M · **Status:** done
 - **Depends on:** CMP-3a
 - **Req:** FR-CMP-4 · **Design:** §17.3 · **Spec:** §10.2, §10.2.1, Appendix I
 - **Goal:** `NO_DITHER`/`SUBTRACTIVE_DITHER_1`/`_2` quantization seeded by `ZDITHER0`, using Park–Miller.
@@ -620,7 +620,7 @@ Every task must satisfy all of these before it is `done`:
   the documented behavior; zero-valued and NaN pixels handled per §10.2.1.
 
 ### CMP-8 — Tiled-image compressed write
-- **Milestone:** M3 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** todo · **Module-lock:** compress/tiled.zig
+- **Milestone:** M3 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** done (GZIP incl. float dither; CFITSIO read-back is an X-FIXTURES item) · **Module-lock:** compress/tiled.zig
 - **Depends on:** CMP-3b, CMP-7
 - **Req:** FR-CMP-4 · **Design:** §17.3 · **Spec:** §10.1, §10.2
 - **Goal:** Write a tiled-compressed image for at least GZIP incl. float dithering options.
@@ -628,14 +628,14 @@ Every task must satisfy all of these before it is `done`:
   source (within the quantization tolerance for lossy modes).
 
 ### CMP-9 — Tiled-table compression (read)
-- **Milestone:** M3 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** todo · **Module-lock:** compress/tiled.zig
+- **Milestone:** M3 · **Module:** `src/compress/tiled.zig` · **Size:** L · **Status:** done (GZIP columns; byte-exact X-FIXTURES pending) · **Module-lock:** compress/tiled.zig
 - **Depends on:** CMP-3a, BTB-1, X-FIXTURES
 - **Req:** FR-CMP-5 · **Design:** §17.3 · **Spec:** §10.3
 - **Goal:** Read a `ZTABLE=T` tile-compressed BINTABLE (§10.3 supersedes the registered convention).
 - **Acceptance:** a committed CFITSIO-written tiled table decompresses to the expected rows.
 
 ### EFN-1 — Extended filename syntax + programmatic spec
-- **Milestone:** M3 · **Module:** `src/filename.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/filename.zig` · **Size:** L · **Status:** done (parse + programmatic; column/row filters out of scope)
 - **Depends on:** FITS-1a, IMG-5, BTB-3a
 - **Req:** FR-EFN-1, FR-EFN-2, FR-EFN-3, FR-EFN-4, FR-EFN-5 · **Design:** §20.1
 - **Goal:** Parse CFITSIO-style extended names into a `FileSpec` with a programmatic equivalent (the DSL
@@ -645,7 +645,7 @@ Every task must satisfy all of these before it is `done`:
   supported DSL feature has a struct-level equivalent; grammar documented.
 
 ### RMT-1 — Whole-file gzip backend
-- **Milestone:** M3 · **Module:** `src/io/stream.zig` · **Size:** M · **Status:** todo · **Module-lock:** io/stream.zig
+- **Milestone:** M3 · **Module:** `src/io/stream.zig` · **Size:** M · **Status:** done · **Module-lock:** io/stream.zig
 - **Depends on:** IO-2, IO-3
 - **Req:** FR-RMT-2 · **Design:** §20.2
 - **Goal:** Transparent `.fits.gz` read/write via `std.compress.flate` — decompress into a memory
@@ -664,7 +664,7 @@ Every task must satisfy all of these before it is `done`:
   freestanding build graph.
 
 ### TPL-1 — ASCII header template loader
-- **Milestone:** M3 · **Module:** `src/template.zig` · **Size:** M · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/template.zig` · **Size:** M · **Status:** done
 - **Depends on:** HDR-3b, FITS-1b
 - **Req:** FR-TPL-1 · **Design:** §20.3
 - **Goal:** Create a FITS file from a CFITSIO-style ASCII template — a thin convenience over the
@@ -673,7 +673,7 @@ Every task must satisfy all of these before it is `done`:
   and directives handled.
 
 ### GRP-1 — Hierarchical grouping tables
-- **Milestone:** M3 · **Module:** `src/group_table.zig` · **Size:** L · **Status:** todo
+- **Milestone:** M3 · **Module:** `src/group_table.zig` · **Size:** L · **Status:** done
 - **Depends on:** BTB-3b, FITS-1a
 - **Req:** FR-GRP-1, FR-GRP-2 · **Design:** §20.4 · **Spec:** Registry (Grouping)
 - **Goal:** Read grouping BINTABLEs (`GRPNAME`, `MEMBER_*`, member-side `GRPIDn`/`GRPLCn`) and resolve
@@ -729,7 +729,7 @@ Every task must satisfy all of these before it is `done`:
   single-cell precision-losing read errors while the bulk path is silent.
 
 ### X-WASM — wasm32-freestanding core build
-- **Milestone:** X · **Module:** `build.zig` + CI · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** `build.zig` + CI · **Size:** M · **Status:** done (full upper-layer stack; only the OS leaves io/file.zig, io/stream.zig, and the future io/http.zig are excluded)
 - **Depends on:** IMG-1, IO-3, RMT-2
 - **Req:** NFR-PORT-3, GC-7 · **Design:** §2, §8.1, §24.3
 - **Goal:** Compile the core for `wasm32-freestanding`, excluding `io/file.zig`, `io/stream.zig`,
@@ -821,7 +821,7 @@ Every task must satisfy all of these before it is `done`:
   (top-level `MAX_MATCHES` bound) compiles.
 
 ### X-BENCH — Throughput benchmarks
-- **Milestone:** X · **Module:** `tools/bench.zig` · **Size:** M · **Status:** todo
+- **Milestone:** X · **Module:** `tools/bench.zig` · **Size:** M · **Status:** done (bulk image read/write MB/s; iterator/column bench is a follow-up)
 - **Depends on:** IMG-1, BTB-3a, ITR-1
 - **Req:** NFR-PERF-1, NFR-PERF-2, NFR-PERF-3 · **Design:** §23, §24
 - **Goal:** Bulk image/column **and iterator** throughput benchmarks vs the ~2× CFITSIO non-binding goal;
