@@ -51,6 +51,7 @@ test {
     _ = @import("io/block.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
+    _ = @import("compress/gzip.zig");
     _ = @import("table/common.zig");
 }
 
