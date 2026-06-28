@@ -31,6 +31,8 @@ pub const block = @import("io/block.zig");
 // ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
 /// FITS date/time + Julian-Date helpers (FR-UTL-1).
 pub const DateTime = @import("wcs/time.zig").DateTime;
+/// Shared table column model: TFORM/TDISP parsing (FR-UTL-2).
+pub const table_common = @import("table/common.zig");
 
 test {
     // Pull every module's tests into the suite (`zig build test`). Each module is listed
@@ -49,6 +51,7 @@ test {
     _ = @import("io/block.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
+    _ = @import("table/common.zig");
 }
 
 test "version is non-empty" {
