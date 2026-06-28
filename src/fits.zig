@@ -6,13 +6,24 @@
 //! its block cache, CHDU index, and lazily-grown HDU list). HDUs are scanned lazily and each
 //! `*Hdu` is individually allocated, so a view holding one stays valid as the list grows.
 const std = @import("std");
+const builtin = @import("builtin");
 const errors = @import("errors.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const Limits = @import("limits.zig").Limits;
 const limits = @import("limits.zig");
 const Device = @import("io/device.zig").Device;
-const FileDevice = @import("io/file.zig").FileDevice;
-const file = @import("io/file.zig");
+// `io/file.zig` is an OS-backed leaf (std.fs + std.Io.Threaded), excluded from the
+// wasm32-freestanding build graph (X-WASM, GC-7). On freestanding, `openFile`/`createFile`
+// degrade to `error.NotWritable`; the in-memory `Device` is the freestanding I/O path.
+const freestanding = builtin.target.os.tag == .freestanding;
+const file = if (freestanding) struct {
+    pub const Access = enum { read_only, read_write, create };
+} else @import("io/file.zig");
+const FileDevice = if (freestanding) struct {
+    pub fn openPath(_: Allocator, _: []const u8, _: file.Access) FitsError!Device {
+        return error.NotWritable;
+    }
+} else @import("io/file.zig").FileDevice;
 const block = @import("io/block.zig");
 const Header = @import("header/header.zig").Header;
 const hdu_mod = @import("hdu.zig");
