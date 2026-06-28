@@ -178,10 +178,17 @@ const Validator = struct {
                 try self.add(.err, idx, kw, "mandatory NAXISn keyword is missing");
             }
         }
-        // Tables additionally require TFIELDS/PCOUNT/GCOUNT.
+        // Tables additionally require TFIELDS/PCOUNT/GCOUNT, and (§7.2.1/§7.3.1) those count
+        // keywords must immediately follow NAXISn in the order PCOUNT, GCOUNT, TFIELDS.
         if (hdu.kind == .ascii_table or hdu.kind == .binary_table) {
             inline for (.{ "TFIELDS", "PCOUNT", "GCOUNT" }) |req| {
                 if (!hdu.header.has(req)) try self.add(.err, idx, req, "mandatory table keyword is missing");
+            }
+            const after = 3 + @as(usize, hdu.naxis); // first card index past NAXISn
+            inline for (.{ "PCOUNT", "GCOUNT", "TFIELDS" }, 0..) |kw, k| {
+                if (hdu.header.has(kw) and (cnt <= after + k or !hdu.header.at(after + k).name.eqlText(kw))) {
+                    try self.add(.err, idx, kw, "table count keyword is not in its mandatory position after NAXISn");
+                }
             }
         }
     }
@@ -549,6 +556,50 @@ test "ASCII table TBCOL plus width past NAXIS1 is flagged; NAXIS1 may exceed ext
 
     try testing.expect(hasFinding(&findings, 2, .err, "TBCOL2")); // overruns NAXIS1
     try testing.expect(!hasFinding(&findings, 2, .err, "TBCOL1")); // fits, plus the gap is legal
+}
+
+test "checkMandatory flags table count keywords out of position" {
+    const alloc = testing.allocator;
+    // A binary-table header whose count keywords do NOT immediately follow NAXIS2 (a TFORM
+    // intrudes before TFIELDS). The write/scan path (`hdu.validate`) now rejects such a header
+    // outright, so it can never be scanned into an `Hdu`; we therefore exercise the verify-layer
+    // positional check directly on a hand-assembled `Hdu`.
+    const axes = try alloc.dupe(u64, &.{ 4, 1 });
+    errdefer alloc.free(axes);
+    var h = Header.initEmpty();
+    errdefer h.deinit(alloc);
+    try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
+    try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+    try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+    try h.appendValue(alloc, "NAXIS1", .{ .int = 4 }, null);
+    try h.appendValue(alloc, "NAXIS2", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "PCOUNT", .{ .int = 0 }, null);
+    try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "TFORM1", .{ .string = "1J" }, null); // intrudes before TFIELDS
+    try h.appendValue(alloc, "TFIELDS", .{ .int = 1 }, null);
+    try h.ensureEnd(alloc);
+
+    var hdu: Hdu = .{
+        .kind = .binary_table,
+        .header = h,
+        .header_off = 0,
+        .data_off = block.BLOCK,
+        .data_bytes = 4,
+        .bitpix = 8,
+        .naxis = 2,
+        .axes = axes,
+        .pcount = 0,
+        .gcount = 1,
+    };
+    // From here `hdu` owns both `h` and `axes`; the errdefers above still cover an early failure
+    // (they free the same memory `hdu.deinit` would), and `hdu.deinit` runs only on success.
+    var findings: Findings = .empty;
+    defer deinitFindings(alloc, &findings);
+    var v: Validator = .{ .alloc = alloc, .fits = undefined, .out = &findings };
+    try v.checkMandatory(&hdu, 2);
+    try testing.expect(hasFinding(&findings, 2, .err, "TFIELDS")); // out of mandatory position
+
+    hdu.deinit(alloc);
 }
 
 test "declared data unit past the device length is flagged" {

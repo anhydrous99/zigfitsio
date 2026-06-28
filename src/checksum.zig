@@ -337,6 +337,49 @@ test "encodeChecksum/decodeChecksum round-trip and produce a clean ASCII alphabe
     }
 }
 
+test "encodeChecksum matches the FITS Appendix J.3 reference vector" {
+    // Appendix J.3 worked example: the complemented sum 0xCC3FDFE2 encodes to this 16-char field.
+    var buf: [16]u8 = undefined;
+    encodeChecksum(0xCC3FDFE2, &buf);
+    try testing.expectEqualStrings("hcHjjc9ghcEghc9g", &buf);
+}
+
+test "ASCII-table data unit is ASCII-space padded, changing DATASUM (FITS §3)" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // primary
+
+    // A 1-column ASCII table (XTENSION='TABLE'); the data unit must be filled with 0x20, not 0x00.
+    var h = Header.initEmpty();
+    try h.appendValue(alloc, "XTENSION", .{ .string = "TABLE" }, null);
+    try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+    try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+    try h.appendValue(alloc, "NAXIS1", .{ .int = 10 }, null);
+    try h.appendValue(alloc, "NAXIS2", .{ .int = 3 }, null);
+    try h.appendValue(alloc, "PCOUNT", .{ .int = 0 }, null);
+    try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "TFIELDS", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "TBCOL1", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "TFORM1", .{ .string = "I10" }, null);
+    const hdu = try f.appendHdu(h); // ownership transferred
+
+    // The reserved+padded data unit reads back as ASCII space everywhere it is untouched.
+    var first: [1]u8 = undefined;
+    try f.dev.readAll(&first, hdu.data_off);
+    try testing.expectEqual(@as(u8, ' '), first[0]);
+
+    // DATASUM over the space-padded unit differs from the zero-padded value it would have had.
+    const space_sum = try datasum(&f, hdu);
+    const padded = block.roundUpBlocks(hdu.data_bytes);
+    const zeros = try alloc.alloc(u8, @intCast(padded));
+    defer alloc.free(zeros);
+    @memset(zeros, 0);
+    try testing.expect(space_sum != sumBytes(0, zeros));
+}
+
 // Build a minimal primary image header (BITPIX=8, NAXIS=1) for the round-trip tests. With
 // `checksum_cards`, placeholder DATASUM/CHECKSUM cards are appended so `update` can edit them in
 // place. The errdefer is discharged on success; the returned header is handed to `appendHdu`.

@@ -174,8 +174,23 @@ pub const Fits = struct {
             return e;
         };
         errdefer self.alloc.destroy(hdu_ptr);
-        // Hdu.init takes ownership of the header (frees it on its own error).
-        hdu_ptr.* = try Hdu.init(self.alloc, res.header, is_primary, self.scan_off, res.cards_consumed, self.limits);
+        // Hdu.init takes ownership of the header (frees it on its own error). Special-records
+        // policy (§3.5): once at least one HDU has been scanned, a trailing 2880-byte region that
+        // is NOT a recognizable extension HDU is treated as special records — not a hard error —
+        // exactly as the Header.parse failure above is. The "special-records signature" is a block
+        // that lacks a valid `XTENSION` (`MissingRequiredKeyword`) or names an unknown extension
+        // type (`BadExtension`); a structurally-intended-but-malformed extension (bad BITPIX /
+        // NAXIS / keyword order / limit overflow) still propagates so the caller learns of it.
+        hdu_ptr.* = Hdu.init(self.alloc, res.header, is_primary, self.scan_off, res.cards_consumed, self.limits) catch |err| {
+            if (self.hdus.items.len > 0 and
+                (err == error.MissingRequiredKeyword or err == error.BadExtension))
+            {
+                self.alloc.destroy(hdu_ptr); // success-return path: the errdefer above won't fire
+                self.fully_scanned = true;
+                return null;
+            }
+            return err; // errdefer destroys hdu_ptr; Hdu.init already freed res.header
+        };
         errdefer hdu_ptr.deinit(self.alloc);
         try self.hdus.append(self.alloc, hdu_ptr);
 
@@ -256,6 +271,12 @@ pub const Fits = struct {
         var header_owned = true;
         errdefer if (header_owned) header.deinit(self.alloc);
         try self.ensureScannedAll(); // append after all existing HDUs
+        // A lazy scan that stopped on trailing special records (§3.5) leaves `scan_off` pointing at
+        // that region while the device extends past it. Appending here would write the new HDU on
+        // top of the special records, silently clobbering them. The library never emits special
+        // records itself, so rather than relocate the region we refuse the append with a typed
+        // error (the file must be rewritten without the trailing records first).
+        if (try self.dev.getSize() > self.scan_off) return error.WrongHduType;
         try header.ensureEnd(self.alloc);
 
         const is_primary = self.hdus.items.len == 0;
@@ -274,6 +295,10 @@ pub const Fits = struct {
         // Reserve & zero-fill the data unit so the file is structurally valid before data lands.
         const data_end = try limits.add(hdu_ptr.data_off, block.roundUpBlocks(hdu_ptr.data_bytes));
         if (data_end > try self.dev.getSize()) try self.dev.setSize(data_end);
+        // ASCII tables must pad with ASCII space, not zero (FITS §3); overwrite the reserved unit.
+        if (hdu_ptr.kind == .ascii_table) {
+            try self.fillRange(hdu_ptr.data_off, block.roundUpBlocks(hdu_ptr.data_bytes), ' ');
+        }
 
         try self.hdus.append(self.alloc, hdu_ptr);
         self.scan_off = data_end;
@@ -376,10 +401,12 @@ pub const Fits = struct {
         }
     }
 
-    // Zero exactly `len` bytes at `off`, in bounded chunks.
-    fn zeroRange(self: *Fits, off: u64, len: u64) FitsError!void {
+    // Write exactly `len` bytes of `byte` at `off`, in bounded chunks. The fill byte is the data
+    // unit's pad value: `0x00` for images/binary tables, ASCII space `0x20` for ASCII tables (§3).
+    fn fillRange(self: *Fits, off: u64, len: u64, byte: u8) FitsError!void {
         if (len == 0) return;
-        var buf: [CHUNK]u8 = [_]u8{0} ** CHUNK;
+        var buf: [CHUNK]u8 = undefined;
+        @memset(&buf, byte);
         var remaining = len;
         var o = off;
         while (remaining > 0) {
@@ -388,6 +415,12 @@ pub const Fits = struct {
             o += n;
             remaining -= n;
         }
+    }
+
+    // The data-unit pad byte for `hdu`'s kind: ASCII space `0x20` for an `XTENSION='TABLE'`
+    // ASCII table (FITS §3 MUST; required for DATASUM/CFITSIO parity), `0x00` otherwise.
+    fn dataFillByte(hdu: *const Hdu) u8 {
+        return if (hdu.kind == .ascii_table) ' ' else 0;
     }
 
     // Add `delta` to the header/data offsets of every HDU AFTER `pivot`, and to `scan_off`.
@@ -433,10 +466,11 @@ pub const Fits = struct {
         }
         hdu.data_bytes = new_data_bytes;
 
-        // Zero everything from the last preserved byte to the new block-padded end: the grown
-        // data region plus any block padding (and, on shrink, the vacated padding bytes).
+        // Fill everything from the last preserved byte to the new block-padded end: the grown
+        // data region plus any block padding (and, on shrink, the vacated padding bytes). ASCII
+        // tables fill with ASCII space, every other kind with zero (FITS §3).
         const keep = @min(old_data_bytes, new_data_bytes);
-        try self.zeroRange(data_off + keep, new_blocks - keep);
+        try self.fillRange(data_off + keep, new_blocks - keep, dataFillByte(hdu));
 
         try self.reinitReader();
     }
@@ -450,6 +484,57 @@ pub const Fits = struct {
         return hdu.data_bytes;
     }
 
+    // Re-order the cards of `header` so the mandatory keywords lead in canonical FITS order
+    // (SIMPLE|XTENSION, BITPIX, NAXIS, NAXIS1..NAXISn, then PCOUNT/GCOUNT/TFIELDS for tables),
+    // preserving the relative order of every other card. Each card is assigned a sort key: the
+    // small canonical rank for a mandatory keyword, or `2^32 + original_index` otherwise (so
+    // non-mandatory cards — and the trailing END — keep their order). Keys are distinct, so a
+    // plain insertion sort yields a stable canonical reordering. Random groups keep PCOUNT/GCOUNT
+    // wherever they sit (a GROUPS card legally precedes them), matching `hdu.validate`.
+    fn reorderMandatoryOrder(self: *Fits, header: *Header, kind: hdu_mod.HduKind, naxis: u16) FitsError!void {
+        const cards = header.cards.items;
+        if (cards.len < 2) return;
+        const lead: []const u8 = switch (kind) {
+            .primary, .random_groups => "SIMPLE",
+            .image, .ascii_table, .binary_table => "XTENSION",
+        };
+        const big: u64 = @as(u64, 1) << 32;
+        const keys = try self.alloc.alloc(u64, cards.len);
+        defer self.alloc.free(keys);
+        for (cards, 0..) |*c, i| {
+            keys[i] = rank: {
+                if (c.name.eqlText(lead)) break :rank 0;
+                if (c.name.eqlText("BITPIX")) break :rank 1;
+                if (c.name.eqlText("NAXIS")) break :rank 2;
+                var nb: [16]u8 = undefined;
+                var n: u16 = 1;
+                while (n <= naxis) : (n += 1) {
+                    const kw = std.fmt.bufPrint(&nb, "NAXIS{d}", .{n}) catch unreachable;
+                    if (c.name.eqlText(kw)) break :rank 2 + @as(u64, n);
+                }
+                if (kind == .ascii_table or kind == .binary_table) {
+                    const base = 3 + @as(u64, naxis);
+                    if (c.name.eqlText("PCOUNT")) break :rank base;
+                    if (c.name.eqlText("GCOUNT")) break :rank base + 1;
+                    if (c.name.eqlText("TFIELDS")) break :rank base + 2;
+                }
+                break :rank big + @as(u64, i); // non-mandatory: keep original relative order
+            };
+        }
+        var i: usize = 1;
+        while (i < cards.len) : (i += 1) {
+            const ck = keys[i];
+            const cc = cards[i];
+            var j: usize = i;
+            while (j > 0 and keys[j - 1] > ck) : (j -= 1) {
+                keys[j] = keys[j - 1];
+                cards[j] = cards[j - 1];
+            }
+            keys[j] = ck;
+            cards[j] = cc;
+        }
+    }
+
     /// Re-serialize `hdu`'s (possibly card-count-changed) header in place: re-align the header
     /// block count, shift following HDUs, recompute `data_off`, then — if the geometry implied by
     /// the new header changed the data size — re-align the data too. Call after editing
@@ -458,6 +543,18 @@ pub const Fits = struct {
         if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
         try self.ensureScannedAll();
         try hdu.header.ensureEnd(self.alloc);
+
+        // In-place edits (`Header.update`) append new keywords at the END of the header, so e.g.
+        // promoting an image to a higher dimension leaves the freshly-added NAXISn out of its
+        // mandated position. Normalize the mandatory-keyword order before serializing so the
+        // rewritten file stays conformant with the §4.4.1.1 ordering that `hdu.validate` enforces
+        // when the file is later re-scanned.
+        const naxis_now: u16 = blk: {
+            const v = hdu.header.getValue(i64, "NAXIS") catch break :blk hdu.naxis;
+            if (v < 0 or v > 999) break :blk hdu.naxis;
+            break :blk @intCast(v);
+        };
+        try self.reorderMandatoryOrder(&hdu.header, hdu.kind, naxis_now);
 
         const old_header_blocks = hdu.data_off - hdu.header_off; // already block-aligned
         const new_header_blocks = block.roundUpBlocks(@as(u64, hdu.header.count()) * block.CARD);
@@ -521,14 +618,24 @@ pub const Fits = struct {
         if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
         try self.ensureScannedAll();
         if (src_n == 0 or src_n > self.hdus.items.len) return error.WrongHduType;
+        // The duplicate is appended as an extension (it follows the existing primary), so it must
+        // carry XTENSION — copying the primary (which carries SIMPLE) can never parse as a valid
+        // extension. Reject it up front, BEFORE any device mutation, so a doomed copy never leaves
+        // the device enlarged or half-written (it used to grow/write the device, then fail in
+        // Hdu.init, leaving a corrupt tail).
+        if (src_n == 1) return error.WrongHduType;
 
         const src = self.hdus.items[src_n - 1];
         const start = src.header_off;
         const len = src.nextOff() - start; // whole HDU, block-aligned
         const dest = self.scan_off; // immediately after the last HDU
 
+        // Capture the device size up front and restore it on ANY later failure, so a copy that
+        // fails after the grow/write leaves the device byte-for-byte as it was found.
+        const old_size = try self.dev.getSize();
+        errdefer self.dev.setSize(old_size) catch {};
         const new_size = try limits.add(dest, len);
-        if (new_size > try self.dev.getSize()) try self.dev.setSize(new_size);
+        if (new_size > old_size) try self.dev.setSize(new_size);
         // Source and destination never overlap (dest ≥ end of the last HDU ≥ src end), so a plain
         // forward copy is safe.
         var buf: [CHUNK]u8 = undefined;
@@ -964,6 +1071,95 @@ test "structural edits are rejected on a read-only handle" {
     try testing.expectError(error.NotWritable, f.rewriteHeaderInPlace(h2));
     try testing.expectError(error.NotWritable, f.deleteHdu(2));
     try testing.expectError(error.NotWritable, f.copyHdu(2));
+}
+
+// ── special-records / copy-rollback regression tests (W3) ────────────────────────────────────
+
+// Copy `text` into card slot `idx` of a 2880-byte header block (the rest stays space-padded).
+fn writeCardInto(blk: []u8, idx: usize, text: []const u8) void {
+    @memcpy(blk[idx * 80 ..][0..text.len], text);
+}
+
+// Append a single 2880-byte record after `off` that parses as a header (it ends with END) but is
+// NOT a valid extension (no XTENSION) — the §3.5 special-records signature.
+fn writeSpecialRecords(dev: Device, off: u64) !void {
+    var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    writeCardInto(&blk, 0, "COMMENT trailing special records, not an HDU");
+    writeCardInto(&blk, 1, "END");
+    try dev.writeAll(&blk, off);
+}
+
+test "copyHdu refuses to copy the primary and leaves the device unchanged" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+    try f.flush();
+
+    const size_before = try f.dev.getSize();
+    const count_before = try f.hduCount();
+    try testing.expectError(error.WrongHduType, f.copyHdu(1)); // primary cannot become an extension
+    try testing.expectEqual(size_before, try f.dev.getSize()); // device not enlarged/corrupted
+    try testing.expectEqual(count_before, try f.hduCount()); // no phantom HDU appended
+}
+
+test "trailing special records are not scanned as an HDU (Hdu.init signature swallowed)" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+    try f.flush();
+    const eof = try f.dev.getSize();
+    try writeSpecialRecords(f.dev, eof);
+
+    // The trailing block parses as a header but is not a valid extension, so once ≥1 HDU exists it
+    // is treated as special records (consistent with the Header.parse path) and not counted.
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    try testing.expectEqual(@as(usize, 2), try f2.hduCount());
+}
+
+test "a trailing malformed extension still errors the scan (not special records)" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    try f.flush();
+    const eof = try f.dev.getSize();
+
+    // A block that names an extension but with an INVALID BITPIX (7). That is not the
+    // special-records signature (MissingRequiredKeyword/BadExtension), so it must propagate.
+    var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    writeCardInto(&blk, 0, "XTENSION= 'IMAGE'");
+    writeCardInto(&blk, 1, "BITPIX  =                    7");
+    writeCardInto(&blk, 2, "NAXIS   =                    0");
+    writeCardInto(&blk, 3, "PCOUNT  =                    0");
+    writeCardInto(&blk, 4, "GCOUNT  =                    1");
+    writeCardInto(&blk, 5, "END");
+    try f.dev.writeAll(&blk, eof);
+
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    try testing.expectError(error.BadBitpix, f2.hduCount());
+}
+
+test "appendHdu refuses a file with trailing special records" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    try f.flush();
+    const eof = try f.dev.getSize();
+    try writeSpecialRecords(f.dev, eof);
+
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_write, .{});
+    defer f2.deinit();
+    try testing.expectEqual(@as(usize, 1), try f2.hduCount()); // special records not counted
+    // Appending would clobber the special-records region, so it is refused with a typed error.
+    try testing.expectError(error.WrongHduType, f2.appendImageHdu(.{ .bitpix = 8, .axes = &.{4} }));
+    try testing.expectEqual(eof + block.BLOCK, try f2.dev.getSize()); // region left untouched
 }
 
 test "distinct Fits handles run concurrently from multiple threads" {

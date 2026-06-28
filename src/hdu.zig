@@ -194,10 +194,17 @@ pub fn detectKind(header: *const Header, is_primary: bool) StructError!HduKind {
     return error.BadExtension;
 }
 
-/// Validate mandatory-keyword presence, the first keyword, and basic types for `kind`
-/// (FR-HDU-5). `EXTEND` is advisory and never checked (FR-HDU-6).
+/// Validate mandatory-keyword presence AND positional order for `kind` (FR-HDU-5 MUST;
+/// FITS 4.0 §4.4.1.1, §7.2.1/§7.3.1). The leading keyword (`SIMPLE`/`XTENSION`) must be first,
+/// `BITPIX` second, `NAXIS` third, and `NAXIS1..NAXISn` must immediately follow `NAXIS` in
+/// order. For ASCII/binary tables `PCOUNT`, `GCOUNT`, `TFIELDS` must immediately follow
+/// `NAXISn` (in that order). Random-groups HDUs interpose a `GROUPS` card before the count
+/// keywords, so only the *presence* of `PCOUNT`/`GCOUNT` is required there, not their position.
+/// `EXTEND` is advisory and never checked (FR-HDU-6); keyword values are validated in
+/// `computeGeometry`.
 pub fn validate(header: *const Header, kind: HduKind) StructError!void {
-    if (header.count() == 0) return error.MissingRequiredKeyword;
+    const cnt = header.count();
+    if (cnt == 0) return error.MissingRequiredKeyword;
     const first = header.at(0);
 
     switch (kind) {
@@ -209,15 +216,45 @@ pub fn validate(header: *const Header, kind: HduKind) StructError!void {
         },
     }
 
-    // BITPIX and NAXIS must be present (their values are validated in computeGeometry).
+    // BITPIX and NAXIS must be present (their values are validated in computeGeometry) AND in
+    // their mandated positions: BITPIX is card[1], NAXIS is card[2].
     if (!header.has("BITPIX")) return error.MissingRequiredKeyword;
     if (!header.has("NAXIS")) return error.MissingRequiredKeyword;
+    if (cnt < 2 or !header.at(1).name.eqlText("BITPIX")) return error.KeywordOrder;
+    if (cnt < 3 or !header.at(2).name.eqlText("NAXIS")) return error.KeywordOrder;
 
-    // Tables additionally require TFIELDS, PCOUNT, GCOUNT.
-    if (kind == .ascii_table or kind == .binary_table) {
-        if (!header.has("TFIELDS")) return error.MissingRequiredKeyword;
-        if (!header.has("PCOUNT")) return error.MissingRequiredKeyword;
-        if (!header.has("GCOUNT")) return error.MissingRequiredKeyword;
+    // NAXIS1..NAXISn must be the contiguous block immediately after NAXIS. A malformed NAXIS
+    // value is left for computeGeometry (BadNaxis); we only enforce order for a legal count.
+    const naxis = header.getValue(i64, "NAXIS") catch return error.MissingRequiredKeyword;
+    if (naxis < 0 or naxis > 999) return; // computeGeometry reports BadNaxis
+    const n: u16 = @intCast(naxis);
+    var name_buf: [16]u8 = undefined;
+    var i: u16 = 0;
+    while (i < n) : (i += 1) {
+        const kw = std.fmt.bufPrint(&name_buf, "NAXIS{d}", .{i + 1}) catch unreachable;
+        const idx = 3 + @as(usize, i);
+        if (cnt <= idx or !header.at(idx).name.eqlText(kw)) return error.KeywordOrder;
+    }
+
+    // The card index immediately past NAXISn (where the count keywords belong).
+    const after = 3 + @as(usize, n);
+    switch (kind) {
+        .ascii_table, .binary_table => {
+            // §7.2.1/§7.3.1: PCOUNT, GCOUNT, TFIELDS in that order, immediately after NAXISn.
+            if (!header.has("TFIELDS")) return error.MissingRequiredKeyword;
+            if (!header.has("PCOUNT")) return error.MissingRequiredKeyword;
+            if (!header.has("GCOUNT")) return error.MissingRequiredKeyword;
+            if (cnt <= after or !header.at(after).name.eqlText("PCOUNT")) return error.KeywordOrder;
+            if (cnt <= after + 1 or !header.at(after + 1).name.eqlText("GCOUNT")) return error.KeywordOrder;
+            if (cnt <= after + 2 or !header.at(after + 2).name.eqlText("TFIELDS")) return error.KeywordOrder;
+        },
+        .random_groups => {
+            // Random groups MUST carry PCOUNT and GCOUNT (§10.2.1), but a GROUPS card legally
+            // sits between NAXISn and them, so only presence is enforced here.
+            if (!header.has("PCOUNT")) return error.MissingRequiredKeyword;
+            if (!header.has("GCOUNT")) return error.MissingRequiredKeyword;
+        },
+        .primary, .image => {},
     }
 }
 
@@ -385,6 +422,105 @@ test "recomputeGeometry leaves a safe-to-free axes slice on error" {
     try hdu.header.update(testing.allocator, "NAXIS", .{ .int = 3 }, null);
     try testing.expectError(error.MissingRequiredKeyword, hdu.recomputeGeometry(testing.allocator, .{}));
     try testing.expectEqual(@as(usize, 0), hdu.axes.len);
+}
+
+test "validate rejects BITPIX/NAXIS out of position (KeywordOrder)" {
+    // SIMPLE present and first, but NAXIS precedes BITPIX → card[1] is not BITPIX.
+    const p = try parseHeader(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "NAXIS   =                    0",
+        "BITPIX  =                    8",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    try testing.expectError(error.KeywordOrder, Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{}));
+}
+
+test "validate rejects non-contiguous NAXISn (KeywordOrder)" {
+    // A foreign keyword interrupts the NAXIS1..NAXISn run.
+    const p = try parseHeader(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    4",
+        "OBJECT  = 'M31'",
+        "NAXIS2  =                    3",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    try testing.expectError(error.KeywordOrder, Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{}));
+}
+
+test "validate rejects table count keywords out of position (KeywordOrder)" {
+    // PCOUNT/GCOUNT/TFIELDS must immediately follow NAXIS2; here a TFORM intrudes first.
+    const p = try parseHeader(testing.allocator, &.{
+        "XTENSION= 'BINTABLE'",
+        "BITPIX  =                    8",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    4",
+        "NAXIS2  =                    1",
+        "TFORM1  = '1J'",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    1",
+        "TFIELDS =                    1",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    try testing.expectError(error.KeywordOrder, Hdu.init(testing.allocator, p.h, false, 0, p.consumed, .{}));
+}
+
+test "validate rejects a random-groups header missing PCOUNT/GCOUNT" {
+    // GROUPS=T with NAXIS1=0 ⇒ random groups; PCOUNT/GCOUNT are then mandatory.
+    const p = try parseHeader(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    0",
+        "NAXIS2  =                    5",
+        "GROUPS  =                    T",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    try testing.expectError(error.MissingRequiredKeyword, Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{}));
+}
+
+test "validate accepts a well-formed random-groups header with PCOUNT/GCOUNT" {
+    // GROUPS legally sits between NAXISn and the count keywords; presence (not position) suffices.
+    const p = try parseHeader(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    2",
+        "NAXIS1  =                    0",
+        "NAXIS2  =                    5",
+        "GROUPS  =                    T",
+        "PCOUNT  =                    0",
+        "GCOUNT  =                    3",
+    });
+    defer {
+        p.reader.deinit();
+        testing.allocator.destroy(p.reader);
+        p.mem.deinit();
+        testing.allocator.destroy(p.mem);
+    }
+    var hdu = try Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{});
+    defer hdu.deinit(testing.allocator);
+    try testing.expectEqual(HduKind.random_groups, hdu.kind);
 }
 
 test "oversized NAXIS product is a typed limit error before allocation" {

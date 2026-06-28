@@ -39,6 +39,9 @@ pub const KeywordValue = @import("header/value.zig").KeywordValue;
 pub const Card = @import("header/card.zig").Card;
 /// HIERARCH long-keyword convention helpers (FR-HDR-9).
 pub const hierarch = @import("header/hierarch.zig");
+/// `CONTINUE` long-string convention helpers — assemble/split (FR-HDR-8). (`continue` is a Zig
+/// keyword, so the module is exported as `continuation`.)
+pub const continuation = @import("header/continue.zig");
 /// The ordered cards of one HDU header (FR-HDR-5/7/11).
 pub const Header = @import("header/header.zig").Header;
 

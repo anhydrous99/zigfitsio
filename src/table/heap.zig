@@ -148,8 +148,13 @@ const SCRATCH_BYTES: usize = 8192;
 pub fn heapGeometry(table: *const BinTable) GeomError!HeapGeometry {
     const main = try limits.mul(table.naxis1, table.naxis2);
     const pcount = table.hdu.pcount;
-    // A malformed or absent THEAP defaults to the minimum legal value.
-    const theap = table.hdu.header.getValue(u64, "THEAP") catch main;
+    // An absent THEAP defaults to the minimum legal value; a THEAP that is *present* but cannot
+    // be read as a non-negative integer is a structural error (a bare `catch main` would have
+    // masked a corrupt value as the default).
+    const theap = table.hdu.header.getValue(u64, "THEAP") catch |e| switch (e) {
+        error.KeywordNotFound => main,
+        else => return error.BadTbcol,
+    };
     if (theap < main) return error.BadTbcol;
     const gap = theap - main;
     if (gap > pcount) return error.BadTbcol;
@@ -262,11 +267,20 @@ pub fn readVlaCell(alloc: Allocator, table: *BinTable, col: ColumnRef, row: u64,
     const column = &table.columns[try table.resolve(col)];
     const spec = try VlaSpec.of(column);
     const desc = try readDescAt(table, column, row);
-    if (desc.len < 0 or desc.off < 0) return error.BadDescriptor;
+    if (desc.len < 0) return error.BadDescriptor;
+
+    // Resolve the (table-level, structural) heap geometry first so a bad THEAP/PCOUNT surfaces
+    // for every read, even a zero-length one.
+    const geom = try heapGeometry(table);
+
+    // §7.3.5: when the element count is zero the byte offset is undefined, so a zero-length cell
+    // short-circuits to an empty slice BEFORE the offset is validated — a garbage (out of range
+    // or negative) offset on a zero-length cell is legal and must not be rejected.
+    if (desc.len == 0) return alloc.alloc(T, 0);
+    if (desc.off < 0) return error.BadDescriptor;
     const len: u64 = @intCast(desc.len);
     const off: u64 = @intCast(desc.off);
 
-    const geom = try heapGeometry(table);
     const bytes = try byteLen(spec.elem, len);
 
     // Validate against the configured limits BEFORE allocating (NFR-SAFE-1).
@@ -518,14 +532,26 @@ pub const HeapManager = struct {
 
     const Reloc = struct { column: *const Column, row: u64, src: u64, len: u64 };
 
-    fn lessThanSrc(_: void, a: Reloc, b: Reloc) bool {
-        return a.src < b.src;
+    // A unique heap byte-extent `[src, src+len)` and the packed offset it is relocated to. Several
+    // rows may reference the same extent (aliasing); they all collapse onto one `Group`.
+    const Group = struct { src: u64, len: u64, dst: u64 };
+
+    fn lessThanGroup(_: void, a: Group, b: Group) bool {
+        if (a.src != b.src) return a.src < b.src;
+        return a.len < b.len;
     }
 
     /// Compact the heap: repack every live VLA payload contiguously from the heap start, rewrite
     /// the affected descriptors, drop the free list, and reset `top` to the packed size
     /// (FR-VLA-4). Live cells are those with a positive descriptor length; empty/freed cells are
-    /// skipped. Payloads only ever move to a lower offset, so the in-place relocation is safe.
+    /// skipped.
+    ///
+    /// On hostile input several descriptors may *alias* the same heap extent. Such rows are
+    /// de-aliased: every distinct `(src, len)` extent is moved exactly once and all rows pointing
+    /// at it are remapped to that single packed offset, so a relocation never reads bytes another
+    /// row already moved. `moveBytes` is overlap-safe in both directions, so even a malformed file
+    /// whose distinct extents partially overlap (forcing a `dst > src` move) cannot corrupt data
+    /// or read out of bounds.
     pub fn compact(self: *HeapManager, gpa: Allocator, table: *BinTable) CompactError!void {
         const geom = try heapGeometry(table);
 
@@ -549,16 +575,39 @@ pub const HeapManager = struct {
             }
         }
 
-        std.mem.sort(Reloc, relocs.items, {}, lessThanSrc);
-
-        var bump: u64 = 0;
+        // Collapse aliasing rows onto unique `(src, len)` extents.
+        var groups: std.ArrayList(Group) = .empty;
+        defer groups.deinit(gpa);
         for (relocs.items) |r| {
-            if (r.src != bump) {
-                try moveBytes(table, geom.heap_abs_off + r.src, geom.heap_abs_off + bump, r.len);
-                const d = try readDescAt(table, r.column, r.row);
-                try writeDescAt(table, r.column, r.row, .{ .len = d.len, .off = @intCast(bump) });
+            var seen = false;
+            for (groups.items) |g| {
+                if (g.src == r.src and g.len == r.len) {
+                    seen = true;
+                    break;
+                }
             }
-            bump = try limits.add(bump, r.len);
+            if (!seen) try groups.append(gpa, .{ .src = r.src, .len = r.len, .dst = 0 });
+        }
+
+        std.mem.sort(Group, groups.items, {}, lessThanGroup);
+
+        // Pack each unique extent to the front, recording its new offset.
+        var bump: u64 = 0;
+        for (groups.items) |*g| {
+            if (g.src != bump) {
+                try moveBytes(table, geom.heap_abs_off + g.src, geom.heap_abs_off + bump, g.len);
+            }
+            g.dst = bump;
+            bump = try limits.add(bump, g.len);
+        }
+
+        // Rewrite each row's descriptor offset to its extent's packed offset (length unchanged).
+        for (relocs.items) |r| {
+            const dst = for (groups.items) |g| {
+                if (g.src == r.src and g.len == r.len) break g.dst;
+            } else unreachable;
+            const d = try readDescAt(table, r.column, r.row);
+            try writeDescAt(table, r.column, r.row, .{ .len = d.len, .off = @intCast(dst) });
         }
 
         self.free_list.clearRetainingCapacity();
@@ -566,17 +615,30 @@ pub const HeapManager = struct {
     }
 };
 
-// Copy `len` bytes from `src` to `dst` within the device. Compaction only moves data to a lower
-// offset (`dst <= src`), so a forward read-then-write per chunk is overlap-safe.
+// Copy `len` bytes from `src` to `dst` within the device, overlap-safe in either direction: a
+// downward move (`dst < src`, the normal compaction case) copies front-to-back, an upward move
+// (`dst > src`, only reachable on a malformed file whose heap extents overlap) copies
+// back-to-front, so the source is never clobbered before it is read.
 fn moveBytes(table: *BinTable, src: u64, dst: u64, len: u64) errors.IoError!void {
     if (src == dst or len == 0) return;
     var buf: [SCRATCH_BYTES]u8 = undefined;
-    var done: u64 = 0;
-    while (done < len) {
-        const m: usize = @intCast(@min(@as(u64, buf.len), len - done));
-        try table.fits.dev.readAll(buf[0..m], src + done);
-        try table.fits.dev.writeAll(buf[0..m], dst + done);
-        done += m;
+    if (dst < src) {
+        var done: u64 = 0;
+        while (done < len) {
+            const m: usize = @intCast(@min(@as(u64, buf.len), len - done));
+            try table.fits.dev.readAll(buf[0..m], src + done);
+            try table.fits.dev.writeAll(buf[0..m], dst + done);
+            done += m;
+        }
+    } else {
+        var remaining = len;
+        while (remaining > 0) {
+            const m: usize = @intCast(@min(@as(u64, buf.len), remaining));
+            const o = remaining - m;
+            try table.fits.dev.readAll(buf[0..m], src + o);
+            try table.fits.dev.writeAll(buf[0..m], dst + o);
+            remaining -= m;
+        }
     }
 }
 
@@ -802,6 +864,8 @@ const HdrOpts = struct {
     tscal: ?f64 = null,
     tzero: ?f64 = null,
     theap: ?u64 = null,
+    /// A non-integer THEAP value (to exercise the present-but-unparseable path).
+    theap_str: ?[]const u8 = null,
 };
 
 fn vlaHeader(alloc: Allocator, tform: []const u8, nrows: u64, pcount: u64, opts: HdrOpts) !Header {
@@ -819,6 +883,7 @@ fn vlaHeader(alloc: Allocator, tform: []const u8, nrows: u64, pcount: u64, opts:
     try h.appendValue(alloc, "TFORM1", .{ .string = tform }, null);
     try h.appendValue(alloc, "TTYPE1", .{ .string = "VLA" }, null);
     if (opts.theap) |t| try h.appendValue(alloc, "THEAP", .{ .int = @intCast(t) }, null);
+    if (opts.theap_str) |s| try h.appendValue(alloc, "THEAP", .{ .string = s }, null);
     if (opts.tscal) |s| try h.appendValue(alloc, "TSCAL1", .{ .float = s }, null);
     if (opts.tzero) |z| try h.appendValue(alloc, "TZERO1", .{ .float = z }, null);
     try h.ensureEnd(alloc);
@@ -1105,6 +1170,109 @@ test "THEAP smaller than NAXIS1*NAXIS2 is a structural error" {
     defer t.deinit(alloc);
     try testing.expectError(error.BadTbcol, heapGeometry(&t));
     try testing.expectError(error.BadTbcol, readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32));
+}
+
+test "THEAP present but unparseable is a structural error (not the default)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // A THEAP whose value is a string (not a non-negative integer) must surface BadTbcol rather
+    // than be silently masked as the default heap start.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 1, 64, .{ .theap_str = "oops" });
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    try testing.expectError(error.BadTbcol, heapGeometry(&t));
+    try testing.expectError(error.BadTbcol, readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32));
+}
+
+test "zero-length VLA cell ignores its (undefined) descriptor offset (§7.3.5)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 1, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+
+    // len == 0 with an out-of-heap offset: the offset is undefined per §7.3.5, so the read must
+    // short-circuit to an empty slice instead of bounds-rejecting the garbage offset.
+    try setDescriptor(&t, .{ .index = 0 }, 0, .{ .len = 0, .off = 1000 });
+    const r = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r);
+    try testing.expectEqual(@as(usize, 0), r.len);
+
+    // len == 0 with a negative offset is likewise accepted.
+    try setDescriptor(&t, .{ .index = 0 }, 0, .{ .len = 0, .off = -7 });
+    const r2 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r2);
+    try testing.expectEqual(@as(usize, 0), r2.len);
+
+    // A negative *length* is still rejected.
+    try setDescriptor(&t, .{ .index = 0 }, 0, .{ .len = -1, .off = 0 });
+    try testing.expectError(error.BadDescriptor, readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32));
+}
+
+test "compact de-aliases descriptors that share one heap extent" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 128, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    // Row 0 holds a real 12-byte payload at offset 0; row 1's descriptor is forged to ALIAS the
+    // very same extent (hostile input). Compaction must move the extent once and remap both rows
+    // to the single packed offset — never issuing a `dst > src` move that would corrupt the heap.
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 7, 8, 9 });
+    try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 3, .off = 0 });
+
+    try mgr.compact(alloc, &t);
+
+    try testing.expectEqual(@as(u64, 12), mgr.top); // one extent survives, not two
+    const d0 = try readDescriptor(&t, .{ .index = 0 }, 0);
+    const d1 = try readDescriptor(&t, .{ .index = 0 }, 1);
+    try testing.expectEqual(d0.off, d1.off);
+
+    const r0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r0);
+    const r1 = try readVlaCell(alloc, &t, .{ .index = 0 }, 1, i32);
+    defer alloc.free(r1);
+    try testing.expectEqualSlices(i32, &[_]i32{ 7, 8, 9 }, r0);
+    try testing.expectEqualSlices(i32, &[_]i32{ 7, 8, 9 }, r1);
+}
+
+test "compact tolerates distinct overlapping extents without OOB (overlap-safe move)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 128, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    // Row 0: a 4-element payload at offset 0 (16 bytes). Row 1 is forged to a DISTINCT but
+    // overlapping extent at the same offset with a shorter length (8 bytes). Sorted packing then
+    // forces an upward (dst > src) move for the longer extent; the overlap-safe `moveBytes` must
+    // copy it without clobbering source bytes early.
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 11, 22, 33, 44 });
+    try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 2, .off = 0 });
+
+    try mgr.compact(alloc, &t);
+
+    // Both extents packed: 8 (row 1) + 16 (row 0) = 24 bytes, no overlap, no panic.
+    try testing.expectEqual(@as(u64, 24), mgr.top);
+    const r1 = try readVlaCell(alloc, &t, .{ .index = 0 }, 1, i32);
+    defer alloc.free(r1);
+    try testing.expectEqualSlices(i32, &[_]i32{ 11, 22 }, r1);
+    const r0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r0);
+    try testing.expectEqualSlices(i32, &[_]i32{ 11, 22, 33, 44 }, r0);
 }
 
 test "max_vla_elems limit is enforced before allocation" {

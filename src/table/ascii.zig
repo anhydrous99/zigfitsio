@@ -334,7 +334,7 @@ pub const AsciiTable = struct {
                 return try convert.cast(T, phys, mode);
             },
             .fixed, .exp_single, .exp_double => {
-                const fv = try parseAsciiFloat(tok);
+                const fv = try parseAsciiFloat(tok, col.tform.decimals);
                 if (identity) return try convert.cast(T, fv, mode);
                 const phys = col.tzero + col.tscal * fv;
                 return try convert.cast(T, phys, mode);
@@ -431,16 +431,77 @@ fn fieldIsNull(col: *const AsciiColumn, raw: []const u8, for_string: bool) bool 
     return false;
 }
 
-/// Parse a FORTRAN real token into `f64`, mapping the `D`/`d` exponent letter to `E`/`e`.
-fn parseAsciiFloat(tok: []const u8) errors.HeaderError!f64 {
+/// Parse a FORTRAN real token (already trimmed of surrounding blanks) into `f64`, per the ASCII
+/// `Fw.d`/`Ew.d`/`Dw.d` field rules (FITS 4.0 §7.2.5).
+///
+/// Accepts an optional mantissa sign, integer and/or fraction digits, and an optional exponent
+/// introduced by `E`/`e`/`D`/`d` **or** by a bare `+`/`-` (rule 3a — e.g. `3.14-2`). When the
+/// token has no `.`, the implied decimal point is placed `decimals` digits from the right of the
+/// integer field (rule 2 — e.g. `314` under `F8.2` is `3.14`). Embedded spaces or any stray
+/// character are rejected with `error.BadValueSyntax`; a token with no digits at all is invalid.
+fn parseAsciiFloat(tok: []const u8, decimals: u8) errors.HeaderError!f64 {
     if (tok.len == 0 or tok.len > MAX_NUM_FIELD) return error.BadValueSyntax;
-    var buf: [MAX_NUM_FIELD]u8 = undefined;
-    for (tok, 0..) |c, i| buf[i] = switch (c) {
-        'D' => 'E',
-        'd' => 'e',
-        else => c,
-    };
-    return std.fmt.parseFloat(f64, buf[0..tok.len]) catch error.BadValueSyntax;
+    var i: usize = 0;
+
+    // Optional mantissa sign.
+    var neg = false;
+    if (tok[i] == '+' or tok[i] == '-') {
+        neg = tok[i] == '-';
+        i += 1;
+    }
+
+    // Integer digits, then an optional fraction.
+    const int_start = i;
+    while (i < tok.len and std.ascii.isDigit(tok[i])) : (i += 1) {}
+    const int_part = tok[int_start..i];
+    var frac_part: []const u8 = tok[i..i];
+    var has_dot = false;
+    if (i < tok.len and tok[i] == '.') {
+        has_dot = true;
+        i += 1;
+        const f_start = i;
+        while (i < tok.len and std.ascii.isDigit(tok[i])) : (i += 1) {}
+        frac_part = tok[f_start..i];
+    }
+    if (int_part.len == 0 and frac_part.len == 0) return error.BadValueSyntax;
+
+    // Optional exponent: an `E`/`D` letter, or a bare `+`/`-` (rule 3a).
+    var exp: i64 = 0;
+    if (i < tok.len) {
+        const c = tok[i];
+        if (c == 'E' or c == 'e' or c == 'D' or c == 'd') {
+            i += 1;
+        } else if (c != '+' and c != '-') {
+            return error.BadValueSyntax; // embedded space or stray character
+        }
+        var eneg = false;
+        if (i < tok.len and (tok[i] == '+' or tok[i] == '-')) {
+            eneg = tok[i] == '-';
+            i += 1;
+        }
+        const e_start = i;
+        while (i < tok.len and std.ascii.isDigit(tok[i])) : (i += 1) {
+            exp = std.math.mul(i64, exp, 10) catch return error.BadValueSyntax;
+            exp = std.math.add(i64, exp, tok[i] - '0') catch return error.BadValueSyntax;
+        }
+        if (i == e_start) return error.BadValueSyntax; // a sign/letter with no exponent digits
+        if (eneg) exp = -exp;
+    }
+    if (i != tok.len) return error.BadValueSyntax; // trailing/embedded garbage
+
+    // With no explicit `.`, the rightmost `decimals` integer digits are fractional (rule 2).
+    const decimal_shift: i64 = if (has_dot) @intCast(frac_part.len) else @intCast(decimals);
+    const total_exp = exp - decimal_shift;
+
+    // Reassemble the significant digits and a single power-of-ten exponent for `parseFloat`.
+    var nbuf: [MAX_NUM_FIELD + 32]u8 = undefined;
+    const s = std.fmt.bufPrint(&nbuf, "{s}{s}{s}e{d}", .{
+        if (neg) "-" else "",
+        int_part,
+        frac_part,
+        total_exp,
+    }) catch return error.BadValueSyntax;
+    return std.fmt.parseFloat(f64, s) catch error.BadValueSyntax;
 }
 
 /// Fill `field` for a null write: all blanks, with `TNULLn` placed if defined (right-justified
@@ -821,6 +882,44 @@ test "large i64 round-trips exactly in identity scaling (no f64 detour)" {
     const big: i64 = 9_007_199_254_740_993; // 2^53 + 1, not exactly representable in f64
     try t.writeCell(i64, .{ .index = 0 }, 0, big);
     try testing.expectEqual(big, (try t.readCell(i64, .{ .index = 0 }, 0)).?);
+}
+
+test "parseAsciiFloat: implied decimal, bare-sign exponent, lowercase d, rejects spaces" {
+    // Rule 2: no '.', so the rightmost `decimals` integer digits are fractional.
+    try testing.expectEqual(@as(f64, 3.14), try parseAsciiFloat("314", 2));
+    // Rule 3a: a bare sign introduces the exponent.
+    try testing.expectEqual(@as(f64, 0.0314), try parseAsciiFloat("3.14-2", 0));
+    // Lowercase 'd' exponent letter.
+    try testing.expectEqual(@as(f64, 1000.0), try parseAsciiFloat("1.0d3", 0));
+    // A leading '.' with no integer digits is fine.
+    try testing.expectEqual(@as(f64, 0.5), try parseAsciiFloat(".5", 0));
+    // A negative mantissa with an explicit point ignores the implied-decimal count.
+    try testing.expectEqual(@as(f64, -3.75), try parseAsciiFloat("-3.75", 2));
+    // Embedded spaces / stray characters are rejected.
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1 2", 0));
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("abc", 0));
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("3.14e", 0));
+}
+
+test "readCell surfaces BadValueSyntax for non-numeric field bytes" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+
+    const cols = [_]TCol{
+        .{ .tbcol = 1, .tform = "I6", .ttype = "N" }, // integer field [0,6)
+        .{ .tbcol = 7, .tform = "F6.2", .ttype = "X" }, // float field [6,12)
+    };
+    const hdu = try appendAsciiTable(&f, testing.allocator, &cols, 12, 1);
+    var t = try AsciiTable.of(&f, hdu);
+    defer t.deinit(testing.allocator);
+
+    // Deposit raw non-numeric bytes directly at each column's field offset.
+    try f.dev.writeAll("abc", hdu.data_off);
+    try f.dev.writeAll("xyz", hdu.data_off + 6);
+    try testing.expectError(error.BadValueSyntax, t.readCell(i64, .{ .index = 0 }, 0));
+    try testing.expectError(error.BadValueSyntax, t.readCell(f64, .{ .index = 1 }, 0));
 }
 
 test "wrong HDU type is rejected" {

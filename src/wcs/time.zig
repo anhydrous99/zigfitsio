@@ -51,20 +51,32 @@ pub const DateTime = struct {
     }
 
     fn parseIso(t: []const u8) HeaderError!DateTime {
-        // Date part: yyyy-mm-dd
-        if (t.len < 10) return error.BadValueSyntax;
-        if (t[4] != '-' or t[7] != '-') return error.BadValueSyntax;
-        const year = parseField(i32, t[0..4]) catch return error.BadValueSyntax;
-        const month = parseField(u8, t[5..7]) catch return error.BadValueSyntax;
-        const day = parseField(u8, t[8..10]) catch return error.BadValueSyntax;
+        // Year: an optional leading sign and at least four digits, allowing the expanded
+        // ISO-8601 form (signed five-digit years) the time WCS permits (§9.1.1).
+        var i: usize = 0;
+        var year_neg = false;
+        if (t.len > 0 and (t[0] == '+' or t[0] == '-')) {
+            year_neg = (t[0] == '-');
+            i = 1;
+        }
+        const year_start = i;
+        while (i < t.len and std.ascii.isDigit(t[i])) : (i += 1) {}
+        if (i - year_start < 4) return error.BadValueSyntax;
+        const year_mag = std.fmt.parseInt(i32, t[year_start..i], 10) catch return error.BadValueSyntax;
+        const year: i32 = if (year_neg) -year_mag else year_mag;
+        // Remainder must be `-mm-dd` (and optionally a time part).
+        if (i + 6 > t.len or t[i] != '-' or t[i + 3] != '-') return error.BadValueSyntax;
+        const month = parseField(u8, t[i + 1 .. i + 3]) catch return error.BadValueSyntax;
+        const day = parseField(u8, t[i + 4 .. i + 6]) catch return error.BadValueSyntax;
         var dt: DateTime = .{ .year = year, .month = month, .day = day };
-        if (t.len == 10) {
+        const after = i + 6;
+        if (after == t.len) {
             try dt.validate();
             return dt;
         }
         // Time part: Thh:mm:ss[.sss]
-        if (t[10] != 'T' and t[10] != ' ') return error.BadValueSyntax;
-        const time = t[11..];
+        if (t[after] != 'T' and t[after] != ' ') return error.BadValueSyntax;
+        const time = t[after + 1 ..];
         if (time.len < 8 or time[2] != ':' or time[5] != ':') return error.BadValueSyntax;
         dt.hour = parseField(u8, time[0..2]) catch return error.BadValueSyntax;
         dt.minute = parseField(u8, time[3..5]) catch return error.BadValueSyntax;
@@ -96,11 +108,20 @@ pub const DateTime = struct {
     /// Write the ISO-8601 representation. Fractional seconds are emitted (to millisecond
     /// precision) only when nonzero, matching common FITS usage.
     pub fn format(self: *const DateTime, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        // FITS years are non-negative; format unsigned so zero-padding does not emit a sign.
-        const year_u: u32 = @intCast(@max(self.year, 0));
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
-            year_u, self.month, self.day, self.hour, self.minute, self.second,
-        });
+        // Years outside 0..9999 use the signed five-digit expanded ISO-8601 form (§9.1.1);
+        // otherwise the customary four-digit, sign-free form.
+        if (self.year < 0 or self.year > 9999) {
+            const sign: u8 = if (self.year < 0) '-' else '+';
+            const mag: u32 = @intCast(@abs(self.year));
+            try w.print("{c}{d:0>5}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+                sign, mag, self.month, self.day, self.hour, self.minute, self.second,
+            });
+        } else {
+            const year_u: u32 = @intCast(self.year);
+            try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+                year_u, self.month, self.day, self.hour, self.minute, self.second,
+            });
+        }
         if (self.frac > 0) {
             const millis: u64 = @intFromFloat(@round(self.frac * 1000.0));
             if (millis > 0) try w.print(".{d:0>3}", .{millis});
@@ -185,6 +206,28 @@ pub fn jdToMjd(jd: f64) f64 {
     return jd - MJD_OFFSET;
 }
 
+/// Convert a Julian epoch (e.g. `J2000.0`) to a Julian Date:
+/// `JD = 2451545.0 + (epoch − 2000.0) × 365.25` (FITS 4.0 §9.2.1, Eq. 31).
+pub fn julianEpochToJd(epoch: f64) f64 {
+    return 2451545.0 + (epoch - 2000.0) * 365.25;
+}
+
+/// Convert a Julian Date to its Julian epoch.
+pub fn jdToJulianEpoch(jd: f64) f64 {
+    return 2000.0 + (jd - 2451545.0) / 365.25;
+}
+
+/// Convert a Besselian epoch (e.g. `B1950.0`) to a Julian Date:
+/// `JD = 2415020.31352 + (epoch − 1900.0) × 365.242198781` (FITS 4.0 §9.2.1, Eq. 30).
+pub fn besselianEpochToJd(epoch: f64) f64 {
+    return 2415020.31352 + (epoch - 1900.0) * 365.242198781;
+}
+
+/// Convert a Julian Date to its Besselian epoch.
+pub fn jdToBesselianEpoch(jd: f64) f64 {
+    return 1900.0 + (jd - 2415020.31352) / 365.242198781;
+}
+
 // ── Time coordinates (WCS-4, FR-WCS-4; FITS 4.0 §9, Tables 30–35) ─────────────────────────
 
 const Header = @import("../header/header.zig").Header;
@@ -200,17 +243,35 @@ pub const TimeSys = enum {
     tcb,
     ut1,
     gps,
+    /// Free-running local clock (`LOCAL`, Table 30).
+    local,
     unknown,
 
     pub fn parse(s: []const u8) TimeSys {
-        const t = std.mem.trim(u8, s, " ");
+        var t = std.mem.trim(u8, s, " ");
+        // Strip an optional realization qualifier, e.g. `UT(NIST)` or `UTC(USNO)` (§9.2.1).
+        if (std.mem.indexOfScalar(u8, t, '(')) |p| t = std.mem.trim(u8, t[0..p], " ");
         const map = .{
             .{ "UTC", TimeSys.utc }, .{ "TAI", TimeSys.tai }, .{ "TT", TimeSys.tt },
             .{ "TDB", TimeSys.tdb }, .{ "TCG", TimeSys.tcg }, .{ "TCB", TimeSys.tcb },
-            .{ "UT1", TimeSys.ut1 }, .{ "GPS", TimeSys.gps },
+            .{ "UT1", TimeSys.ut1 }, .{ "GPS", TimeSys.gps }, .{ "LOCAL", TimeSys.local },
+            // Deprecated synonyms (Table 30): TDT/ET ⇒ TT, IAT ⇒ TAI, GMT ⇒ UTC.
+            .{ "TDT", TimeSys.tt }, .{ "ET", TimeSys.tt },
+            .{ "IAT", TimeSys.tai }, .{ "GMT", TimeSys.utc },
         };
         inline for (map) |e| if (std.ascii.eqlIgnoreCase(t, e[0])) return e[1];
+        // A bare `UT` (generic Universal Time) is taken as UT1.
+        if (std.ascii.eqlIgnoreCase(t, "UT")) return .ut1;
         return .unknown;
+    }
+
+    /// The canonical keyword string for this scale, or `null` for `.unknown`.
+    pub fn toString(self: TimeSys) ?[]const u8 {
+        return switch (self) {
+            .utc => "UTC", .tai => "TAI", .tt => "TT", .tdb => "TDB",
+            .tcg => "TCG", .tcb => "TCB", .ut1 => "UT1", .gps => "GPS",
+            .local => "LOCAL", .unknown => null,
+        };
     }
 };
 
@@ -221,17 +282,52 @@ pub const RefPos = enum {
     barycenter,
     heliocenter,
     relocatable,
+    /// User-defined position (`CUSTOM`, Table 31).
+    custom,
+    /// Galactic centre.
+    galactic,
+    /// Earth–Moon barycentre (`EMBARYCENTER`).
+    embarycenter,
+    mercury,
+    venus,
+    mars,
+    jupiter,
+    saturn,
+    uranus,
+    neptune,
+    pluto,
     unknown,
 
     pub fn parse(s: []const u8) RefPos {
         const t = std.mem.trim(u8, s, " ");
+        if (t.len < 3) return .unknown;
+        // Table 31 values are distinguished by their first three significant characters.
+        const pre = t[0..3];
         const map = .{
-            .{ "TOPOCENTER", RefPos.topocenter }, .{ "GEOCENTER", RefPos.geocenter },
-            .{ "BARYCENTER", RefPos.barycenter }, .{ "HELIOCENTER", RefPos.heliocenter },
-            .{ "RELOCATABLE", RefPos.relocatable },
+            .{ "TOP", RefPos.topocenter }, .{ "GEO", RefPos.geocenter },
+            .{ "BAR", RefPos.barycenter }, .{ "REL", RefPos.relocatable },
+            .{ "CUS", RefPos.custom }, .{ "HEL", RefPos.heliocenter },
+            .{ "GAL", RefPos.galactic }, .{ "EMB", RefPos.embarycenter },
+            .{ "MER", RefPos.mercury }, .{ "VEN", RefPos.venus },
+            .{ "MAR", RefPos.mars }, .{ "JUP", RefPos.jupiter },
+            .{ "SAT", RefPos.saturn }, .{ "URA", RefPos.uranus },
+            .{ "NEP", RefPos.neptune }, .{ "PLU", RefPos.pluto },
         };
-        inline for (map) |e| if (std.ascii.eqlIgnoreCase(t, e[0])) return e[1];
+        inline for (map) |e| if (std.ascii.eqlIgnoreCase(pre, e[0])) return e[1];
         return .unknown;
+    }
+
+    /// The canonical keyword string for this position, or `null` for `.unknown`.
+    pub fn toString(self: RefPos) ?[]const u8 {
+        return switch (self) {
+            .topocenter => "TOPOCENTER", .geocenter => "GEOCENTER",
+            .barycenter => "BARYCENTER", .heliocenter => "HELIOCENTER",
+            .relocatable => "RELOCATABLE", .custom => "CUSTOM",
+            .galactic => "GALACTIC", .embarycenter => "EMBARYCENTER",
+            .mercury => "MERCURY", .venus => "VENUS", .mars => "MARS",
+            .jupiter => "JUPITER", .saturn => "SATURN", .uranus => "URANUS",
+            .neptune => "NEPTUNE", .pluto => "PLUTO", .unknown => null,
+        };
     }
 };
 
@@ -250,6 +346,16 @@ pub const TimeCoords = struct {
     /// Exposure window relative to `MJDREF` (`TSTART`/`TSTOP`).
     tstart: ?f64 = null,
     tstop: ?f64 = null,
+    /// Time offset applied to all time values (`TIMEOFFS`, §9.2.4).
+    timeoffs: ?f64 = null,
+    /// `DATE-BEG`/`DATE-AVG`/`DATE-END` parsed (Table 33).
+    date_beg: ?DateTime = null,
+    date_avg: ?DateTime = null,
+    date_end: ?DateTime = null,
+    /// `MJD-BEG`/`MJD-AVG`/`MJD-END`.
+    mjd_beg: ?f64 = null,
+    mjd_avg: ?f64 = null,
+    mjd_end: ?f64 = null,
 
     /// Parse the global time keywords from `h`.
     pub fn fromHeader(a: Allocator, h: *const Header) std.mem.Allocator.Error!TimeCoords {
@@ -264,22 +370,85 @@ pub const TimeCoords = struct {
             self.trefpos = RefPos.parse(s);
         } else |_| {}
         self.timeunit = h.getString(a, "TIMEUNIT") catch null;
-        // MJDREF, or MJDREFI + MJDREFF (the split integer/fraction form for precision).
-        if (h.getValue(f64, "MJDREF")) |v| {
-            self.mjdref = v;
-        } else |_| {
-            const mi = h.getValue(f64, "MJDREFI") catch null;
-            const mf = h.getValue(f64, "MJDREFF") catch null;
-            if (mi != null or mf != null) self.mjdref = (mi orelse 0) + (mf orelse 0);
-        }
+        // Reference epoch, resolved with the §9.2.2 precedence JDREF > DATEREF > MJDREF.
+        self.mjdref = resolveMjdRef(a, h);
         self.mjd_obs = h.getValue(f64, "MJD-OBS") catch null;
         self.tstart = h.getValue(f64, "TSTART") catch null;
         self.tstop = h.getValue(f64, "TSTOP") catch null;
-        if (h.getString(a, "DATE-OBS")) |s| {
-            defer a.free(s);
-            self.date_obs = DateTime.parse(s) catch null;
-        } else |_| {}
+        self.timeoffs = h.getValue(f64, "TIMEOFFS") catch null;
+        self.mjd_beg = h.getValue(f64, "MJD-BEG") catch null;
+        self.mjd_avg = h.getValue(f64, "MJD-AVG") catch null;
+        self.mjd_end = h.getValue(f64, "MJD-END") catch null;
+        self.date_obs = parseDateKw(a, h, "DATE-OBS");
+        self.date_beg = parseDateKw(a, h, "DATE-BEG");
+        self.date_avg = parseDateKw(a, h, "DATE-AVG");
+        self.date_end = parseDateKw(a, h, "DATE-END");
         return self;
+    }
+
+    /// Resolve the reference epoch (as an MJD) from the JD/DATE/MJD keyword families, with
+    /// the §9.2.2 precedence `JDREF` > `DATEREF` > `MJDREF`. Within each split family the
+    /// integer+fraction pair (`*REFI`+`*REFF`) takes precedence over the single keyword, and
+    /// the single keyword wins only when at most one split part is present.
+    fn resolveMjdRef(a: Allocator, h: *const Header) ?f64 {
+        // JDREF family (highest precedence), converted from JD to MJD.
+        const ji = h.getValue(f64, "JDREFI") catch null;
+        const jf = h.getValue(f64, "JDREFF") catch null;
+        if (ji != null and jf != null) return jdToMjd(ji.? + jf.?);
+        if (h.getValue(f64, "JDREF")) |v| {
+            return jdToMjd(v);
+        } else |_| {}
+        if (ji != null or jf != null) return jdToMjd((ji orelse 0) + (jf orelse 0));
+        // DATEREF (an ISO-8601 calendar date).
+        if (parseDateKw(a, h, "DATEREF")) |dt| return dt.toMjd();
+        // MJDREF family.
+        const mi = h.getValue(f64, "MJDREFI") catch null;
+        const mf = h.getValue(f64, "MJDREFF") catch null;
+        if (mi != null and mf != null) return mi.? + mf.?;
+        if (h.getValue(f64, "MJDREF")) |v| {
+            return v;
+        } else |_| {}
+        if (mi != null or mf != null) return (mi orelse 0) + (mf orelse 0);
+        return null;
+    }
+
+    /// Read keyword `name` as an ISO-8601 date, returning `null` when absent or malformed.
+    fn parseDateKw(a: Allocator, h: *const Header, name: []const u8) ?DateTime {
+        const s = h.getString(a, name) catch return null;
+        defer a.free(s);
+        return DateTime.parse(s) catch null;
+    }
+
+    /// Emit the global time-coordinate cards into `h`, mirroring `fromHeader`: `TIMESYS`,
+    /// `TREFPOS`, `TIMEUNIT`, `MJDREFI`/`MJDREFF`, `DATE-OBS`, `MJD-OBS`, `TSTART`, `TSTOP`
+    /// (FR-WCS-4 SHOULD). Only fields that are set are written. The split `MJDREFI`/`MJDREFF`
+    /// pair preserves the full precision of `mjdref` and round-trips through `fromHeader`.
+    pub fn toHeader(self: *const TimeCoords, a: Allocator, h: *Header) (HeaderError || Allocator.Error)!void {
+        if (self.timesys.toString()) |s| try h.appendValue(a, "TIMESYS", .{ .string = s }, "time scale");
+        if (self.trefpos.toString()) |s| try h.appendValue(a, "TREFPOS", .{ .string = s }, "time reference position");
+        if (self.timeunit) |u| try h.appendValue(a, "TIMEUNIT", .{ .string = u }, "time unit");
+        if (self.mjdref) |m| {
+            const whole = @floor(m);
+            try h.appendValue(a, "MJDREFI", .{ .float = whole }, "[d] MJD reference, integer part");
+            try h.appendValue(a, "MJDREFF", .{ .float = m - whole }, "[d] MJD reference, fractional part");
+        }
+        if (self.date_obs) |dt| try appendDate(a, h, "DATE-OBS", dt, "observation date");
+        if (self.mjd_obs) |v| try h.appendValue(a, "MJD-OBS", .{ .float = v }, "[d] observation MJD");
+        if (self.tstart) |v| try h.appendValue(a, "TSTART", .{ .float = v }, "start of exposure");
+        if (self.tstop) |v| try h.appendValue(a, "TSTOP", .{ .float = v }, "end of exposure");
+    }
+
+    /// Alias of `toHeader`: write the global time-coordinate cards into `h` (FR-WCS-4).
+    pub fn writeTime(self: *const TimeCoords, a: Allocator, h: *Header) (HeaderError || Allocator.Error)!void {
+        return self.toHeader(a, h);
+    }
+
+    /// Format `dt` as an ISO-8601 string and append it as the value of card `name`.
+    fn appendDate(a: Allocator, h: *Header, name: []const u8, dt: DateTime, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
+        var buf: [40]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        dt.format(&w) catch unreachable; // 40 bytes is ample for any FITS date string
+        try h.appendValue(a, name, .{ .string = w.buffered() }, comment_text);
     }
 
     pub fn deinit(self: *TimeCoords, a: Allocator) void {
@@ -393,4 +562,159 @@ test "TimeCoords parses the global time keyword set" {
     try testing.expect(@abs(tc.mjdref.? - 58000.5) < 1e-9); // I + F combined
     try testing.expect(@abs(tc.tstop.? - 1200.0) < 1e-9);
     try testing.expectEqual(@as(i32, 2018), tc.date_obs.?.year);
+}
+
+test "MJDREFI+MJDREFF take precedence over a single MJDREF (§9.2.2)" {
+    const a = testing.allocator;
+    var h = Header.initEmpty();
+    defer h.deinit(a);
+    try h.appendValue(a, "MJDREF", .{ .float = 50000.0 }, null);
+    try h.appendValue(a, "MJDREFI", .{ .float = 58000.0 }, null);
+    try h.appendValue(a, "MJDREFF", .{ .float = 0.25 }, null);
+    var tc = try TimeCoords.fromHeader(a, &h);
+    defer tc.deinit(a);
+    // The split integer+fraction pair wins over the lone MJDREF.
+    try testing.expect(@abs(tc.mjdref.? - 58000.25) < 1e-9);
+}
+
+test "TimeCoords toHeader/writeTime round-trips through fromHeader" {
+    const a = testing.allocator;
+    var src: TimeCoords = .{
+        .timesys = .tt,
+        .trefpos = .geocenter,
+        .mjdref = 58000.5,
+        .mjd_obs = 58001.25,
+        .tstart = 0.0,
+        .tstop = 1200.0,
+        .date_obs = try DateTime.parse("2018-08-13T09:30:15"),
+    };
+    src.timeunit = try a.dupe(u8, "s"); // owned per the field contract
+    defer src.deinit(a);
+
+    var h = Header.initEmpty();
+    defer h.deinit(a);
+    try src.writeTime(a, &h);
+
+    var tc = try TimeCoords.fromHeader(a, &h);
+    defer tc.deinit(a);
+    try testing.expectEqual(TimeSys.tt, tc.timesys);
+    try testing.expectEqual(RefPos.geocenter, tc.trefpos);
+    try testing.expectEqualStrings("s", tc.timeunit.?);
+    try testing.expect(@abs(tc.mjdref.? - 58000.5) < 1e-9);
+    try testing.expect(@abs(tc.mjd_obs.? - 58001.25) < 1e-9);
+    try testing.expect(@abs(tc.tstop.? - 1200.0) < 1e-9);
+    try testing.expectEqual(@as(i32, 2018), tc.date_obs.?.year);
+    try testing.expectEqual(@as(u8, 15), tc.date_obs.?.second);
+}
+
+test "TimeSys deprecated synonyms, LOCAL, and UT() qualifier" {
+    try testing.expectEqual(TimeSys.tt, TimeSys.parse("TDT"));
+    try testing.expectEqual(TimeSys.tt, TimeSys.parse("ET"));
+    try testing.expectEqual(TimeSys.tai, TimeSys.parse("IAT"));
+    try testing.expectEqual(TimeSys.utc, TimeSys.parse("GMT"));
+    try testing.expectEqual(TimeSys.local, TimeSys.parse("LOCAL"));
+    try testing.expectEqual(TimeSys.ut1, TimeSys.parse("UT"));
+    try testing.expectEqual(TimeSys.utc, TimeSys.parse("UTC(USNO)"));
+    try testing.expectEqual(TimeSys.ut1, TimeSys.parse("UT1(NIST)"));
+    try testing.expectEqual(TimeSys.unknown, TimeSys.parse("FOO"));
+    try testing.expectEqualStrings("LOCAL", TimeSys.local.toString().?);
+    try testing.expect(TimeSys.unknown.toString() == null);
+}
+
+test "RefPos CUSTOM and solar-system positions match on three chars" {
+    try testing.expectEqual(RefPos.custom, RefPos.parse("CUSTOM"));
+    try testing.expectEqual(RefPos.heliocenter, RefPos.parse("HELIOCENTER"));
+    try testing.expectEqual(RefPos.embarycenter, RefPos.parse("EMBARYCENTER"));
+    try testing.expectEqual(RefPos.galactic, RefPos.parse("GALACTIC"));
+    try testing.expectEqual(RefPos.mars, RefPos.parse("MARS"));
+    try testing.expectEqual(RefPos.jupiter, RefPos.parse("JUPITER"));
+    try testing.expectEqual(RefPos.pluto, RefPos.parse("PLUTO"));
+    try testing.expectEqual(RefPos.topocenter, RefPos.parse("TOPOCENTER"));
+    try testing.expectEqual(RefPos.unknown, RefPos.parse("XY"));
+    try testing.expectEqualStrings("EMBARYCENTER", RefPos.embarycenter.toString().?);
+}
+
+test "reference epoch precedence JDREF > DATEREF > MJDREF" {
+    const a = testing.allocator;
+    // JDREF wins over both DATEREF and MJDREF.
+    {
+        var h = Header.initEmpty();
+        defer h.deinit(a);
+        try h.appendValue(a, "MJDREF", .{ .float = 50000.0 }, null);
+        try h.appendValue(a, "DATEREF", .{ .string = "2000-01-01T00:00:00" }, null);
+        try h.appendValue(a, "JDREF", .{ .float = mjdToJd(58000.0) }, null);
+        var tc = try TimeCoords.fromHeader(a, &h);
+        defer tc.deinit(a);
+        try testing.expect(@abs(tc.mjdref.? - 58000.0) < 1e-6);
+    }
+    // DATEREF wins over MJDREF when no JDREF is present.
+    {
+        var h = Header.initEmpty();
+        defer h.deinit(a);
+        try h.appendValue(a, "MJDREF", .{ .float = 50000.0 }, null);
+        try h.appendValue(a, "DATEREF", .{ .string = "1858-11-17T00:00:00" }, null);
+        var tc = try TimeCoords.fromHeader(a, &h);
+        defer tc.deinit(a);
+        try testing.expect(@abs(tc.mjdref.? - 0.0) < 1e-6); // MJD epoch
+    }
+    // Split JDREFI+JDREFF take precedence within the JD family.
+    {
+        var h = Header.initEmpty();
+        defer h.deinit(a);
+        try h.appendValue(a, "JDREF", .{ .float = mjdToJd(1.0) }, null);
+        try h.appendValue(a, "JDREFI", .{ .float = mjdToJd(58000.0) }, null);
+        try h.appendValue(a, "JDREFF", .{ .float = 0.25 }, null);
+        var tc = try TimeCoords.fromHeader(a, &h);
+        defer tc.deinit(a);
+        try testing.expect(@abs(tc.mjdref.? - 58000.25) < 1e-6);
+    }
+}
+
+test "TimeCoords reads DATE/MJD-BEG/AVG/END and TIMEOFFS" {
+    const a = testing.allocator;
+    var h = Header.initEmpty();
+    defer h.deinit(a);
+    try h.appendValue(a, "DATE-BEG", .{ .string = "2018-08-13T09:00:00" }, null);
+    try h.appendValue(a, "DATE-AVG", .{ .string = "2018-08-13T09:30:00" }, null);
+    try h.appendValue(a, "DATE-END", .{ .string = "2018-08-13T10:00:00" }, null);
+    try h.appendValue(a, "MJD-BEG", .{ .float = 58343.375 }, null);
+    try h.appendValue(a, "MJD-AVG", .{ .float = 58343.395 }, null);
+    try h.appendValue(a, "MJD-END", .{ .float = 58343.416 }, null);
+    try h.appendValue(a, "TIMEOFFS", .{ .float = 1.5 }, null);
+    var tc = try TimeCoords.fromHeader(a, &h);
+    defer tc.deinit(a);
+    try testing.expectEqual(@as(u8, 9), tc.date_beg.?.hour);
+    try testing.expectEqual(@as(u8, 30), tc.date_avg.?.minute);
+    try testing.expectEqual(@as(u8, 10), tc.date_end.?.hour);
+    try testing.expect(@abs(tc.mjd_beg.? - 58343.375) < 1e-9);
+    try testing.expect(@abs(tc.mjd_end.? - 58343.416) < 1e-9);
+    try testing.expect(@abs(tc.timeoffs.? - 1.5) < 1e-9);
+}
+
+test "signed five-digit ISO-8601 years parse and format" {
+    const future = try DateTime.parse("+12345-06-07T01:02:03");
+    try testing.expectEqual(@as(i32, 12345), future.year);
+    try testing.expectEqual(@as(u8, 6), future.month);
+    var buf: [40]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try future.format(&w);
+    try testing.expectEqualStrings("+12345-06-07T01:02:03", w.buffered());
+
+    const past = try DateTime.parse("-04713-11-24T12:00:00");
+    try testing.expectEqual(@as(i32, -4713), past.year);
+    var buf2: [40]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    try past.format(&w2);
+    try testing.expectEqualStrings("-04713-11-24T12:00:00", w2.buffered());
+}
+
+test "Julian and Besselian epoch conversions" {
+    // J2000.0 ⇒ JD 2451545.0.
+    try testing.expect(@abs(julianEpochToJd(2000.0) - 2451545.0) < 1e-6);
+    try testing.expect(@abs(jdToJulianEpoch(2451545.0) - 2000.0) < 1e-9);
+    // B1900.0 ⇒ JD 2415020.31352.
+    try testing.expect(@abs(besselianEpochToJd(1900.0) - 2415020.31352) < 1e-6);
+    try testing.expect(@abs(jdToBesselianEpoch(2415020.31352) - 1900.0) < 1e-9);
+    // Round-trip a Besselian epoch through JD.
+    try testing.expect(@abs(jdToBesselianEpoch(besselianEpochToJd(1950.0)) - 1950.0) < 1e-9);
 }

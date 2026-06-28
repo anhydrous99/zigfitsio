@@ -80,10 +80,17 @@ pub fn build(name: []const u8, v: value.KeywordValue, comment: ?[]const u8) Head
 fn formatFree(w: *std.Io.Writer, v: value.KeywordValue) std.Io.Writer.Error!void {
     switch (v) {
         .int => |n| try w.print("{d}", .{n}),
-        .float => |f| try w.print("{e}", .{f}),
+        .float => |f| {
+            var tmp: [64]u8 = undefined;
+            try w.writeAll(value.formatReal(&tmp, f)); // uppercase 'E' exponent (§4.2.4)
+        },
         .logical => |b| try w.writeAll(if (b) "T" else "F"),
         .complex_int => |c| try w.print("({d}, {d})", .{ c[0], c[1] }),
-        .complex_float => |c| try w.print("({e}, {e})", .{ c[0], c[1] }),
+        .complex_float => |c| {
+            var rb: [64]u8 = undefined;
+            var ib: [64]u8 = undefined;
+            try w.print("({s}, {s})", .{ value.formatReal(&rb, c[0]), value.formatReal(&ib, c[1]) });
+        },
         .string => |s| {
             try w.writeByte('\'');
             for (s) |ch| {
@@ -161,6 +168,18 @@ test "matchName accepts both spellings, case-insensitive, whitespace-collapsed" 
     try testing.expect(matchName(&c, "HIERARCH ESO DET CHIP1 NAME"));
     try testing.expect(!matchName(&c, "ESO DET CHIP2 NAME"));
     try testing.expect(!matchName(&c, "ESO DET"));
+}
+
+test "build emits an UPPERCASE 'E' exponent for real values (§4.2.4)" {
+    const c = try build("ESO INS TEMP", .{ .float = 1.5e2 }, null);
+    const raw = c.bytes();
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 'E') != null);
+    try testing.expect(std.mem.indexOf(u8, raw, "1.5E2") != null);
+    // No lowercase 'e' anywhere in the formatted value/name.
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 'e') == null);
+
+    const cc = try build("ESO INS GAIN", .{ .complex_float = .{ 1.5e2, -2.5e-3 } }, null);
+    try testing.expect(std.mem.indexOf(u8, cc.bytes(), "(1.5E2, -2.5E-3)") != null);
 }
 
 test "non-HIERARCH card yields null" {

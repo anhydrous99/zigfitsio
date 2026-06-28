@@ -18,6 +18,9 @@ const Card = @import("card.zig").Card;
 const Name = @import("name.zig").Name;
 const Matches = @import("name.zig").Matches;
 const value = @import("value.zig");
+// `continue` is a Zig keyword, so the long-string module is imported under `continuation`.
+const continuation = @import("continue.zig");
+const hierarch = @import("hierarch.zig");
 const block = @import("../io/block.zig");
 
 const Allocator = std.mem.Allocator;
@@ -119,6 +122,9 @@ pub const Header = struct {
         for (self.cards.items, 0..) |*c, i| {
             if (c.kind == .end) continue;
             if (c.name.eqlText(name)) return i;
+            // The 8-byte name of every HIERARCH card is the literal "HIERARCH"; match the real
+            // hierarchical keyword (either spelling) via the convention parser (FR-HDR-9).
+            if (c.name.eqlText("HIERARCH") and hierarch.matchName(c, name)) return i;
         }
         return null;
     }
@@ -174,6 +180,68 @@ pub const Header = struct {
         }
     }
 
+    /// Read a (possibly `CONTINUE`-continued) long string value as one owned slice (caller
+    /// frees). Walks the base card plus any following `CONTINUE` cards via the long-string
+    /// convention (FR-HDR-8, §4.2.1.2); a value that does not actually continue (including any
+    /// literal trailing `&`) is returned as its single-card string. `error.KeywordNotFound` if
+    /// absent, `error.WrongValueType` if not a string, `error.ValueUndefined` for a blank field.
+    /// Honors `INHERIT` like `get`/`getString`.
+    pub fn getLongString(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || Allocator.Error)![]u8 {
+        if (self.findFirst(name)) |idx| {
+            if (try continuation.assemble(alloc, self.cards.items, idx)) |joined| return joined.value;
+            // Not a continued run: take the single-card string value (keeps any literal `&`).
+            return self.getString(alloc, name);
+        }
+        if (self.inherit) |parent| {
+            if (isInheritable(name)) return parent.getLongString(alloc, name);
+        }
+        return error.KeywordNotFound;
+    }
+
+    /// Read the value of a `HIERARCH` long-keyword card by its hierarchical name — either the
+    /// spaced-token form (`ESO DET CHIP1 NAME`) or the full `HIERARCH …` spelling — as a parsed
+    /// `KeywordValue` (FR-HDR-9). A `.string` payload is allocator-owned (caller `deinit`s it);
+    /// other variants own nothing. `error.KeywordNotFound` if no `HIERARCH` card matches.
+    pub fn getHierarch(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || Allocator.Error)!value.KeywordValue {
+        for (self.cards.items) |*c| {
+            if (c.kind == .end) continue;
+            if (c.name.eqlText("HIERARCH") and hierarch.matchName(c, name)) {
+                return (try hierarch.parseValue(alloc, c)) orelse error.KeywordNotFound;
+            }
+        }
+        return error.KeywordNotFound;
+    }
+
+    /// Read keyword `name` as the full parsed `KeywordValue` union, exposing every value type —
+    /// including the `complex_int`/`complex_float`/`undefined` variants that the scalar
+    /// `getValue` cannot return (FR-HDR-3). A `.string` payload is allocator-owned (caller
+    /// `deinit`s it); other variants own nothing. `error.KeywordNotFound` if absent.
+    pub fn getValueUnion(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || Allocator.Error)!value.KeywordValue {
+        const card = try self.get(name);
+        return value.parseValue(alloc, card.valueField());
+    }
+
+    /// Read a complex-valued keyword (FITS 4.0 §4.2.5/§4.2.6) as `[2]f64` `{real, imaginary}`.
+    /// A `complex_int` is widened to floats and a real/integer scalar is taken as `{value, 0}`
+    /// (FR-HDR-3, FR-CONV-1). `error.WrongValueType` for a string/logical value,
+    /// `error.ValueUndefined` for a blank field, `error.KeywordNotFound` if absent. No allocation.
+    pub fn getComplex(self: *const Header, name: []const u8) (ValueError || HeaderError)![2]f64 {
+        const card = try self.get(name);
+        var fixed_alloc = std.heap.FixedBufferAllocator.init(&[_]u8{});
+        const v = value.parseValue(fixed_alloc.allocator(), card.valueField()) catch |err| switch (err) {
+            error.OutOfMemory => return error.WrongValueType, // a string value (needs alloc)
+            else => |e| return e,
+        };
+        return switch (v) {
+            .complex_float => |c| c,
+            .complex_int => |c| .{ @floatFromInt(c[0]), @floatFromInt(c[1]) },
+            .float => |f| .{ f, 0 },
+            .int => |n| .{ @floatFromInt(n), 0 },
+            .undefined => error.ValueUndefined,
+            else => error.WrongValueType,
+        };
+    }
+
     /// The parsed `/ comment` of keyword `name`, borrowed from the card's bytes, or `null` if
     /// the keyword is absent or has no comment (FR-HDR-5).
     pub fn comment(self: *const Header, name: []const u8) ?[]const u8 {
@@ -188,7 +256,13 @@ pub const Header = struct {
         out.reset();
         for (self.cards.items, 0..) |*c, i| {
             if (c.kind == .end) continue;
-            if (@import("name.zig").matchWildcard(pattern, c.name.text())) out.add(@intCast(i));
+            if (@import("name.zig").matchWildcard(pattern, c.name.text())) {
+                out.add(@intCast(i));
+            } else if (c.name.eqlText("HIERARCH") and hierarch.matchName(c, pattern)) {
+                // A HIERARCH card matches when `pattern` is its (exact) hierarchical keyword;
+                // its literal 8-byte name is always "HIERARCH" so the wildcard pass misses it.
+                out.add(@intCast(i));
+            }
         }
     }
 
@@ -205,6 +279,16 @@ pub const Header = struct {
     pub fn appendValue(self: *Header, alloc: Allocator, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
         const card = try Card.buildValue(name, v, comment_text);
         try self.cards.append(alloc, card);
+    }
+
+    /// Append a string value of any length using the `CONTINUE` long-string convention
+    /// (FR-HDR-8, §4.2.1.2): a base value card whose value ends with the `&` continuation marker
+    /// plus one or more `CONTINUE` cards, or a single card when the string fits in 68 characters.
+    /// `comment` is attached to the final card. Round-trips through `getLongString`.
+    pub fn appendLongString(self: *Header, alloc: Allocator, name: []const u8, str: []const u8, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
+        const cards = try continuation.split(alloc, name, str, comment_text);
+        defer alloc.free(cards);
+        try self.cards.appendSlice(alloc, cards);
     }
 
     /// Append a raw 80-byte card, used by builders that format their own card bytes.
@@ -481,4 +565,122 @@ test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)"
     const before = h.count();
     try h.update(testing.allocator, "BITPIX", .{ .int = 8 }, null);
     try testing.expectEqual(before, h.count()); // filled a blank, no net growth
+}
+
+test "long-string CONTINUE: append then getLongString round-trips through the Header (FR-HDR-8)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    const long = "The quick brown fox jumps over the lazy dog, and then keeps right on running " ++
+        "across a very wide open field for a good long while under a clear blue sky."; // > 68
+    try h.appendLongString(testing.allocator, "LONGSTR", long, "a long comment");
+    try h.appendLongString(testing.allocator, "OBJECT", "M31", null); // short ⇒ single card
+    try h.ensureEnd(testing.allocator);
+
+    // The long value spanned a base value card plus at least one CONTINUE card.
+    try testing.expect(h.at(0).kind == .value);
+    try testing.expect(h.at(1).kind == .continuation);
+
+    const got = try h.getLongString(testing.allocator, "LONGSTR");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(long, got);
+
+    // A short (non-continued) string also reads correctly through getLongString.
+    const obj = try h.getLongString(testing.allocator, "OBJECT");
+    defer testing.allocator.free(obj);
+    try testing.expectEqualStrings("M31", obj);
+
+    // A non-string keyword is still a type error.
+    try h.appendValue(testing.allocator, "NX", .{ .int = 2 }, null);
+    try testing.expectError(error.WrongValueType, h.getLongString(testing.allocator, "NX"));
+}
+
+test "getLongString reassembles a multi-card CONTINUE value parsed from real cards (FR-HDR-8)" {
+    var mem = try buildHeaderDevice(testing.allocator, &.{
+        "WEATHER = 'Partly cloudy during the evening f&'",
+        "CONTINUE  'ollowed by cloudy skies overnight.&'",
+        "CONTINUE  ' Low 21C. Winds NNE at 5 to 10 mph.'",
+        "OBJECT  = 'M31     '",
+    });
+    defer mem.deinit();
+    var reader = try block.BlockReader.init(testing.allocator, mem.device(), 0);
+    defer reader.deinit();
+    const res = try Header.parse(testing.allocator, &reader, 0, 36);
+    var h = res.header;
+    defer h.deinit(testing.allocator);
+
+    const got = try h.getLongString(testing.allocator, "WEATHER");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        "Partly cloudy during the evening followed by cloudy skies overnight. Low 21C. Winds NNE at 5 to 10 mph.",
+        got,
+    );
+    // The trailing single-card keyword is unaffected by the preceding CONTINUE run.
+    const obj = try h.getLongString(testing.allocator, "OBJECT");
+    defer testing.allocator.free(obj);
+    try testing.expectEqualStrings("M31", obj);
+}
+
+test "HIERARCH lookup through the Header by both spellings (FR-HDR-9)" {
+    var mem = try buildHeaderDevice(testing.allocator, &.{
+        "BITPIX  =                    8",
+        "HIERARCH ESO DET CHIP1 NAME = 'CCD1' / detector name",
+        "HIERARCH ESO INS TEMP = 12.5 / Celsius",
+    });
+    defer mem.deinit();
+    var reader = try block.BlockReader.init(testing.allocator, mem.device(), 0);
+    defer reader.deinit();
+    const res = try Header.parse(testing.allocator, &reader, 0, 36);
+    var h = res.header;
+    defer h.deinit(testing.allocator);
+
+    // has/get resolve HIERARCH cards by either spelling, case-insensitive.
+    try testing.expect(h.has("ESO DET CHIP1 NAME"));
+    try testing.expect(h.has("hierarch eso det chip1 name"));
+    try testing.expect(!h.has("ESO DET CHIP2 NAME"));
+    _ = try h.get("ESO DET CHIP1 NAME"); // resolves to the HIERARCH card (no KeywordNotFound)
+
+    // getHierarch reads the parsed value (string and numeric variants).
+    const name = try h.getHierarch(testing.allocator, "ESO DET CHIP1 NAME");
+    defer name.deinit(testing.allocator);
+    try testing.expectEqualStrings("CCD1", name.string);
+    const temp = try h.getHierarch(testing.allocator, "HIERARCH ESO INS TEMP"); // full spelling
+    try testing.expectEqual(@as(f64, 12.5), temp.float);
+    try testing.expectError(error.KeywordNotFound, h.getHierarch(testing.allocator, "ESO DET CHIP9 GONE"));
+
+    // find() also surfaces a HIERARCH card by its exact hierarchical name.
+    var m: Matches = .{};
+    h.find("ESO INS TEMP", &m);
+    try testing.expectEqual(@as(usize, 1), m.len);
+}
+
+test "complex and undefined values are reachable via getValueUnion/getComplex (FR-HDR-3)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendValue(testing.allocator, "CPLXF", .{ .complex_float = .{ 1.5, -2.5 } }, null);
+    try h.appendValue(testing.allocator, "CPLXI", .{ .complex_int = .{ 3, 4 } }, null);
+    try h.appendValue(testing.allocator, "UNDEF", .undefined, null);
+    try h.appendValue(testing.allocator, "REAL", .{ .float = 7.0 }, null);
+    try h.appendValue(testing.allocator, "OBJECT", .{ .string = "M31" }, null);
+    try h.ensureEnd(testing.allocator);
+
+    // getValueUnion exposes every variant, including those getValue cannot return.
+    const vf = try h.getValueUnion(testing.allocator, "CPLXF");
+    defer vf.deinit(testing.allocator);
+    try testing.expectEqual([2]f64{ 1.5, -2.5 }, vf.complex_float);
+    const vi = try h.getValueUnion(testing.allocator, "CPLXI");
+    defer vi.deinit(testing.allocator);
+    try testing.expectEqual([2]i64{ 3, 4 }, vi.complex_int);
+    const vu = try h.getValueUnion(testing.allocator, "UNDEF");
+    defer vu.deinit(testing.allocator);
+    try testing.expectEqual(value.KeywordValue.undefined, std.meta.activeTag(vu));
+
+    // getComplex normalizes int→float pairs and scalars→(v, 0); rejects non-numeric types.
+    try testing.expectEqual([2]f64{ 1.5, -2.5 }, try h.getComplex("CPLXF"));
+    try testing.expectEqual([2]f64{ 3.0, 4.0 }, try h.getComplex("CPLXI"));
+    try testing.expectEqual([2]f64{ 7.0, 0.0 }, try h.getComplex("REAL"));
+    try testing.expectError(error.ValueUndefined, h.getComplex("UNDEF"));
+    try testing.expectError(error.WrongValueType, h.getComplex("OBJECT"));
+
+    // getValue still cannot coerce a complex value to a scalar (unchanged contract).
+    try testing.expectError(error.WrongValueType, h.getValue(f64, "CPLXF"));
 }

@@ -170,6 +170,18 @@ pub const GroupTable = struct {
         const fits = self.table.fits;
         _ = try fits.hduCount(); // membership only resolves against a fully-scanned file
 
+        // An inter-file member (non-blank MEMBER_LOCATION) lives in another file; following it is
+        // out of scope here, so never let MEMBER_POSITION/EXTNAME resolve it against the local file.
+        if (self.col_location) |ci| {
+            const col = &self.table.columns[ci];
+            const w: usize = @intCast(col.tform.repeat);
+            var lbuf: [256]u8 = undefined;
+            if (w > 0 and w <= lbuf.len) {
+                try self.table.readColumn(u8, .{ .index = ci }, row, lbuf[0..w], .{});
+                if (std.mem.trimEnd(u8, lbuf[0..w], " ").len > 0) return null;
+            }
+        }
+
         if (self.col_position) |ci| {
             const pos = try self.readIntCell(ci, row);
             if (pos >= 1 and @as(u64, @intCast(pos)) <= fits.hdus.items.len) {
@@ -275,9 +287,7 @@ pub const GroupTable = struct {
         var kw: [16]u8 = undefined;
         while (n <= 999) : (n += 1) {
             const name = grpidName(&kw, n);
-            if (!member.header.has(name)) {
-                if (n > 1) continue else break; // tolerate gaps below a known max, then stop
-            }
+            if (!member.header.has(name)) continue; // scan the full range (mirror groupsOf)
             const v = member.header.getValue(i64, name) catch continue;
             if (v == grp_pos) {
                 member.header.delete(name) catch {};
@@ -602,6 +612,58 @@ test "of rejects a non-grouping binary table and a non-table HDU" {
     const f = &b.f;
     const prim = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
     try testing.expectError(error.WrongHduType, GroupTable.of(f, prim));
+}
+
+test "resolveMember returns null for a non-blank MEMBER_LOCATION (inter-file) row" {
+    const alloc = testing.allocator;
+    var b = try newHandle(alloc);
+    defer b.deinit(alloc);
+    const f = &b.f;
+
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // HDU1 primary
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{3} }); // HDU2 (a valid local target)
+
+    var grp = try GroupTable.create(f, null); // HDU3
+    defer grp.deinit(alloc);
+    try grp.table.appendRows(1);
+    // A *valid* local position (2) that would otherwise resolve, but a non-blank MEMBER_LOCATION
+    // marks this as an inter-file member ⇒ must resolve to null.
+    try grp.writeIntCell(grp.col_position.?, 0, 2);
+    try grp.writeStrCell(grp.col_location.?, 0, "file://elsewhere.fits");
+    try testing.expectEqual(@as(?*Hdu, null), try grp.resolveMember(0));
+
+    // Clearing MEMBER_LOCATION re-enables local resolution by position.
+    try grp.writeStrCell(grp.col_location.?, 0, "");
+    try testing.expectEqual(@as(?*Hdu, f.hdus.items[1]), try grp.resolveMember(0));
+}
+
+test "removeMember drops GRPID2 even after the lower GRPID1 was already removed" {
+    const alloc = testing.allocator;
+    var b = try newHandle(alloc);
+    defer b.deinit(alloc);
+    const f = &b.f;
+
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // HDU1 primary
+    const h2 = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{3} }); // HDU2 member
+
+    var grpA = try GroupTable.create(f, "A"); // HDU3
+    defer grpA.deinit(alloc);
+    var grpB = try GroupTable.create(f, "B"); // HDU4
+    defer grpB.deinit(alloc);
+
+    _ = try grpA.addMember(h2); // GRPID1 = 3
+    _ = try grpB.addMember(h2); // GRPID2 = 4
+    try testing.expectEqual(@as(i64, 3), try h2.header.getValue(i64, "GRPID1"));
+    try testing.expectEqual(@as(i64, 4), try h2.header.getValue(i64, "GRPID2"));
+
+    // Remove from the lower-GRPIDn group first: drops GRPID1, leaving a gap at n==1.
+    try testing.expect(try grpA.removeMember(h2));
+    try testing.expect(!h2.header.has("GRPID1"));
+    try testing.expect(h2.header.has("GRPID2"));
+
+    // Removing from the second group must still scan past the gap and drop GRPID2.
+    try testing.expect(try grpB.removeMember(h2));
+    try testing.expect(!h2.header.has("GRPID2"));
 }
 
 test "addMember/removeMember are rejected on a read-only handle" {

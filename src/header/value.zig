@@ -127,13 +127,36 @@ pub fn parseUnits(field: []const u8) ?[]const u8 {
 pub fn formatValue(w: *std.Io.Writer, v: KeywordValue) std.Io.Writer.Error!void {
     switch (v) {
         .int => |n| try fixedNum(w, "{d}", .{n}),
-        .float => |f| try fixedNum(w, "{e}", .{f}),
+        .float => |f| {
+            var tmp: [64]u8 = undefined;
+            try padLeft(w, formatReal(&tmp, f), FIXED_WIDTH);
+        },
         .logical => |b| try padLeft(w, if (b) "T" else "F", FIXED_WIDTH),
         .complex_int => |c| try w.print("({d}, {d})", .{ c[0], c[1] }),
-        .complex_float => |c| try w.print("({e}, {e})", .{ c[0], c[1] }),
+        .complex_float => |c| {
+            var rb: [64]u8 = undefined;
+            var ib: [64]u8 = undefined;
+            try w.print("({s}, {s})", .{ formatReal(&rb, c[0]), formatReal(&ib, c[1]) });
+        },
         .string => |s| try formatString(w, s),
         .undefined => {}, // undefined value ⇒ blank value field
     }
+}
+
+/// Format a real with the FITS-mandated **uppercase** exponent letter (FITS 4.0 §4.2.4: reals
+/// are written with `E` — or the FORTRAN `D` — never a lowercase `e`). `std.fmt`'s `{e}` emits
+/// a lowercase `e`, so the exponent letter is upper-cased in place within `buf`. Returns the
+/// slice of `buf` used; `buf` must be ≥ 32 bytes (any `f64` in `{e}` form fits). Shared by the
+/// card writer here and the HIERARCH free-format writer (`hierarch.zig`).
+pub fn formatReal(buf: []u8, f: f64) []const u8 {
+    const s = std.fmt.bufPrint(buf, "{e}", .{f}) catch unreachable;
+    for (s) |*c| {
+        if (c.* == 'e') {
+            c.* = 'E';
+            break; // `{e}` yields exactly one exponent letter
+        }
+    }
+    return s;
 }
 
 // ── internals ────────────────────────────────────────────────────────────────────────────
@@ -260,8 +283,8 @@ fn hasFloatChar(s: []const u8) bool {
 }
 
 // Format `args` with `fmt` into a scratch buffer, then right-justify in `FIXED_WIDTH` columns.
-// The buffer holds any i64 ("{d}", ≤20 chars) or f64 ("{e}", ≤24 chars), so `bufPrint` cannot
-// overflow.
+// Used for integers ("{d}", any i64 ≤ 20 chars), so `bufPrint` into the 64-byte buffer cannot
+// overflow. Reals route through `formatReal` instead (uppercase-exponent fix-up).
 fn fixedNum(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
     var tmp: [64]u8 = undefined;
     const s = std.fmt.bufPrint(&tmp, fmt, args) catch unreachable;
@@ -431,6 +454,31 @@ test "formatValue strings escape, pad to 8, and round-trip through parseValue" {
         defer v.deinit(testing.allocator);
         try testing.expectEqualStrings(orig, v.string);
     }
+}
+
+test "formatValue writes reals with an UPPERCASE 'E' exponent (§4.2.4)" {
+    var buf: [80]u8 = undefined;
+    {
+        // A representative .float: 150.0 ⇒ "1.5E2", right-justified in the 20-column field.
+        var w = std.Io.Writer.fixed(&buf);
+        try formatValue(&w, .{ .float = 1.5e2 });
+        const s = w.buffered();
+        try testing.expectEqual(@as(usize, FIXED_WIDTH), s.len);
+        try testing.expectEqualStrings("               1.5E2", s); // 15 blanks + "1.5E2"
+        try testing.expect(std.mem.indexOfScalar(u8, s, 'e') == null); // never a lowercase 'e'
+    }
+    {
+        // A representative .complex_float: pins the uppercase 'E' in BOTH parts.
+        var w = std.Io.Writer.fixed(&buf);
+        try formatValue(&w, .{ .complex_float = .{ 1.5e2, -2.5e-3 } });
+        const s = w.buffered();
+        try testing.expectEqualStrings("(1.5E2, -2.5E-3)", s);
+        try testing.expect(std.mem.indexOfScalar(u8, s, 'e') == null);
+    }
+    // formatReal upper-cases the exponent and otherwise matches std.fmt's "{e}".
+    var rb: [64]u8 = undefined;
+    try testing.expectEqualStrings("1E2", formatReal(&rb, 100.0));
+    try testing.expectEqualStrings("3.14E0", formatReal(&rb, 3.14));
 }
 
 test "formatValue undefined writes a blank value field" {

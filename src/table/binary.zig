@@ -536,7 +536,7 @@ pub const BinTable = struct {
         switch (column.tform.type) {
             .logical => try readLogical(T, dev, off, out, mode, opts),
             .bit => try readBits(T, dev, off, out, mode),
-            .char => try readChars(T, dev, off, out, mode),
+            .char => try readChars(T, dev, off, out, mode, column),
             .byte => try readRun(u8, T, dev, off, out, column, mode, opts),
             .int16 => try readRun(i16, T, dev, off, out, column, mode, opts),
             .int32 => try readRun(i32, T, dev, off, out, column, mode, opts),
@@ -555,7 +555,7 @@ pub const BinTable = struct {
         switch (column.tform.type) {
             .logical => try writeLogical(T, dev, off, in, opts),
             .bit => try writeBits(T, dev, off, in),
-            .char => try writeChars(T, dev, off, in),
+            .char => try writeChars(T, dev, off, in, column),
             .byte => try writeRun(u8, T, dev, off, in, column, mode, opts),
             .int16 => try writeRun(i16, T, dev, off, in, column, mode, opts),
             .int32 => try writeRun(i32, T, dev, off, in, column, mode, opts),
@@ -653,7 +653,9 @@ fn parseColumns(fits: *Fits, hdu: *Hdu) OpenError!struct { columns: []Column, na
             };
             if (ds) |s| {
                 defer alloc.free(s);
-                tdim = try parseTdim(alloc, s, tform.repeat);
+                // VLA columns: TDIM shapes the heap array, so the product<=repeat bound is skipped.
+                const bound: ?u64 = if (tform.type.isVla()) null else tform.repeat;
+                tdim = try parseTdim(alloc, s, bound);
             }
         }
 
@@ -766,9 +768,12 @@ fn restrideRows(alloc: Allocator, dev: Device, data_off: u64, nrows: u64, old_st
     }
 }
 
-/// Parse a `TDIMn` value `"(a,b,…)"` into an owned shape. The product of the axes must be
-/// `≤ repeat` (trailing elements are undefined fill, FR-BTB-3); otherwise `error.BadTdim`.
-fn parseTdim(alloc: Allocator, s_in: []const u8, repeat: u64) (errors.TableError || Allocator.Error)![]u64 {
+/// Parse a `TDIMn` value `"(a,b,…)"` into an owned shape. When `bound` is non-null the product
+/// of the axes must be `≤ bound` (the column `repeat`; trailing elements are undefined fill,
+/// FR-BTB-3) or `error.BadTdim`. For a `P`/`Q` (VLA) column `bound` is `null`: `TDIMn` then
+/// describes the *heap* array shape, not the in-row descriptor repeat, so the product bound does
+/// not apply.
+fn parseTdim(alloc: Allocator, s_in: []const u8, bound: ?u64) (errors.TableError || Allocator.Error)![]u64 {
     const s = std.mem.trim(u8, s_in, " ");
     if (s.len < 2 or s[0] != '(' or s[s.len - 1] != ')') return error.BadTdim;
     const inner = s[1 .. s.len - 1];
@@ -784,7 +789,9 @@ fn parseTdim(alloc: Allocator, s_in: []const u8, repeat: u64) (errors.TableError
         try list.append(alloc, d);
     }
     if (list.items.len == 0) return error.BadTdim;
-    if (product > repeat) return error.BadTdim;
+    if (bound) |b| {
+        if (product > b) return error.BadTdim;
+    }
     return list.toOwnedSlice(alloc);
 }
 
@@ -1003,9 +1010,22 @@ fn writeBits(comptime T: type, dev: Device, off: u64, in: []const T) (errors.IoE
     }
 }
 
-// A: decode terminates at the first NUL (rest → spaces); leading NUL ⇒ null (all spaces).
+// The per-string width of an `A` cell: `TDIMn`'s most-rapidly-varying axis (`tdim[0]`) when a
+// `TDIMn` is present (FR-BTB-7: the field is an array of fixed-width strings), else the whole
+// field. A zero axis falls back to the whole field so the modulus below is never by zero.
+fn charWidth(column: *const Column, full: usize) usize {
+    if (column.tdim) |td| {
+        if (td.len > 0 and td[0] > 0 and td[0] <= full) return @intCast(td[0]);
+    }
+    return full;
+}
+
+// A: decode terminates at the first NUL (rest → spaces); leading NUL ⇒ null (all spaces). When
+// `TDIMn` declares a string array (`TDIMn=(w,…)`), the NUL/pad state resets at every `w`-byte
+// substring boundary so a NUL in one string does not blank the following strings (FR-BTB-7).
 // For non-`u8` `T`, each byte is simply converted (no string semantics).
-fn readChars(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode) (errors.IoError || errors.ConvError)!void {
+fn readChars(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode, column: *const Column) (errors.IoError || errors.ConvError)!void {
+    const width = charWidth(column, out.len);
     var scratch: [SCRATCH_BYTES]u8 = undefined;
     var done: usize = 0;
     var hit_nul = false;
@@ -1014,6 +1034,7 @@ fn readChars(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode) (err
         try dev.readAll(scratch[0..m], off + done);
         for (scratch[0..m], 0..) |b, i| {
             if (T == u8) {
+                if ((done + i) % width == 0) hit_nul = false; // new substring: reset latch
                 if (hit_nul) {
                     out[done + i] = ' ';
                 } else if (b == 0) {
@@ -1031,7 +1052,10 @@ fn readChars(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode) (err
 }
 
 // A: encode pads with spaces; once an input NUL is seen the remainder of the field is spaces.
-fn writeChars(comptime T: type, dev: Device, off: u64, in: []const T) (errors.IoError || errors.ConvError)!void {
+// As in `readChars`, a `TDIMn` string array resets the pad state at every `tdim[0]`-byte
+// substring boundary so each string is padded independently (FR-BTB-7).
+fn writeChars(comptime T: type, dev: Device, off: u64, in: []const T, column: *const Column) (errors.IoError || errors.ConvError)!void {
+    const width = charWidth(column, in.len);
     var scratch: [SCRATCH_BYTES]u8 = undefined;
     var done: usize = 0;
     var hit_nul = false;
@@ -1039,6 +1063,7 @@ fn writeChars(comptime T: type, dev: Device, off: u64, in: []const T) (errors.Io
         const m = @min(scratch.len, in.len - done);
         for (0..m) |i| {
             if (T == u8) {
+                if ((done + i) % width == 0) hit_nul = false; // new substring: reset latch
                 const b = in[done + i];
                 if (hit_nul) {
                     scratch[i] = ' ';
@@ -1388,6 +1413,68 @@ test "TDIM parses and bounds against repeat" {
         const hdu = try buildBinTable(&f, alloc, &specs, 1, null);
         try testing.expectError(error.BadTdim, BinTable.of(&f, hdu));
     }
+}
+
+test "VLA TDIM bounds the heap array, not the descriptor repeat (1PJ TDIM=(10))" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+
+    // A P/Q column has repeat 1 (one descriptor), but TDIM describes the heap array shape; a
+    // product (10) far exceeding the descriptor repeat must be accepted, not over-rejected.
+    const specs = [_]ColSpec{.{ .tform = "1PJ", .ttype = "VLA", .tdim = "(10)" }};
+    const hdu = try buildBinTable(&f, alloc, &specs, 1, null);
+    var t = try BinTable.of(&f, hdu);
+    defer t.deinit(alloc);
+    try testing.expectEqualSlices(u64, &[_]u64{10}, t.columns[0].tdim.?);
+
+    // A non-VLA column with the same over-large TDIM is still rejected.
+    const bad = [_]ColSpec{.{ .tform = "1J", .ttype = "FIX", .tdim = "(10)" }};
+    const bhdu = try buildBinTable(&f, alloc, &bad, 1, null);
+    try testing.expectError(error.BadTdim, BinTable.of(&f, bhdu));
+}
+
+test "FR-BTB-7: TDIM string array resets NUL/pad per substring (60A / (5,4,3))" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+
+    const specs = [_]ColSpec{.{ .tform = "60A", .ttype = "GRID", .tdim = "(5,4,3)" }};
+    const hdu = try buildBinTable(&f, alloc, &specs, 1, null);
+    var t = try BinTable.of(&f, hdu);
+    defer t.deinit(alloc);
+    try testing.expectEqualSlices(u64, &[_]u64{ 5, 4, 3 }, t.columns[0].tdim.?);
+
+    // 12 fixed-width (5-byte) strings; each is NUL-terminated and NUL-padded within its slot. A
+    // NUL in an early slot must not blank the following slots (the single-latch bug).
+    const words = [_][]const u8{
+        "ab", "cdefg", "h", "ijkl", "mno", "p", "qrstu", "vw", "xyz", "AB", "CDE", "FG",
+    };
+    var in: [60]u8 = undefined;
+    @memset(&in, 0);
+    for (words, 0..) |w, s| @memcpy(in[s * 5 ..][0..w.len], w);
+    try t.writeColumn(u8, .{ .index = 0 }, 0, &in, .{});
+
+    var out: [60]u8 = undefined;
+    try t.readColumn(u8, .{ .index = 0 }, 0, &out, .{});
+
+    // Each 5-byte slot decodes independently: chars up to its first NUL, then spaces.
+    for (words, 0..) |w, s| {
+        var exp: [5]u8 = [_]u8{' '} ** 5;
+        @memcpy(exp[0..w.len], w);
+        try testing.expectEqualSlices(u8, &exp, out[s * 5 ..][0..5]);
+    }
+
+    // A single cell read uses the scalar policy but the same per-substring semantics.
+    var cell: [60]u8 = undefined;
+    try t.readCell(u8, .{ .index = 0 }, 0, &cell, .{});
+    try testing.expectEqualSlices(u8, &out, &cell);
 }
 
 test "NAXIS1 must equal the sum of field widths" {

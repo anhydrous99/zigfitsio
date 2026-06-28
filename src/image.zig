@@ -195,8 +195,10 @@ pub const ImageView = struct {
     }
 
     /// Write a rectangular section (symmetric with `readSection`).
-    pub fn writeSection(self: *ImageView, comptime T: type, lower: []const u64, upper: []const u64, stride: ?[]const u64, in: []T, opts: WriteOpts(T)) ImageError!void {
-        try self.section(T, lower, upper, stride, in, .write, self.scalingOf(opts.scaling), opts.null_sentinel);
+    pub fn writeSection(self: *ImageView, comptime T: type, lower: []const u64, upper: []const u64, stride: ?[]const u64, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        // `section` is shared with the read path (which fills its buffer), so it takes a mutable
+        // slice; the write path only reads from `in`, hence the `@constCast` is sound here.
+        try self.section(T, lower, upper, stride, @constCast(in), .write, self.scalingOf(opts.scaling), opts.null_sentinel);
     }
 
     // Column-major (first axis fastest) linear index of an N-D coordinate, bounds-checked.
@@ -285,9 +287,9 @@ pub const ImageView = struct {
 
         const stride0 = if (stride_opt) |st| st[0] else 1;
         const row_len = counts[0];
-        // A scratch row of stored elements for the innermost axis span (contiguous on disk).
+        // The innermost axis span (contiguous on disk); `transferRowTyped` streams it through the
+        // fixed scratch buffer in `CHUNK_ELEMS`-sized blocks, so the span is unbounded here.
         const span = upper[0] - lower[0] + 1; // contiguous element count covering the strided row
-        if (span > CHUNK_ELEMS) return error.BadDimensions; // a single row must fit the scratch
 
         var coord: [999]u64 = undefined;
         for (0..nd) |i| coord[i] = lower[i];
@@ -326,7 +328,7 @@ pub const ImageView = struct {
         return idx;
     }
 
-    // Transfer one innermost row: read `span` contiguous stored elements at `base`, then pick
+    // Transfer one innermost row: stream `span` contiguous stored elements at `base`, then pick
     // every `stride0`-th into `row` (or the inverse for writes).
     fn transferRow(self: *ImageView, comptime T: type, base: u64, span: u64, stride0: u64, row_len: u64, row: []T, comptime dir: Dir, sc: Scaling, sentinel: ?T) ImageError!void {
         return switch (self.hdu.bitpix) {
@@ -344,24 +346,40 @@ pub const ImageView = struct {
         const elem = @sizeOf(Stored);
         var scratch: [CHUNK_ELEMS]Stored = undefined;
         const sp: usize = @intCast(span);
-        const byte_off = self.hdu.data_off + base * elem;
-        if (dir == .read) {
-            try self.fits.dev.readAll(std.mem.sliceAsBytes(scratch[0..sp]), byte_off);
-            endian.swapToNative(Stored, scratch[0..sp]);
-            var j: usize = 0;
-            while (j < row_len) : (j += 1) {
-                row[j] = try transformRead(Stored, T, scratch[@intCast(j * stride0)], sc, sentinel);
+        const st: usize = @intCast(stride0);
+        const rl: usize = @intCast(row_len);
+        // Stream the contiguous span in scratch-sized blocks so spans wider than CHUNK_ELEMS are
+        // supported. Reads scatter the strided elements out of each block; writes read-modify-write
+        // each block so the strided gaps keep their on-disk values.
+        var s_off: usize = 0; // element offset of the current block within the span
+        while (s_off < sp) {
+            const block_len = @min(CHUNK_ELEMS, sp - s_off);
+            const byte_off = self.hdu.data_off + (base + s_off) * elem;
+            // First row index whose source element `j*st` lands at or after this block's start.
+            const j_start = (s_off + st - 1) / st;
+            if (dir == .read) {
+                try self.fits.dev.readAll(std.mem.sliceAsBytes(scratch[0..block_len]), byte_off);
+                endian.swapToNative(Stored, scratch[0..block_len]);
+                var j: usize = j_start;
+                while (j < rl) : (j += 1) {
+                    const src = j * st;
+                    if (src >= s_off + block_len) break;
+                    row[j] = try transformRead(Stored, T, scratch[src - s_off], sc, sentinel);
+                }
+            } else {
+                // Read-modify-write the block so strided gaps are preserved.
+                try self.fits.dev.readAll(std.mem.sliceAsBytes(scratch[0..block_len]), byte_off);
+                endian.swapToNative(Stored, scratch[0..block_len]);
+                var j: usize = j_start;
+                while (j < rl) : (j += 1) {
+                    const src = j * st;
+                    if (src >= s_off + block_len) break;
+                    scratch[src - s_off] = try transformWrite(Stored, T, row[j], sc, sentinel);
+                }
+                endian.swapToBig(Stored, scratch[0..block_len]);
+                try self.fits.dev.writeAll(std.mem.sliceAsBytes(scratch[0..block_len]), byte_off);
             }
-        } else {
-            // Read-modify-write the span so strided gaps are preserved.
-            try self.fits.dev.readAll(std.mem.sliceAsBytes(scratch[0..sp]), byte_off);
-            endian.swapToNative(Stored, scratch[0..sp]);
-            var j: usize = 0;
-            while (j < row_len) : (j += 1) {
-                scratch[@intCast(j * stride0)] = try transformWrite(Stored, T, row[j], sc, sentinel);
-            }
-            endian.swapToBig(Stored, scratch[0..sp]);
-            try self.fits.dev.writeAll(std.mem.sliceAsBytes(scratch[0..sp]), byte_off);
+            s_off += block_len;
         }
     }
 };
@@ -788,6 +806,80 @@ test "reshape to NAXIS=0 (scalar) drops all NAXISn and zeroes the data unit" {
     var rb: [5]u8 = undefined;
     try f.dev.readAll(&rb, ext.data_off);
     try testing.expectEqualSlices(u8, &payload, &rb);
+}
+
+test "section with a fastest axis wider than CHUNK_ELEMS round-trips (streamed rows)" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    const w = CHUNK_ELEMS + 904; // 5000 — comfortably past the old single-scratch limit
+    const h = 2;
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+    var img = try ImageView.append(&f, .{ .bitpix = 32, .axes = &.{ w, h } });
+
+    // Start from a recognizable full-array baseline.
+    const base = try testing.allocator.alloc(i32, w * h);
+    defer testing.allocator.free(base);
+    for (base, 0..) |*v, i| v.* = @intCast(@as(i64, @intCast(i)) - 100);
+    try img.writeAll(i32, base, .{});
+
+    // A) Contiguous full-width section (span = w > CHUNK_ELEMS) round-trips both directions.
+    const sect = try testing.allocator.alloc(i32, w * h);
+    defer testing.allocator.free(sect);
+    for (sect, 0..) |*v, i| v.* = @intCast(7_000_000 + i);
+    try img.writeSection(i32, &.{ 0, 0 }, &.{ w - 1, h - 1 }, null, sect, .{});
+    const back = try testing.allocator.alloc(i32, w * h);
+    defer testing.allocator.free(back);
+    try img.readSection(i32, &.{ 0, 0 }, &.{ w - 1, h - 1 }, null, back, .{});
+    try testing.expectEqualSlices(i32, sect, back);
+    // The whole array now equals `sect` (full overwrite).
+    try img.readAll(i32, back, .{});
+    try testing.expectEqualSlices(i32, sect, back);
+
+    // B) Strided section whose span (>CHUNK_ELEMS) crosses several scratch blocks.
+    const stp = 3;
+    const cnt = (w - 1) / stp + 1; // selected count along the fastest axis
+    const wr = try testing.allocator.alloc(i32, cnt);
+    defer testing.allocator.free(wr);
+    for (wr, 0..) |*v, i| v.* = @intCast(-(@as(i64, @intCast(i)) + 1));
+    try img.writeSection(i32, &.{ 0, 0 }, &.{ w - 1, 0 }, &.{ stp, 1 }, wr, .{});
+    const rd = try testing.allocator.alloc(i32, cnt);
+    defer testing.allocator.free(rd);
+    try img.readSection(i32, &.{ 0, 0 }, &.{ w - 1, 0 }, &.{ stp, 1 }, rd, .{});
+    try testing.expectEqualSlices(i32, wr, rd);
+    // Gather cross-check against the full row-0 image and confirm gaps were preserved.
+    try img.readAll(i32, back, .{});
+    var k: usize = 0;
+    var x: usize = 0;
+    while (x < w) : (x += stp) {
+        try testing.expectEqual(wr[k], back[x]);
+        k += 1;
+    }
+    try testing.expectEqual(sect[1], back[1]); // an untouched gap keeps its prior value
+}
+
+test "convert.cast failures surface through writeAll (DoD failure paths)" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+
+    // i32 value out of the BITPIX=16 stored range → Overflow.
+    {
+        var img = try ImageView.append(&f, .{ .bitpix = 16, .axes = &.{1} });
+        try testing.expectError(error.Overflow, img.writeAll(i32, &.{40000}, .{}));
+    }
+    // f32 NaN into an integer BITPIX with no null sentinel → NanToInt.
+    {
+        var img = try ImageView.append(&f, .{ .bitpix = 32, .axes = &.{1} });
+        try testing.expectError(error.NanToInt, img.writeAll(f32, &.{std.math.nan(f32)}, .{}));
+    }
+    // A scaled physical value that rounds outside the stored range → Overflow.
+    // BITPIX=16 (i16), BSCALE=2 ⇒ stored = 80000/2 = 40000, past i16's 32767.
+    {
+        var img = try ImageView.append(&f, .{ .bitpix = 16, .axes = &.{1} });
+        try testing.expectError(error.Overflow, img.writeAll(f64, &.{80000.0}, .{ .scaling = .{ .bscale = 2 } }));
+    }
 }
 
 test "multi-chunk transfer stays correct across the chunk boundary" {

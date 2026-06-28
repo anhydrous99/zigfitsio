@@ -5,9 +5,26 @@
 //! equal-area) — plus the plate carrée `CAR`, following Calabretta & Greisen (2002). The full
 //! pipeline is: pixel → intermediate world coords (CRPIX offset, `PCi_j`/`CDi_j` matrix,
 //! `CDELT`) → native spherical (the projection's deprojection) → celestial (spherical rotation
-//! by `CRVAL`/`LONPOLE`). An unimplemented projection is `error.UnsupportedProjection`. The
+//! about the native pole). An unimplemented projection is `error.UnsupportedProjection`. The
 //! registry is extensible; reference-point accuracy against WCSLIB/astropy is pinned by
 //! X-FIXTURES, while pixel→world→pixel round-trips are checked here.
+//!
+//! The native→celestial rotation is parameterised by the celestial coordinates of the native
+//! pole `(α_p, δ_p)` together with `LONPOLE` (`φ_p`). These are derived from each projection's
+//! fiducial native point `(φ0, θ0)` — `(0°, 90°)` for the zenithal family TAN/SIN/ARC/STG/ZEA,
+//! `(0°, 0°)` for the plate carrée CAR — and `CRVAL`/`LONPOLE`/`LATPOLE`, following Calabretta &
+//! Greisen (2002), Paper II eqs (8)–(10). For zenithal projections the fiducial point *is* the
+//! native pole, so `(α_p, δ_p) = CRVAL`; for CAR the pole is offset and is computed properly,
+//! so the reference pixel maps back to `CRVAL` (not to a pole).
+//!
+//! Conventions and limitations:
+//!   * Only the **parameter-free** forms of these projections are implemented. `PVi_m` (parsed
+//!     into `Wcs.pv` by `keys.zig`) is **not** consumed here — none of TAN/SIN/ARC/STG/ZEA/CAR
+//!     in their standard form take projection parameters, so `PVi_m` is silently ignored.
+//!   * The legacy `CROTAi` rotation is honoured **only** when no `PCi_j`/`CDi_j` matrix is
+//!     present: `CROTA` on the latitude axis (the classic `CROTA2`) is folded into the linear
+//!     transform `M` using the AIPS convention. When a `PC`/`CD` matrix is given, `CROTAi` is
+//!     ignored (FITS 4.0 forbids combining them).
 const std = @import("std");
 const WcsError = @import("../errors.zig").WcsError;
 const Wcs = @import("keys.zig").Wcs;
@@ -50,8 +67,13 @@ pub const Celestial = struct {
     lon_axis: usize = 0,
     lat_axis: usize = 1,
     crpix: [2]f64,
-    crval: [2]f64, // [lon0, lat0] degrees
-    lonpole: f64, // degrees
+    crval: [2]f64, // reference value [lon0, lat0] degrees (informational)
+    /// Native longitude of the celestial pole (`LONPOLE`, `φ_p`), radians.
+    phi_p: f64,
+    /// Celestial coordinates of the native pole `(α_p, δ_p)`, radians — the axis of the
+    /// native→celestial spherical rotation, derived from the projection's reference point.
+    alpha_p: f64,
+    delta_p: f64,
     /// The 2×2 linear transform (intermediate = M · (pixel − CRPIX)), absorbing CDELT.
     m: [2][2]f64,
     /// Inverse of `m`.
@@ -83,7 +105,18 @@ pub const Celestial = struct {
                 };
             },
             .none => {
-                m = .{ .{ w.cdelt[lon], 0 }, .{ 0, w.cdelt[lat] } };
+                // No PCi_j/CDi_j: honour the legacy CROTAi rotation (AIPS convention), taken
+                // from the latitude axis (the classic CROTA2). With ρ = CROTA[lat]:
+                //   M = [ CDELT_lon·cosρ,  −CDELT_lat·sinρ ;
+                //         CDELT_lon·sinρ,   CDELT_lat·cosρ ].
+                // ρ = 0 reduces to the plain diagonal CDELT scaling.
+                const rho = w.crota[lat] * DEG2RAD;
+                const cr = std.math.cos(rho);
+                const sr = std.math.sin(rho);
+                m = .{
+                    .{ w.cdelt[lon] * cr, -w.cdelt[lat] * sr },
+                    .{ w.cdelt[lon] * sr, w.cdelt[lat] * cr },
+                };
             },
         }
         const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
@@ -93,13 +126,20 @@ pub const Celestial = struct {
             .{ -m[1][0] / det, m[0][0] / det },
         };
 
+        const crval: [2]f64 = .{ w.crval[lon], w.crval[lat] };
+        // Resolve the spherical-rotation pole from the projection's fiducial point, applying
+        // the projection-correct LONPOLE/LATPOLE defaults (Paper II eqs 8–10).
+        const pole = computePole(proj, crval, w.lonpole, w.latpole);
+
         return .{
             .proj = proj,
             .lon_axis = lon,
             .lat_axis = lat,
             .crpix = .{ w.crpix[lon], w.crpix[lat] },
-            .crval = .{ w.crval[lon], w.crval[lat] },
-            .lonpole = w.lonpole orelse 180.0, // zenithal default
+            .crval = crval,
+            .phi_p = pole.phi_p,
+            .alpha_p = pole.alpha_p,
+            .delta_p = pole.delta_p,
             .m = m,
             .minv = minv,
         };
@@ -166,35 +206,116 @@ pub const Celestial = struct {
         return .{ .x = r * std.math.sin(phi), .y = -r * std.math.cos(phi) };
     }
 
-    // Native (phi,theta radians) → celestial (deg), rotation about the native pole = reference
-    // point for zenithal/CAR with the standard equations.
+    // Native (phi,theta radians) → celestial (deg). Spherical rotation about the native pole
+    // (α_p, δ_p) with native longitude of the celestial pole φ_p (Paper II eq 2).
     fn nativeToCelestial(self: *const Celestial, phi: f64, theta: f64) [2]f64 {
-        const ap = self.crval[0] * DEG2RAD;
-        const dp = self.crval[1] * DEG2RAD;
-        const phip = self.lonpole * DEG2RAD;
-        const dphi = phi - phip;
+        const dphi = phi - self.phi_p;
         const sin_t = std.math.sin(theta);
         const cos_t = std.math.cos(theta);
-        const dec = std.math.asin(clamp(sin_t * std.math.sin(dp) + cos_t * std.math.cos(dp) * std.math.cos(dphi), -1, 1));
-        const ra = ap + std.math.atan2(-cos_t * std.math.sin(dphi), sin_t * std.math.cos(dp) - cos_t * std.math.sin(dp) * std.math.cos(dphi));
+        const sin_dp = std.math.sin(self.delta_p);
+        const cos_dp = std.math.cos(self.delta_p);
+        const dec = std.math.asin(clamp(sin_t * sin_dp + cos_t * cos_dp * std.math.cos(dphi), -1, 1));
+        const ra = self.alpha_p + std.math.atan2(-cos_t * std.math.sin(dphi), sin_t * cos_dp - cos_t * sin_dp * std.math.cos(dphi));
         return .{ norm360(ra * RAD2DEG), dec * RAD2DEG };
     }
 
-    // Celestial (deg) → native (phi,theta radians), the inverse rotation.
+    // Celestial (deg) → native (phi,theta radians), the inverse rotation (Paper II eq 5).
     fn celestialToNative(self: *const Celestial, lon: f64, lat: f64) Native {
-        const ap = self.crval[0] * DEG2RAD;
-        const dp = self.crval[1] * DEG2RAD;
-        const phip = self.lonpole * DEG2RAD;
         const ra = lon * DEG2RAD;
         const dec = lat * DEG2RAD;
-        const dra = ra - ap;
+        const dra = ra - self.alpha_p;
         const sin_d = std.math.sin(dec);
         const cos_d = std.math.cos(dec);
-        const theta = std.math.asin(clamp(sin_d * std.math.sin(dp) + cos_d * std.math.cos(dp) * std.math.cos(dra), -1, 1));
-        const phi = phip + std.math.atan2(-cos_d * std.math.sin(dra), sin_d * std.math.cos(dp) - cos_d * std.math.sin(dp) * std.math.cos(dra));
+        const sin_dp = std.math.sin(self.delta_p);
+        const cos_dp = std.math.cos(self.delta_p);
+        const theta = std.math.asin(clamp(sin_d * sin_dp + cos_d * cos_dp * std.math.cos(dra), -1, 1));
+        const phi = self.phi_p + std.math.atan2(-cos_d * std.math.sin(dra), sin_d * cos_dp - cos_d * sin_dp * std.math.cos(dra));
         return .{ .phi = phi, .theta = theta };
     }
 };
+
+/// The native pole `(α_p, δ_p)` and `φ_p` (LONPOLE) that define the native→celestial rotation,
+/// all in radians.
+const Pole = struct { phi_p: f64, alpha_p: f64, delta_p: f64 };
+
+/// A projection's fiducial native point `(φ0, θ0)` in **degrees** (Calabretta & Greisen 2002,
+/// Paper II, Table 1): `(0, 90)` for the zenithal family, `(0, 0)` for the plate carrée.
+fn referencePoint(proj: Projection) struct { phi0: f64, theta0: f64 } {
+    return switch (proj) {
+        .car => .{ .phi0 = 0, .theta0 = 0 },
+        .tan, .sin, .arc, .stg, .zea => .{ .phi0 = 0, .theta0 = 90 },
+    };
+}
+
+/// Compute the native pole `(α_p, δ_p)` and `φ_p` from the projection's fiducial point
+/// `(φ0, θ0)` / `(α0, δ0)=CRVAL` and the optional `LONPOLE`/`LATPOLE`, per Paper II eqs (8)–(10).
+/// Projection-correct defaults are applied: `LONPOLE = 0°` if `δ0 ≥ θ0` else `180°`; `LATPOLE
+/// = +90°` (which disambiguates the pole toward the north when eq (8) has two roots). Pure trig,
+/// never fails — a fully degenerate configuration falls back to `LATPOLE`.
+fn computePole(proj: Projection, crval: [2]f64, lonpole: ?f64, latpole: ?f64) Pole {
+    const ref = referencePoint(proj);
+    const phi0 = ref.phi0 * DEG2RAD;
+    const theta0 = ref.theta0 * DEG2RAD;
+    const alpha0 = crval[0] * DEG2RAD;
+    const delta0 = crval[1] * DEG2RAD;
+
+    // Default LONPOLE: 0° if δ0 ≥ θ0, else 180° (Paper II §2.4).
+    const lonpole_deg = lonpole orelse (if (crval[1] >= ref.theta0) @as(f64, 0) else 180.0);
+    const phi_p = lonpole_deg * DEG2RAD;
+
+    // Zenithal family: the fiducial point IS the native pole — no solving needed (and this keeps
+    // the rotation identical to the classic CRVAL-as-pole formulation).
+    if (ref.theta0 == 90) {
+        return .{ .phi_p = phi_p, .alpha_p = alpha0, .delta_p = delta0 };
+    }
+
+    // Default LATPOLE: +90° (choose the northerly pole when eq (8) is two-valued).
+    const latpole_rad = (latpole orelse 90.0) * DEG2RAD;
+    const sin_t0 = std.math.sin(theta0);
+    const cos_t0 = std.math.cos(theta0);
+    const dphi = phi_p - phi0;
+
+    // Solve sin δ0 = sinθ0·sinδp + cosθ0·cosδp·cos(φp−φ0) for δp (Paper II eq 8):
+    //   = R·cos(δp − ψ),  R = hypot(sinθ0, cosθ0·cos(φp−φ0)),  ψ = arg(cosθ0·cos·, sinθ0).
+    var delta_p: f64 = latpole_rad;
+    const mu = sin_t0;
+    const lam = cos_t0 * std.math.cos(dphi);
+    const rr = std.math.hypot(mu, lam);
+    if (rr != 0) {
+        const psi = std.math.atan2(mu, lam);
+        const omega = std.math.acos(clamp(std.math.sin(delta0) / rr, -1, 1));
+        const c1 = wrapPi(psi + omega);
+        const c2 = wrapPi(psi - omega);
+        const half_pi = std.math.pi / 2.0;
+        const v1 = @abs(c1) <= half_pi + 1e-9; // valid declination root?
+        const v2 = @abs(c2) <= half_pi + 1e-9;
+        if (v1 and v2) {
+            const d1 = @abs(c1 - latpole_rad);
+            const d2 = @abs(c2 - latpole_rad);
+            delta_p = if (d1 < d2) c1 else if (d2 < d1) c2 else @max(c1, c2);
+        } else if (v1) {
+            delta_p = c1;
+        } else if (v2) {
+            delta_p = c2;
+        }
+    }
+
+    // Solve for α_p from the fiducial point (Paper II eq 10):
+    //   α0 − αp = arg(sinθ0·cosδp − cosθ0·sinδp·cos(φ0−φp), −cosθ0·sin(φ0−φp)).
+    const yy = -cos_t0 * std.math.sin(phi0 - phi_p);
+    const xx = sin_t0 * std.math.cos(delta_p) - cos_t0 * std.math.sin(delta_p) * std.math.cos(phi0 - phi_p);
+    const alpha_p = if (yy == 0 and xx == 0) alpha0 else alpha0 - std.math.atan2(yy, xx);
+
+    return .{ .phi_p = phi_p, .alpha_p = alpha_p, .delta_p = delta_p };
+}
+
+/// Wrap an angle (radians) into `(−π, π]`.
+fn wrapPi(a: f64) f64 {
+    const two_pi = 2.0 * std.math.pi;
+    var x = @mod(a + std.math.pi, two_pi);
+    if (x < 0) x += two_pi;
+    return x - std.math.pi;
+}
 
 fn isLon(ct: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(ct, "RA") or std.ascii.startsWithIgnoreCase(ct, "GLON") or std.ascii.startsWithIgnoreCase(ct, "ELON");
@@ -287,6 +408,10 @@ test "each zenithal projection round-trips pixel→world→pixel" {
         });
         defer cleanup(testing.allocator, p);
         var c = try Celestial.fromWcs(&p.w);
+        // Reference pixel → CRVAL (true for every projection after the native-pole fix).
+        const ref = try c.pixelToWorld(.{ 100.0, 100.0 });
+        try testing.expect(@abs(ref[0] - 80.0) < 1e-9);
+        try testing.expect(@abs(ref[1] - 45.0) < 1e-9);
         const pt: [2]f64 = .{ 120.0, 130.0 };
         const world = try c.pixelToWorld(pt);
         const back = try c.worldToPixel(world);
@@ -310,7 +435,72 @@ test "CAR plate carrée and axis order detection (DEC first)" {
     defer cleanup(testing.allocator, p);
     var c = try Celestial.fromWcs(&p.w);
     try testing.expectEqual(@as(usize, 1), c.lon_axis); // RA is axis 2 (index 1)
+    // Reference pixel → CRVAL=(0,0). Before the native-pole fix CAR mapped CRPIX to dec=−90;
+    // it must now land on the reference value like every other projection.
+    const ref = try c.pixelToWorld(.{ 1.0, 1.0 });
+    try testing.expect(@abs(ref[0] - 0.0) < 1e-9);
+    try testing.expect(@abs(ref[1] - 0.0) < 1e-9);
     const pt: [2]f64 = .{ 5.0, 7.0 };
+    const world = try c.pixelToWorld(pt);
+    const back = try c.worldToPixel(world);
+    try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
+    try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
+}
+
+test "CAR with off-equator CRVAL: reference pixel maps to CRVAL and round-trips" {
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    2",
+        "CTYPE1  = 'RA---CAR'",
+        "CTYPE2  = 'DEC--CAR'",
+        "CRPIX1  =                 50.0",
+        "CRPIX2  =                 50.0",
+        "CRVAL1  =                120.0",
+        "CRVAL2  =                 30.0",
+        "CDELT1  =                 -0.05",
+        "CDELT2  =                  0.05",
+    });
+    defer cleanup(testing.allocator, p);
+    var c = try Celestial.fromWcs(&p.w);
+    const ref = try c.pixelToWorld(.{ 50.0, 50.0 });
+    try testing.expect(@abs(ref[0] - 120.0) < 1e-9);
+    try testing.expect(@abs(ref[1] - 30.0) < 1e-9);
+    // A nearby pixel offset purely in the latitude direction stays near the meridian.
+    const w_up = try c.pixelToWorld(.{ 50.0, 60.0 });
+    try testing.expect(@abs(w_up[0] - 120.0) < 1e-7); // longitude unchanged on the central meridian
+    try testing.expect(@abs(w_up[1] - 30.5) < 1e-7); // +10 px · 0.05 deg
+    for ([_][2]f64{ .{ 10, 20 }, .{ 80, 95 }, .{ 50, 1 } }) |pt| {
+        const world = try c.pixelToWorld(pt);
+        const back = try c.worldToPixel(world);
+        try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
+        try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
+    }
+}
+
+test "legacy CROTA2 rotation is folded into M when no PC/CD" {
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    2",
+        "CTYPE1  = 'RA---TAN'",
+        "CTYPE2  = 'DEC--TAN'",
+        "CRPIX1  =                 50.0",
+        "CRPIX2  =                 50.0",
+        "CRVAL1  =                 30.0",
+        "CRVAL2  =                 10.0",
+        "CDELT1  =               -0.001",
+        "CDELT2  =                0.001",
+        "CROTA2  =                 90.0",
+    });
+    defer cleanup(testing.allocator, p);
+    var c = try Celestial.fromWcs(&p.w);
+    // ρ=90°: M = [[ -d1·0, -d2·1 ],[ -d1·1, d2·0 ]] = [[0,-0.001],[-0.001,0]].
+    try testing.expect(@abs(c.m[0][0] - 0.0) < 1e-12);
+    try testing.expect(@abs(c.m[0][1] - (-0.001)) < 1e-12);
+    try testing.expect(@abs(c.m[1][0] - (-0.001)) < 1e-12);
+    try testing.expect(@abs(c.m[1][1] - 0.0) < 1e-12);
+    // Reference pixel still maps to CRVAL, and the rotated frame round-trips.
+    const ref = try c.pixelToWorld(.{ 50.0, 50.0 });
+    try testing.expect(@abs(ref[0] - 30.0) < 1e-9);
+    try testing.expect(@abs(ref[1] - 10.0) < 1e-9);
+    const pt: [2]f64 = .{ 70.0, 40.0 };
     const world = try c.pixelToWorld(pt);
     const back = try c.worldToPixel(world);
     try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
