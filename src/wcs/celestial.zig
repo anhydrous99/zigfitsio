@@ -185,7 +185,9 @@ pub const Celestial = struct {
             // A pixel beyond the projection limb has no sky preimage. `clamp` would silently
             // fold it onto the limb (a finite, wrong, non-round-tripping coordinate); reject it.
             .sin => if (r > R0) return error.NonInvertible else std.math.acos(clamp(r / R0, -1, 1)),
-            .arc => (90.0 - r) * DEG2RAD,
+            // ARC's limb is the antipode at r = 180°; beyond it theta < -90° is non-physical and
+            // the rotation would silently alias it onto a wrong, non-round-tripping sky position.
+            .arc => if (r > 180.0) return error.NonInvertible else (90.0 - r) * DEG2RAD,
             .stg => std.math.pi / 2.0 - 2.0 * std.math.atan(r / (2.0 * R0)),
             .zea => if (r > 2.0 * R0) return error.NonInvertible else std.math.pi / 2.0 - 2.0 * std.math.asin(clamp(r / (2.0 * R0), -1, 1)),
             .car => unreachable,
@@ -426,7 +428,9 @@ test "each zenithal projection round-trips pixel→world→pixel" {
 }
 
 test "SIN/ZEA reject a pixel beyond the projection limb instead of folding it (regression)" {
-    inline for (.{ .{ "SIN", 1401.0 }, .{ "ZEA", 3001.0 } }) |cfg| {
+    // SIN limb 57.3°, ZEA limb 114.6°, ARC limb 180° — at 0.05°/px that is ~1146/2292/3600 px.
+    // (r = 180° exactly is the valid antipode, so push the ARC probe well past it.)
+    inline for (.{ .{ "SIN", 1401.0 }, .{ "ZEA", 3001.0 }, .{ "ARC", 3801.0 } }) |cfg| {
         const code = cfg[0];
         var p = try wcsFromCards(testing.allocator, &.{
             "WCSAXES =                    2",

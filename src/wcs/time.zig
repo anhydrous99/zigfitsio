@@ -211,6 +211,10 @@ pub const DateTime = struct {
             hour += 1;
         }
         _ = &day_fraction;
+        // The |jd| ≤ 1e15 entry guard keeps the i64 intermediates in range, but `year` (≈ jd/365.25,
+        // up to ~2.7e12 for an accepted jd) overflows the i32 `year` field — so the narrowing cast
+        // below would still panic. Range-check it and surface the typed error the contract promises.
+        if (year < std.math.minInt(i32) or year > std.math.maxInt(i32)) return error.BadValueSyntax;
         return .{
             .year = @intCast(year),
             .month = @intCast(month),
@@ -570,6 +574,10 @@ test "fromJulianDate rejects non-finite / out-of-range jd instead of panicking" 
     try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(-std.math.inf(f64)));
     try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(std.math.nan(f64)));
     try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(1.0e300));
+    // A finite jd within the entry guard (|jd| ≤ 1e15) whose reconstructed year overflows i32
+    // must also be a typed error, not an @intCast panic.
+    try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(1.0e14));
+    try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(1.0e12));
     _ = try DateTime.fromJulianDate(2451545.0); // a normal JD still works
 }
 

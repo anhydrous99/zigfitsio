@@ -168,6 +168,8 @@ pub const BinTable = struct {
                 return idx;
             },
             .name => |nm| {
+                // Full capacity (not max_matches): single-column resolution must see ≥2 matches to
+                // report AmbiguousColumn; max_matches is a user-facing cap for their own list queries.
                 var m: Matches = .{};
                 self.columnByName(nm, &m);
                 if (m.len == 0) return error.NoSuchColumn;

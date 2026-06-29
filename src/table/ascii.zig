@@ -296,6 +296,8 @@ pub const AsciiTable = struct {
                 return &self.columns[i];
             },
             .name => |nm| {
+                // Full capacity (not max_matches): single-column resolution must see ≥2 matches to
+                // report AmbiguousColumn; max_matches is a user-facing cap for their own list queries.
                 var m: Matches = .{};
                 self.columnByName(nm, &m);
                 if (m.len == 0) return error.NoSuchColumn;
@@ -328,6 +330,10 @@ pub const AsciiTable = struct {
         const identity = col.tscal == 1 and col.tzero == 0;
         switch (col.tform.type) {
             .int => {
+                // std.fmt.parseInt accepts interior '_' digit separators (e.g. "1_000"→1000),
+                // which FITS §7.2.5 forbids; screen the token so a malformed Iw field is a typed
+                // error rather than a silently-wrong value (matches header/value.zig).
+                if (!isFitsIntToken(tok)) return error.BadValueSyntax;
                 const iv = std.fmt.parseInt(i64, tok, 10) catch return error.BadValueSyntax;
                 if (identity) return try convert.cast(T, iv, mode);
                 const phys = col.tzero + col.tscal * @as(f64, @floatFromInt(iv));
@@ -503,7 +509,21 @@ fn parseAsciiFloat(tok: []const u8, decimals: u8) errors.HeaderError!f64 {
         frac_part,
         total_exp,
     }) catch return error.BadValueSyntax;
-    return std.fmt.parseFloat(f64, s) catch error.BadValueSyntax;
+    const v = std.fmt.parseFloat(f64, s) catch return error.BadValueSyntax;
+    // An out-of-f64-range field (e.g. "1E400") parses to ±inf; reject it rather than letting a
+    // non-finite value flow silently into scaling/WCS math (matches header/value.zig parseFloatTok).
+    if (!std.math.isFinite(v)) return error.BadValueSyntax;
+    return v;
+}
+
+// A FITS integer field: an optional leading sign followed by ≥1 decimal digit and nothing else
+// (rejects the underscore separators / base prefixes std.fmt.parseInt would otherwise accept).
+fn isFitsIntToken(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const digits = if (s[0] == '+' or s[0] == '-') s[1..] else s;
+    if (digits.len == 0) return false;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 /// Fill `field` for a null write: all blanks, with `TNULLn` placed if defined (right-justified
@@ -909,6 +929,20 @@ test "parseAsciiFloat: implied decimal, bare-sign exponent, lowercase d, rejects
     // the `exp - decimal_shift` subtraction and panicked. It must be a typed error instead.
     try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1e-9223372036854775807", 2));
     try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1.99e-9223372036854775807", 0));
+    // Regression: an out-of-f64-range field overflows to +inf and must be rejected, not returned.
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1E400", 0));
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1.0E400", 0));
+}
+
+test "ASCII integer cell rejects interior-underscore tokens (no silent wrong value)" {
+    // std.fmt.parseInt would read "1_000" as 1000; the Iw read path must reject it.
+    try testing.expect(!isFitsIntToken("1_000"));
+    try testing.expect(!isFitsIntToken("+1_2"));
+    try testing.expect(!isFitsIntToken("0x10"));
+    try testing.expect(!isFitsIntToken("+"));
+    try testing.expect(isFitsIntToken("1000"));
+    try testing.expect(isFitsIntToken("-42"));
+    try testing.expect(isFitsIntToken("+7"));
 }
 
 test "formatDecimalField rejects nan/inf instead of silently writing non-conforming bytes" {

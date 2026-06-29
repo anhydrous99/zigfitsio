@@ -1267,11 +1267,10 @@ test "absurd GCOUNT does not overflow-panic during scan (roundUpBlocks saturates
     writeCardInto(&blk, 5, "END");
     var mem = try MemoryDevice.initBytes(testing.allocator, &blk);
     defer mem.deinit();
-    // data_bytes ≈ 2^64; nextOff()→roundUpBlocks must saturate, not integer-overflow panic.
-    // open succeeds with the single HDU (its declared data unit just lies past EOF).
-    var f = try Fits.open(testing.allocator, mem.device(), .read_only, .{});
-    defer f.deinit();
-    try testing.expectEqual(@as(usize, 1), try f.hduCount());
+    // data_bytes ≈ 2^64: dataByteCount rejects it (it would overflow downstream i64 offset math),
+    // so open() fails with a typed error instead of panicking during the scan or admitting a
+    // handle that panics later on resize/delete.
+    try testing.expectError(error.LimitExceeded, Fits.open(testing.allocator, mem.device(), .read_only, .{}));
 }
 
 test "max_hdu_count is enforced during scanning" {

@@ -357,7 +357,11 @@ fn htrans(alloc: Allocator, a: []i64, nx: usize, ny: usize) Allocator.Error!void
 }
 
 // Inverse integer H-transform (CFITSIO `hinv`, no smoothing). Exact inverse of `htrans`.
-fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) Allocator.Error!void {
+// The recombination sums are evaluated in i128 (a 4-way sum of i64 values cannot overflow i128)
+// and narrowed back with a checked cast: for a valid tile every value fits i64 so the result is
+// identical, while a crafted tile with out-of-range sumall/coefficients yields error.CorruptTile
+// instead of an i64 integer-overflow panic.
+fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) HcompressError!void {
     const log2n = ceilLog2(@max(nx, ny));
     if (log2n == 0) return;
     const tmp = try alloc.alloc(i64, (@max(nx, ny) + 1) / 2);
@@ -379,7 +383,7 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) Allocator.Error!void {
         const mask2: i64 = mask0 << 2;
         const prnd2: i64 = bit2 >> 1;
         const nrnd2: i64 = prnd2 - 1;
-        a[0] = (a[0] + (if (a[0] >= 0) prnd2 else nrnd2)) & mask2;
+        a[0] = std.math.cast(i64, (@as(i128, a[0]) + (if (a[0] >= 0) @as(i128, prnd2) else @as(i128, nrnd2))) & @as(i128, mask2)) orelse return error.CorruptTile;
     }
 
     var nxtop: usize = 1;
@@ -416,36 +420,36 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) Allocator.Error!void {
             while (j + 1 < nytop) : (j += 2) {
                 const s00 = r0 + j;
                 const s10 = r1 + j;
-                var h0 = a[s00];
-                var hx = a[s10];
-                var hy = a[s00 + 1];
-                var hc = a[s10 + 1];
-                hx = (hx + (if (hx >= 0) prnd1 else nrnd1)) & mask1;
-                hy = (hy + (if (hy >= 0) prnd1 else nrnd1)) & mask1;
-                hc = (hc + (if (hc >= 0) prnd0 else nrnd0)) & mask0;
-                const lowbit0 = hc & bit0;
+                var h0: i128 = a[s00];
+                var hx: i128 = a[s10];
+                var hy: i128 = a[s00 + 1];
+                var hc: i128 = a[s10 + 1];
+                hx = (hx + (if (hx >= 0) @as(i128, prnd1) else @as(i128, nrnd1))) & @as(i128, mask1);
+                hy = (hy + (if (hy >= 0) @as(i128, prnd1) else @as(i128, nrnd1))) & @as(i128, mask1);
+                hc = (hc + (if (hc >= 0) @as(i128, prnd0) else @as(i128, nrnd0))) & @as(i128, mask0);
+                const lowbit0 = hc & @as(i128, bit0);
                 hx = if (hx >= 0) hx - lowbit0 else hx + lowbit0;
                 hy = if (hy >= 0) hy - lowbit0 else hy + lowbit0;
-                const lowbit1 = (hc ^ hx ^ hy) & bit1;
+                const lowbit1 = (hc ^ hx ^ hy) & @as(i128, bit1);
                 h0 = if (h0 >= 0)
                     h0 + lowbit0 - lowbit1
                 else
                     h0 + (if (lowbit0 == 0) lowbit1 else lowbit0 - lowbit1);
-                a[s10 + 1] = (h0 + hx + hy + hc) >> shift;
-                a[s10] = (h0 + hx - hy - hc) >> shift;
-                a[s00 + 1] = (h0 - hx + hy - hc) >> shift;
-                a[s00] = (h0 - hx - hy + hc) >> shift;
+                a[s10 + 1] = std.math.cast(i64, (h0 + hx + hy + hc) >> shift) orelse return error.CorruptTile;
+                a[s10] = std.math.cast(i64, (h0 + hx - hy - hc) >> shift) orelse return error.CorruptTile;
+                a[s00 + 1] = std.math.cast(i64, (h0 - hx + hy - hc) >> shift) orelse return error.CorruptTile;
+                a[s00] = std.math.cast(i64, (h0 - hx - hy + hc) >> shift) orelse return error.CorruptTile;
             }
             if (oddy) {
                 const s00 = r0 + (nytop - 1);
                 const s10 = r1 + (nytop - 1);
-                var h0 = a[s00];
-                var hx = a[s10];
-                hx = (hx + (if (hx >= 0) prnd1 else nrnd1)) & mask1;
-                const lowbit1 = hx & bit1;
+                var h0: i128 = a[s00];
+                var hx: i128 = a[s10];
+                hx = (hx + (if (hx >= 0) @as(i128, prnd1) else @as(i128, nrnd1))) & @as(i128, mask1);
+                const lowbit1 = hx & @as(i128, bit1);
                 h0 = if (h0 >= 0) h0 - lowbit1 else h0 + lowbit1;
-                a[s10] = (h0 + hx) >> shift;
-                a[s00] = (h0 - hx) >> shift;
+                a[s10] = std.math.cast(i64, (h0 + hx) >> shift) orelse return error.CorruptTile;
+                a[s00] = std.math.cast(i64, (h0 - hx) >> shift) orelse return error.CorruptTile;
             }
         }
         if (oddx) {
@@ -453,13 +457,13 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) Allocator.Error!void {
             var j: usize = 0;
             while (j + 1 < nytop) : (j += 2) {
                 const s00 = r0 + j;
-                var h0 = a[s00];
-                var hy = a[s00 + 1];
-                hy = (hy + (if (hy >= 0) prnd1 else nrnd1)) & mask1;
-                const lowbit1 = hy & bit1;
+                var h0: i128 = a[s00];
+                var hy: i128 = a[s00 + 1];
+                hy = (hy + (if (hy >= 0) @as(i128, prnd1) else @as(i128, nrnd1))) & @as(i128, mask1);
+                const lowbit1 = hy & @as(i128, bit1);
                 h0 = if (h0 >= 0) h0 - lowbit1 else h0 + lowbit1;
-                a[s00 + 1] = (h0 + hy) >> shift;
-                a[s00] = (h0 - hy) >> shift;
+                a[s00 + 1] = std.math.cast(i64, (h0 + hy) >> shift) orelse return error.CorruptTile;
+                a[s00] = std.math.cast(i64, (h0 - hy) >> shift) orelse return error.CorruptTile;
             }
             if (oddy) {
                 const s00 = r0 + (nytop - 1);
@@ -1263,6 +1267,19 @@ test "corrupt streams error typed" {
         0x00, // EOF nibble
     };
     try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_dc));
+
+    // Regression: with scale=0 (undigitize is a no-op) a crafted DC term at i64-max overflows the
+    // hinv recombination (the (a[0]+rounding)&mask narrowing). Must be CorruptTile, not a panic.
+    const hinv_overflow = [_]u8{
+        0xDD, 0x99, // magic
+        0x00, 0x00, 0x00, 0x02, // nx = 2
+        0x00, 0x00, 0x00, 0x02, // ny = 2
+        0x00, 0x00, 0x00, 0x00, // scale = 0 (undigitize no-op → DC reaches hinv unscaled)
+        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // sumall = i64 max
+        0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
+        0x00, // EOF nibble
+    };
+    try testing.expectError(error.CorruptTile, decompress(alloc, &hinv_overflow));
 }
 
 test "lossy (scale>1) round-trip stays within tolerance and is bounded" {

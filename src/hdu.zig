@@ -166,7 +166,14 @@ pub const Hdu = struct {
         const product = try limits.naxisProduct(self.axes[start..], lim.max_naxis_product);
         const inner = try limits.add(self.pcount, product);
         const groups = try limits.mul(self.gcount, inner);
-        return limits.mul(self.elemBytes(), groups);
+        const total = try limits.mul(self.elemBytes(), groups);
+        // Bound the data unit so both it and its block-rounded size stay within i64: every
+        // downstream offset/size computation (nextOff, resizeHduData, deleteHdu, …) casts block
+        // counts to i64, so an absurd GCOUNT/PCOUNT that drives data_bytes toward 2^64 would later
+        // overflow those casts. A real data unit is astronomically smaller — reject the rest with
+        // a typed error here (NFR-SAFE-1) rather than admitting a value that panics on use.
+        if (total > std.math.maxInt(i64) - block.BLOCK) return error.LimitExceeded;
+        return total;
     }
 };
 

@@ -207,6 +207,9 @@ pub const GroupTable = struct {
             try self.table.readColumn(u8, .{ .index = col_idx }, row, stack[0..w], .{});
             return std.mem.trimEnd(u8, stack[0..w], " ").len > 0;
         }
+        // Bound the attacker-controlled column width before allocating (NFR-SAFE-1): a crafted
+        // MEMBER_LOCATION TFORM like '4294967296A' must not force a multi-GiB allocation.
+        if (w > self.table.fits.limits.max_open_alloc) return error.LimitExceeded;
         const alloc = self.table.fits.alloc;
         const buf = try alloc.alloc(u8, w);
         defer alloc.free(buf);
@@ -325,6 +328,8 @@ pub const GroupTable = struct {
     fn readStrCell(self: *GroupTable, alloc: Allocator, col_idx: u16, row: u64) GroupError![]u8 {
         const col = &self.table.columns[col_idx];
         const w: usize = @intCast(col.tform.repeat);
+        // Bound the attacker-controlled column width before allocating (NFR-SAFE-1).
+        if (w > self.table.fits.limits.max_open_alloc) return error.LimitExceeded;
         const buf = try alloc.alloc(u8, w);
         defer alloc.free(buf);
         if (w > 0) try self.table.readColumn(u8, .{ .index = col_idx }, row, buf, .{});

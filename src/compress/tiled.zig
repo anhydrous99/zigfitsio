@@ -827,7 +827,7 @@ fn ceilDiv(len: u64, tile: u64) u64 {
 
 // First column index whose TTYPEn matches `name` (case-insensitive), or null.
 fn findCol(base: *const BinTable, name: []const u8) ?u16 {
-    var m: Matches = .{};
+    var m: Matches = .{}; // first match only; internal resolution uses full capacity
     base.columnByName(name, &m);
     if (m.len == 0) return null;
     return @intCast(m.at(0));

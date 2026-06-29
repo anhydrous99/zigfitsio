@@ -28,9 +28,11 @@ pub const Limits = struct {
     max_tile_bytes: u64 = 1 << 30,
     /// Ceiling on a single allocation request.
     max_open_alloc: u64 = 1 << 32,
-    /// Runtime ceiling for a wildcard `Matches` list; must be ≤ `name.MAX_MATCHES`. Applied by
-    /// constructing the accumulator with `Matches.withLimit(limits)` (it clamps to the comptime
-    /// inline capacity), so a lowered ceiling actually bounds the accumulated count.
+    /// Caller-facing ceiling for a wildcard `Matches` result list; must be ≤ `name.MAX_MATCHES`.
+    /// Apply it by building the accumulator with `Matches.withLimit(limits)` for your own
+    /// `Header.find` / `columnByName` queries (it clamps to the comptime inline capacity). The
+    /// library's internal single-column resolution intentionally uses the full capacity so it can
+    /// always detect an ambiguous (≥2-match) name, so this ceiling never narrows that path.
     max_matches: u32 = 4096,
 };
 
