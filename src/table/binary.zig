@@ -453,6 +453,9 @@ pub const BinTable = struct {
         try self.fits.resizeHduData(self.hdu, new_total);
         const data_off = self.hdu.data_off;
         if (pcount > 0) try moveRegion(self.fits.dev, data_off + old_rows, data_off + new_rows, pcount);
+        // Bound the attacker-derived row width (NAXIS1) before restride allocates row buffers (NFR-SAFE-1).
+        if (old_naxis1 > self.fits.limits.max_open_alloc or new_naxis1 > self.fits.limits.max_open_alloc)
+            return error.LimitExceeded;
         try restrideRows(alloc, self.fits.dev, data_off, nrows, old_naxis1, new_naxis1, segs);
     }
 
@@ -465,6 +468,9 @@ pub const BinTable = struct {
         const new_rows = try limits.mul(new_naxis1, nrows);
         const new_total = try limits.add(new_rows, pcount);
         const data_off = self.hdu.data_off;
+        // Bound the attacker-derived row width (NAXIS1) before restride allocates row buffers (NFR-SAFE-1).
+        if (old_naxis1 > self.fits.limits.max_open_alloc or new_naxis1 > self.fits.limits.max_open_alloc)
+            return error.LimitExceeded;
         try restrideRows(alloc, self.fits.dev, data_off, nrows, old_naxis1, new_naxis1, segs);
         if (pcount > 0) try moveRegion(self.fits.dev, data_off + old_rows, data_off + new_rows, pcount);
         try self.fits.resizeHduData(self.hdu, new_total);
@@ -744,11 +750,16 @@ fn zeroBytes(dev: Device, off: u64, len: u64) errors.IoError!void {
 // (`copy` ranges reference the old row; `zero` runs are new fill). Rows are processed
 // back-to-front when growing and front-to-back when shrinking so an in-place stride change never
 // overwrites a not-yet-moved row. One old/new row buffer is allocated for the whole pass.
-fn restrideRows(alloc: Allocator, dev: Device, data_off: u64, nrows: u64, old_stride: u64, new_stride: u64, segs: []const Seg) (errors.IoError || Allocator.Error)!void {
+fn restrideRows(alloc: Allocator, dev: Device, data_off: u64, nrows: u64, old_stride: u64, new_stride: u64, segs: []const Seg) (errors.IoError || errors.LimitError || Allocator.Error)!void {
     if (nrows == 0) return;
-    const oldbuf = try alloc.alloc(u8, @intCast(old_stride));
+    // Narrow the strides FALLIBLY: on a 32-bit-usize target the exact boundary value 1<<32 (the
+    // default max_open_alloc, which the caller's `> max_open_alloc` guard lets through) would panic
+    // a plain @intCast. std.math.cast rejects an out-of-usize-range width instead (NFR-SAFE-1).
+    const old_w = std.math.cast(usize, old_stride) orelse return error.LimitExceeded;
+    const new_w = std.math.cast(usize, new_stride) orelse return error.LimitExceeded;
+    const oldbuf = try alloc.alloc(u8, old_w);
     defer alloc.free(oldbuf);
-    const newbuf = try alloc.alloc(u8, @intCast(new_stride));
+    const newbuf = try alloc.alloc(u8, new_w);
     defer alloc.free(newbuf);
     const growing = new_stride > old_stride;
     var idx: u64 = 0;

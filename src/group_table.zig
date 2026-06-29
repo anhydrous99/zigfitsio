@@ -200,7 +200,9 @@ pub const GroupTable = struct {
     // width: a stack buffer for the common case, the handle allocator for wider columns.
     fn cellNonBlank(self: *GroupTable, col_idx: u16, row: u64) GroupError!bool {
         const col = &self.table.columns[col_idx];
-        const w: usize = @intCast(col.tform.repeat);
+        // Narrow the attacker-controlled u64 width FALLIBLY: on a 32-bit-usize target (wasm32) a
+        // repeat ≥ 2^32 would panic a plain @intCast before the ceiling guard below ever runs.
+        const w = std.math.cast(usize, col.tform.repeat) orelse return error.LimitExceeded;
         if (w == 0) return false;
         var stack: [256]u8 = undefined;
         if (w <= stack.len) {
@@ -327,7 +329,9 @@ pub const GroupTable = struct {
 
     fn readStrCell(self: *GroupTable, alloc: Allocator, col_idx: u16, row: u64) GroupError![]u8 {
         const col = &self.table.columns[col_idx];
-        const w: usize = @intCast(col.tform.repeat);
+        // Narrow the attacker-controlled u64 width FALLIBLY: on a 32-bit-usize target (wasm32) a
+        // repeat ≥ 2^32 would panic a plain @intCast before the ceiling guard below ever runs.
+        const w = std.math.cast(usize, col.tform.repeat) orelse return error.LimitExceeded;
         // Bound the attacker-controlled column width before allocating (NFR-SAFE-1).
         if (w > self.table.fits.limits.max_open_alloc) return error.LimitExceeded;
         const buf = try alloc.alloc(u8, w);
@@ -340,8 +344,12 @@ pub const GroupTable = struct {
     fn writeStrCell(self: *GroupTable, col_idx: u16, row: u64, s: []const u8) GroupError!void {
         const alloc = self.table.fits.alloc;
         const col = &self.table.columns[col_idx];
-        const w: usize = @intCast(col.tform.repeat);
+        // Narrow the attacker-controlled u64 width FALLIBLY: on a 32-bit-usize target (wasm32) a
+        // repeat ≥ 2^32 would panic a plain @intCast before the ceiling guard below ever runs.
+        const w = std.math.cast(usize, col.tform.repeat) orelse return error.LimitExceeded;
         if (w == 0) return;
+        // Bound the attacker-controlled column width before allocating (NFR-SAFE-1), matching readStrCell/cellNonBlank.
+        if (w > self.table.fits.limits.max_open_alloc) return error.LimitExceeded;
         const buf = try alloc.alloc(u8, w);
         defer alloc.free(buf);
         @memset(buf, ' ');

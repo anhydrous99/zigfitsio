@@ -30,7 +30,7 @@ pub const Assembled = struct {
 /// Reassemble the long string value beginning at card `i`. Returns `null` when card `i` is
 /// not a string value that actually continues (so the caller uses the single-card value as-is,
 /// keeping any literal trailing `&`). The returned `value` is allocator-owned.
-pub fn assemble(alloc: Allocator, cards: []const Card, i: usize) (HeaderError || Allocator.Error)!?Assembled {
+pub fn assemble(alloc: Allocator, cards: []const Card, i: usize, max_len: usize) (HeaderError || errors.LimitError || Allocator.Error)!?Assembled {
     if (i >= cards.len or cards[i].kind != .value) return null;
     const first = value.parseValue(alloc, cards[i].valueField()) catch return null;
     defer first.deinit(alloc);
@@ -45,6 +45,9 @@ pub fn assemble(alloc: Allocator, cards: []const Card, i: usize) (HeaderError ||
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
     try buf.appendSlice(alloc, s0[0 .. s0.len - 1]);
+    // NFR-SAFE-1: bound the assembled length against limits.Limits.max_string_value so a long
+    // run of CONTINUE cards cannot drive an unbounded allocation (DoS).
+    if (buf.items.len > max_len) return error.LimitExceeded;
 
     var consumed: usize = 1;
     var j = i + 1;
@@ -60,9 +63,11 @@ pub fn assemble(alloc: Allocator, cards: []const Card, i: usize) (HeaderError ||
             (j + 1 < cards.len and cards[j + 1].kind == .continuation);
         if (continues) {
             try buf.appendSlice(alloc, cs[0 .. cs.len - 1]);
+            if (buf.items.len > max_len) return error.LimitExceeded;
         } else {
             // Last card: keep its text verbatim (a trailing '&' here is literal).
             try buf.appendSlice(alloc, cs);
+            if (buf.items.len > max_len) return error.LimitExceeded;
             break;
         }
     }
@@ -159,7 +164,7 @@ test "assemble a 3-card continued string (FITS §4.2.1.2 style)" {
         card80("CONTINUE  'ollowed by cloudy skies overnight.&'"),
         card80("CONTINUE  ' Low 21C. Winds NNE at 5 to 10 mph.'"),
     };
-    const a = try assemble(testing.allocator, &cards, 0);
+    const a = try assemble(testing.allocator, &cards, 0, 1 << 20);
     try testing.expect(a != null);
     defer testing.allocator.free(a.?.value);
     try testing.expectEqual(@as(usize, 3), a.?.consumed);
@@ -174,7 +179,7 @@ test "value ending in '&' with no following CONTINUE keeps '&' literal" {
         card80("OBJECT  = 'M31 &'"),
         card80("BITPIX  =                    8"),
     };
-    const a = try assemble(testing.allocator, &cards, 0);
+    const a = try assemble(testing.allocator, &cards, 0, 1 << 20);
     try testing.expect(a == null); // not a continuation; caller keeps the literal value "M31 &"
 }
 
@@ -182,7 +187,7 @@ test "orphaned CONTINUE is not a value start" {
     const cards = [_]Card{
         card80("CONTINUE  'orphaned text'"),
     };
-    const a = try assemble(testing.allocator, &cards, 0);
+    const a = try assemble(testing.allocator, &cards, 0, 1 << 20);
     try testing.expect(a == null); // a CONTINUE card is commentary, not a value card
 }
 
@@ -195,7 +200,7 @@ test "split then assemble round-trips a long string" {
     try testing.expect(cards[0].kind == .value);
     try testing.expect(cards[1].kind == .continuation);
 
-    const a = try assemble(testing.allocator, cards, 0);
+    const a = try assemble(testing.allocator, cards, 0, 1 << 20);
     try testing.expect(a != null);
     defer testing.allocator.free(a.?.value);
     try testing.expectEqualStrings(long, a.?.value);
@@ -215,7 +220,7 @@ test "split preserves the comment when the final data chunk would fill the card 
     const long = "x" ** 135;
     const cards = try split(testing.allocator, "DESC", long, "units");
     defer testing.allocator.free(cards);
-    const a = try assemble(testing.allocator, cards, 0);
+    const a = try assemble(testing.allocator, cards, 0, 1 << 20);
     try testing.expect(a != null);
     defer testing.allocator.free(a.?.value);
     try testing.expectEqualStrings(long, a.?.value); // value still reassembles exactly
@@ -230,7 +235,7 @@ test "split with a comment that overflows a single card falls through to multi-c
     const cards = try split(testing.allocator, "DESC", s, "note");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2);
-    const a = try assemble(testing.allocator, cards, 0);
+    const a = try assemble(testing.allocator, cards, 0, 1 << 20);
     try testing.expect(a != null);
     defer testing.allocator.free(a.?.value);
     try testing.expectEqualStrings(s, a.?.value);

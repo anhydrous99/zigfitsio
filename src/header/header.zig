@@ -186,9 +186,12 @@ pub const Header = struct {
     /// literal trailing `&`) is returned as its single-card string. `error.KeywordNotFound` if
     /// absent, `error.WrongValueType` if not a string, `error.ValueUndefined` for a blank field.
     /// Honors `INHERIT` like `get`/`getString`.
-    pub fn getLongString(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || Allocator.Error)![]u8 {
+    pub fn getLongString(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || errors.LimitError || Allocator.Error)![]u8 {
         if (self.findFirst(name)) |idx| {
-            if (try continuation.assemble(alloc, self.cards.items, idx)) |joined| return joined.value;
+            // NFR-SAFE-1: Header carries no configurable Limits, so enforce the documented
+            // default ceiling (limits.Limits.max_string_value) to close the assemble DoS.
+            const max_str = (@import("../limits.zig").Limits{}).max_string_value;
+            if (try continuation.assemble(alloc, self.cards.items, idx, max_str)) |joined| return joined.value;
             // Not a continued run: take the single-card string value (keeps any literal `&`).
             return self.getString(alloc, name);
         }

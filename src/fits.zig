@@ -174,7 +174,9 @@ pub const Fits = struct {
         defer cdev.close(); // the compressed file is only the source; the handle keeps the inflated copy
         const csize64 = try cdev.getSize();
         if (csize64 > opts.limits.max_open_alloc) return error.LimitExceeded;
-        const csize: usize = @intCast(csize64);
+        // NFR-SAFE-1: on a 32-bit-usize target a size of exactly 2^32 passes the guard above but
+        // would overflow @intCast; cast fallibly so it is rejected rather than panicking.
+        const csize = std.math.cast(usize, csize64) orelse return error.LimitExceeded;
         const cbuf = try alloc.alloc(u8, csize);
         defer alloc.free(cbuf);
         try cdev.readAll(cbuf, 0);

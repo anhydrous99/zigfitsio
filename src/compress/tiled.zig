@@ -651,7 +651,7 @@ pub const TiledImage = struct {
                 const sx = std.mem.readInt(u32, cbytes[2..][0..4], .big);
                 const sy = std.mem.readInt(u32, cbytes[6..][0..4], .big);
                 if (sx != tdim[1] or sy != tdim[0]) return error.CorruptTile;
-                const dec = try hcompress.decompress(alloc, cbytes);
+                const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile));
                 defer alloc.free(dec.data);
                 if (dec.ny != tdim[0] or dec.nx != tdim[1]) return error.CorruptTile;
                 return i32ToBig(alloc, dec.data, w);
@@ -775,7 +775,10 @@ fn readVlaRawBytes(base: *BinTable, alloc: Allocator, col: u16, row: u64) heap.R
     const dev_size = try fits.dev.getSize();
     if (abs_end > dev_size) return error.BadDescriptor;
 
-    const buf = try alloc.alloc(u8, @intCast(bytes));
+    // Narrow FALLIBLY: max_heap_bytes (default 1<<34) exceeds a 32-bit usize, so a plain @intCast
+    // could panic on wasm32 for a large heap; reject an out-of-usize-range size instead (NFR-SAFE-1).
+    const buf_len = std.math.cast(usize, bytes) orelse return error.LimitExceeded;
+    const buf = try alloc.alloc(u8, buf_len);
     errdefer alloc.free(buf);
     try fits.dev.readAll(buf, abs);
     return buf;

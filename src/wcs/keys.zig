@@ -10,6 +10,9 @@
 const std = @import("std");
 const WcsError = @import("../errors.zig").WcsError;
 const Header = @import("../header/header.zig").Header;
+const Card = @import("../header/card.zig").Card;
+const value = @import("../header/value.zig");
+const convert = @import("../convert.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -50,8 +53,17 @@ pub const Wcs = struct {
         var self: Wcs = .{ .alt = alt };
         errdefer self.deinit(a);
 
+        // Build a keyword→card index over the header (and its INHERIT chain) ONCE so every WCS
+        // lookup below is O(1). Probing CDi_j/PCi_j (up to n², n ≤ 999) and PVi_m/PSi_m (n×100)
+        // names via Header.findFirst is an O(cards) linear scan each; a crafted WCSAXES=999 header
+        // padded with filler cards otherwise costs ~n²×cards ≈ 10¹¹ comparisons — a CPU-exhaustion
+        // DoS (NFR-SAFE-1). All WCS keywords are inheritable, so the merged index preserves INHERIT
+        // semantics (NAXIS, which is not inheritable, is read separately below via Header.getValue).
+        var name_map = try buildNameMap(a, h);
+        defer name_map.deinit(a);
+
         const naxes = blk: {
-            if (getValueAlt(h, u16, "WCSAXES", alt)) |n| break :blk n;
+            if (getValueAlt(&name_map, u16, "WCSAXES", alt)) |n| break :blk n;
             break :blk h.getValue(u16, "NAXIS") catch 0;
         };
         // A FITS axis count is ≤ 999 (NAXIS/WCSAXES). Reject an oversized declaration: besides
@@ -73,33 +85,33 @@ pub const Wcs = struct {
         var buf: [8]u8 = undefined;
         for (0..n) |i| {
             const idx = i + 1;
-            self.ctype[i] = try getStringAlt(a, h, "CTYPE", idx, alt) orelse try a.dupe(u8, "");
-            self.cunit[i] = try getStringAlt(a, h, "CUNIT", idx, alt) orelse try a.dupe(u8, "");
-            self.crpix[i] = getIndexedAlt(h, "CRPIX", idx, alt) orelse 0;
-            self.crval[i] = getIndexedAlt(h, "CRVAL", idx, alt) orelse 0;
-            self.cdelt[i] = getIndexedAlt(h, "CDELT", idx, alt) orelse 1;
-            self.crota[i] = getIndexedAlt(h, "CROTA", idx, alt) orelse 0;
+            self.ctype[i] = getStringAlt(a, &name_map, "CTYPE", idx, alt) orelse try a.dupe(u8, "");
+            self.cunit[i] = getStringAlt(a, &name_map, "CUNIT", idx, alt) orelse try a.dupe(u8, "");
+            self.crpix[i] = getIndexedAlt(&name_map, "CRPIX", idx, alt) orelse 0;
+            self.crval[i] = getIndexedAlt(&name_map, "CRVAL", idx, alt) orelse 0;
+            self.cdelt[i] = getIndexedAlt(&name_map, "CDELT", idx, alt) orelse 1;
+            self.crota[i] = getIndexedAlt(&name_map, "CROTA", idx, alt) orelse 0;
             _ = &buf;
         }
 
         // Detect CD vs PC (mutually exclusive).
-        const has_cd = anyMatrix(h, "CD", n, alt);
-        const has_pc = anyMatrix(h, "PC", n, alt);
+        const has_cd = anyMatrix(&name_map, "CD", n, alt);
+        const has_pc = anyMatrix(&name_map, "PC", n, alt);
         if (has_cd and has_pc) return error.BadWcs;
         if (has_cd) {
-            self.transform = .{ .cd = try readMatrix(a, h, "CD", n, alt, 0) }; // CD default 0
+            self.transform = .{ .cd = try readMatrix(a, &name_map, "CD", n, alt, 0) }; // CD default 0
         } else if (has_pc) {
-            self.transform = .{ .pc = try readMatrix(a, h, "PC", n, alt, null) }; // PC default identity
+            self.transform = .{ .pc = try readMatrix(a, &name_map, "PC", n, alt, null) }; // PC default identity
         } else {
             self.transform = .none;
         }
 
-        self.pv = try readPv(a, h, n, alt);
-        self.ps = try readPs(a, h, n, alt);
-        self.lonpole = getValueAlt(h, f64, "LONPOLE", alt);
-        self.latpole = getValueAlt(h, f64, "LATPOLE", alt);
-        self.equinox = getValueAlt(h, f64, "EQUINOX", alt);
-        if (try getStringAltName(a, h, "RADESYS", alt)) |r| self.radesys = r;
+        self.pv = try readPv(a, &name_map, n, alt);
+        self.ps = try readPs(a, &name_map, n, alt);
+        self.lonpole = getValueAlt(&name_map, f64, "LONPOLE", alt);
+        self.latpole = getValueAlt(&name_map, f64, "LATPOLE", alt);
+        self.equinox = getValueAlt(&name_map, f64, "EQUINOX", alt);
+        if (getStringAltName(a, &name_map, "RADESYS", alt)) |r| self.radesys = r;
         return self;
     }
 
@@ -184,43 +196,87 @@ fn matrixName(buf: *[8]u8, comptime base: []const u8, i: usize, j: usize, alt: u
 
 // ── readers ────────────────────────────────────────────────────────────────────────────
 
-fn getValueAlt(h: *const Header, comptime T: type, comptime base: []const u8, alt: u8) ?T {
-    var buf: [8]u8 = undefined;
-    return h.getValue(T, nameAlt(&buf, base, alt)) catch null;
+// A keyword-name → card index, used to make the WCS keyword reads O(1) instead of O(cards).
+const NameMap = std.StringHashMapUnmanaged(*const Card);
+
+// Index every named card of `h` and its INHERIT chain by its normalized keyword text, nearest
+// header winning (matching `Header.findFirst`-then-inherit). Built once per `fromHeader`; the
+// keys reference card-owned bytes that outlive the map (freed before `fromHeader` returns).
+fn buildNameMap(a: Allocator, h: *const Header) Allocator.Error!NameMap {
+    var map: NameMap = .empty;
+    errdefer map.deinit(a);
+    var hp: ?*const Header = h;
+    while (hp) |hdr| : (hp = hdr.inherit) {
+        for (hdr.cards.items) |*c| {
+            if (c.kind == .end) continue;
+            const gop = try map.getOrPut(a, c.name.text());
+            if (!gop.found_existing) gop.value_ptr.* = c; // first occurrence wins
+        }
+    }
+    return map;
 }
 
-fn getIndexedAlt(h: *const Header, comptime base: []const u8, idx: usize, alt: u8) ?f64 {
+// Read `name` as an int/float, mirroring `Header.getValue` coercion; `null` when absent or not a
+// numeric value (a string value needs allocation, so the empty fixed buffer maps it to `null`).
+fn mapValue(map: *const NameMap, comptime T: type, name: []const u8) ?T {
+    const card = map.get(name) orelse return null;
+    var fixed = std.heap.FixedBufferAllocator.init(&[_]u8{});
+    const v = value.parseValue(fixed.allocator(), card.valueField()) catch return null;
+    return switch (v) {
+        .int => |nn| convert.cast(T, nn, .scalar) catch null,
+        .float => |f| convert.cast(T, f, .scalar) catch null,
+        else => null,
+    };
+}
+
+// Read `name` as an owned string (caller frees), mirroring `Header.getString`; `null` when absent
+// or not a string value.
+fn mapString(a: Allocator, map: *const NameMap, name: []const u8) ?[]u8 {
+    const card = map.get(name) orelse return null;
+    const v = value.parseValue(a, card.valueField()) catch return null;
+    switch (v) {
+        .string => |s| return @constCast(s),
+        else => {
+            v.deinit(a);
+            return null;
+        },
+    }
+}
+
+fn getValueAlt(map: *const NameMap, comptime T: type, comptime base: []const u8, alt: u8) ?T {
+    var buf: [8]u8 = undefined;
+    return mapValue(map, T, nameAlt(&buf, base, alt));
+}
+
+fn getIndexedAlt(map: *const NameMap, comptime base: []const u8, idx: usize, alt: u8) ?f64 {
     var buf: [8]u8 = undefined;
     const name = indexedName(&buf, base, idx, alt) orelse return null;
-    return h.getValue(f64, name) catch null;
+    return mapValue(map, f64, name);
 }
 
-fn getStringAlt(a: Allocator, h: *const Header, comptime base: []const u8, idx: usize, alt: u8) std.mem.Allocator.Error!?[]u8 {
+fn getStringAlt(a: Allocator, map: *const NameMap, comptime base: []const u8, idx: usize, alt: u8) ?[]u8 {
     var buf: [8]u8 = undefined;
     const name = indexedName(&buf, base, idx, alt) orelse return null;
-    const s = h.getString(a, name) catch return null;
-    return s;
+    return mapString(a, map, name);
 }
 
-fn getStringAltName(a: Allocator, h: *const Header, comptime base: []const u8, alt: u8) std.mem.Allocator.Error!?[]u8 {
+fn getStringAltName(a: Allocator, map: *const NameMap, comptime base: []const u8, alt: u8) ?[]u8 {
     var buf: [8]u8 = undefined;
-    const name = nameAlt(&buf, base, alt);
-    const s = h.getString(a, name) catch return null;
-    return s;
+    return mapString(a, map, nameAlt(&buf, base, alt));
 }
 
-fn anyMatrix(h: *const Header, comptime base: []const u8, n: usize, alt: u8) bool {
+fn anyMatrix(map: *const NameMap, comptime base: []const u8, n: usize, alt: u8) bool {
     var buf: [8]u8 = undefined;
     for (1..n + 1) |i| {
         for (1..n + 1) |j| {
             const name = matrixName(&buf, base, i, j, alt) orelse continue;
-            if (h.has(name)) return true;
+            if (map.get(name) != null) return true;
         }
     }
     return false;
 }
 
-fn readMatrix(a: Allocator, h: *const Header, comptime base: []const u8, n: usize, alt: u8, default_off_diag: ?f64) std.mem.Allocator.Error![][]f64 {
+fn readMatrix(a: Allocator, map: *const NameMap, comptime base: []const u8, n: usize, alt: u8, default_off_diag: ?f64) std.mem.Allocator.Error![][]f64 {
     var buf: [8]u8 = undefined;
     const m = try a.alloc([]f64, n);
     var made: usize = 0;
@@ -239,20 +295,20 @@ fn readMatrix(a: Allocator, h: *const Header, comptime base: []const u8, n: usiz
                 m[i][j] = def;
                 continue;
             };
-            m[i][j] = if (h.getValue(f64, name) catch null) |v| v else def;
+            m[i][j] = mapValue(map, f64, name) orelse def;
         }
     }
     return m;
 }
 
-fn readPv(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.Error![]PvTerm {
+fn readPv(a: Allocator, map: *const NameMap, n: usize, alt: u8) std.mem.Allocator.Error![]PvTerm {
     var list: std.ArrayList(PvTerm) = .empty;
     errdefer list.deinit(a);
     var buf: [8]u8 = undefined;
     for (1..n + 1) |i| {
         for (0..100) |m| {
             const name = matrixName(&buf, "PV", i, m, alt) orelse continue;
-            if (h.getValue(f64, name) catch null) |v| {
+            if (mapValue(map, f64, name)) |v| {
                 try list.append(a, .{ .axis = @intCast(i), .m = @intCast(m), .value = v });
             }
         }
@@ -260,7 +316,7 @@ fn readPv(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.E
     return list.toOwnedSlice(a);
 }
 
-fn readPs(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.Error![]PsTerm {
+fn readPs(a: Allocator, map: *const NameMap, n: usize, alt: u8) std.mem.Allocator.Error![]PsTerm {
     var list: std.ArrayList(PsTerm) = .empty;
     errdefer {
         for (list.items) |t| a.free(t.value);
@@ -270,7 +326,8 @@ fn readPs(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.E
     for (1..n + 1) |i| {
         for (0..100) |m| {
             const name = matrixName(&buf, "PS", i, m, alt) orelse continue;
-            const s = h.getString(a, name) catch continue;
+            const s = mapString(a, map, name) orelse continue;
+            errdefer a.free(s); // free the just-parsed string if the append below fails (OOM)
             try list.append(a, .{ .axis = @intCast(i), .m = @intCast(m), .value = s });
         }
     }

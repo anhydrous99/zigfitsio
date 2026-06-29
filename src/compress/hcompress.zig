@@ -202,7 +202,7 @@ pub fn compress(alloc: Allocator, data: []const i32, nx: usize, ny: usize, scale
 /// Reads `nx`, `ny`, `scale`, `sumall` and the per-quadrant plane counts, inverts the quadtree
 /// coder, the quantization and the H-transform, and returns the recovered pixels. A bad magic,
 /// truncated body, or out-of-range value is `error.CorruptTile`. Caller owns `Decoded.data`.
-pub fn decompress(alloc: Allocator, src: []const u8) HcompressError!Decoded {
+pub fn decompress(alloc: Allocator, src: []const u8, nelem: usize) HcompressError!Decoded {
     if (src.len < 2 or src[0] != code_magic[0] or src[1] != code_magic[1]) return error.CorruptTile;
     var dec = Decoder{ .data = src, .nextchar = 2 };
 
@@ -223,6 +223,9 @@ pub fn decompress(alloc: Allocator, src: []const u8) HcompressError!Decoded {
     if (scale < 0) return error.CorruptTile;
     if (nb0 > 63 or nb1 > 63 or nb2 > 63) return error.CorruptTile;
     const n = std.math.mul(usize, nx, ny) catch return error.CorruptTile;
+    // The caller passes the Limits-validated tile pixel count; a stream whose declared geometry
+    // disagrees cannot be a valid tile and must not drive the mag/a/out allocations (NFR-SAFE-1).
+    if (n != nelem) return error.CorruptTile;
 
     const mag = try alloc.alloc(u64, n);
     defer alloc.free(mag);
@@ -1043,7 +1046,7 @@ const testing = std.testing;
 fn roundTrip(alloc: Allocator, data: []const i32, nx: usize, ny: usize, scale: i32) ![]i32 {
     const enc = try compress(alloc, data, nx, ny, scale);
     defer alloc.free(enc);
-    const dec = try decompress(alloc, enc);
+    const dec = try decompress(alloc, enc, nx * ny);
     try testing.expectEqual(nx, dec.nx);
     try testing.expectEqual(ny, dec.ny);
     return dec.data;
@@ -1215,7 +1218,7 @@ test "decompress reports geometry and standard magic from the stream header" {
     defer alloc.free(enc);
     try testing.expectEqual(@as(u8, 0xDD), enc[0]);
     try testing.expectEqual(@as(u8, 0x99), enc[1]);
-    const dec = try decompress(alloc, enc);
+    const dec = try decompress(alloc, enc, 17 * 13);
     defer alloc.free(dec.data);
     try testing.expectEqual(@as(usize, 17), dec.nx);
     try testing.expectEqual(@as(usize, 13), dec.ny);
@@ -1236,12 +1239,12 @@ test "non-2-D / bad-shape requests error typed" {
 test "corrupt streams error typed" {
     const alloc = testing.allocator;
     // Too short for the magic.
-    try testing.expectError(error.CorruptTile, decompress(alloc, "s"));
+    try testing.expectError(error.CorruptTile, decompress(alloc, "s", 1));
     // Long enough but wrong magic.
     var buf: [header_len]u8 = undefined;
     @memset(&buf, 0);
     @memcpy(buf[0..2], "ZZ");
-    try testing.expectError(error.CorruptTile, decompress(alloc, &buf));
+    try testing.expectError(error.CorruptTile, decompress(alloc, &buf, 1));
 
     // Valid header but truncated bit stream.
     var data: [8 * 8]i32 = undefined;
@@ -1253,7 +1256,7 @@ test "corrupt streams error typed" {
     const enc = try compress(alloc, &data, 8, 8, 0);
     defer alloc.free(enc);
     // Cut the body off, keeping only the header: the quadtree decode must run out of bits.
-    try testing.expectError(error.CorruptTile, decompress(alloc, enc[0..header_len]));
+    try testing.expectError(error.CorruptTile, decompress(alloc, enc[0..header_len], 8 * 8));
 
     // Regression: a crafted DC term (sumall) times `scale` overflowed i64 in undigitize and
     // panicked. nx=ny=2, scale=2, sumall=2^62, all-zero quadtrees, EOF nibble ⇒ 2^62*2 = 2^63.
@@ -1266,7 +1269,7 @@ test "corrupt streams error typed" {
         0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
         0x00, // EOF nibble
     };
-    try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_dc));
+    try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_dc, 2 * 2));
 
     // Regression: with scale=0 (undigitize is a no-op) a crafted DC term at i64-max overflows the
     // hinv recombination (the (a[0]+rounding)&mask narrowing). Must be CorruptTile, not a panic.
@@ -1279,7 +1282,7 @@ test "corrupt streams error typed" {
         0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
         0x00, // EOF nibble
     };
-    try testing.expectError(error.CorruptTile, decompress(alloc, &hinv_overflow));
+    try testing.expectError(error.CorruptTile, decompress(alloc, &hinv_overflow, 2 * 2));
 }
 
 test "lossy (scale>1) round-trip stays within tolerance and is bounded" {

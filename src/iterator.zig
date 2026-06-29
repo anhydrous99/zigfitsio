@@ -294,6 +294,11 @@ pub fn forEachImage(
     if (total == 0) return; // scalar / NAXIS=0 image: nothing to walk
     if (scratch.len == 0) return error.BadDimensions; // a non-empty image needs a chunk buffer
 
+    // forEachImage walks raw pixels by the host axes; a compressed view's dims() are the host table axes (which may
+    // be zero-length) while elementCount() is the ZNAXISn product, so the raw walk is invalid and previously hit
+    // `rem % 0` in unravel. Compressed images must be read via TiledImage. (NFR-SAFE-1)
+    if (view.isCompressed()) return error.BadDimensions;
+
     const axes = view.dims();
     const naxis = axes.len;
     var coord: [999]u64 = undefined;
@@ -313,7 +318,9 @@ pub fn forEachImage(
 }
 
 // Convert a column-major linear index into its N-D coordinate (axis 0 fastest). All axes are
-// positive here (a zero axis makes `elementCount` zero, handled by the caller's early return).
+// positive here: a zero host axis makes `elementCount` zero (handled by the caller's early return),
+// and compressed views (whose dims() are the host table axes and may be zero-length) are rejected by
+// the caller before this point.
 fn unravel(linear: u64, axes: []const u64, out: []u64) void {
     var rem = linear;
     for (axes, 0..) |ax, i| {
