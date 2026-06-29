@@ -54,6 +54,10 @@ pub const Wcs = struct {
             if (getValueAlt(h, u16, "WCSAXES", alt)) |n| break :blk n;
             break :blk h.getValue(u16, "NAXIS") catch 0;
         };
+        // A FITS axis count is ≤ 999 (NAXIS/WCSAXES). Reject an oversized declaration: besides
+        // making keyword names overflow the 8-char buffer, an unbounded `n` makes anyMatrix's
+        // n×n probe an O(n²) CPU DoS (up to 65535² lookups) on a single crafted card.
+        if (naxes > 999) return error.BadWcs;
         self.axes = naxes;
         const n: usize = naxes;
 
@@ -105,13 +109,15 @@ pub const Wcs = struct {
     pub fn writeTo(self: *const Wcs, a: Allocator, h: *Header) (WcsError || @import("../errors.zig").HeaderError || std.mem.Allocator.Error)!void {
         var buf: [8]u8 = undefined;
         try h.appendValue(a, nameAlt(&buf, "WCSAXES", self.alt), .{ .int = self.axes }, null);
+        // An index/axis whose keyword would exceed 8 chars (CTYPE1000, CDi_j with i/j ≥ 100)
+        // is unrepresentable in standard FITS keywords -> error.BadWcs rather than a panic.
         for (0..self.axes) |i| {
             const idx = i + 1;
-            if (self.ctype[i].len > 0) try h.appendValue(a, indexedName(&buf, "CTYPE", idx, self.alt), .{ .string = self.ctype[i] }, null);
-            try h.appendValue(a, indexedName(&buf, "CRPIX", idx, self.alt), .{ .float = self.crpix[i] }, null);
-            try h.appendValue(a, indexedName(&buf, "CRVAL", idx, self.alt), .{ .float = self.crval[i] }, null);
-            try h.appendValue(a, indexedName(&buf, "CDELT", idx, self.alt), .{ .float = self.cdelt[i] }, null);
-            if (self.cunit[i].len > 0) try h.appendValue(a, indexedName(&buf, "CUNIT", idx, self.alt), .{ .string = self.cunit[i] }, null);
+            if (self.ctype[i].len > 0) try h.appendValue(a, indexedName(&buf, "CTYPE", idx, self.alt) orelse return error.BadWcs, .{ .string = self.ctype[i] }, null);
+            try h.appendValue(a, indexedName(&buf, "CRPIX", idx, self.alt) orelse return error.BadWcs, .{ .float = self.crpix[i] }, null);
+            try h.appendValue(a, indexedName(&buf, "CRVAL", idx, self.alt) orelse return error.BadWcs, .{ .float = self.crval[i] }, null);
+            try h.appendValue(a, indexedName(&buf, "CDELT", idx, self.alt) orelse return error.BadWcs, .{ .float = self.cdelt[i] }, null);
+            if (self.cunit[i].len > 0) try h.appendValue(a, indexedName(&buf, "CUNIT", idx, self.alt) orelse return error.BadWcs, .{ .string = self.cunit[i] }, null);
         }
         switch (self.transform) {
             .none => {},
@@ -119,10 +125,10 @@ pub const Wcs = struct {
             .cd => |m| try writeMatrix(a, h, "CD", m, self.alt),
         }
         for (self.pv) |t| {
-            try h.appendValue(a, matrixName(&buf, "PV", t.axis, t.m, self.alt), .{ .float = t.value }, null);
+            try h.appendValue(a, matrixName(&buf, "PV", t.axis, t.m, self.alt) orelse return error.BadWcs, .{ .float = t.value }, null);
         }
         for (self.ps) |t| {
-            try h.appendValue(a, matrixName(&buf, "PS", t.axis, t.m, self.alt), .{ .string = t.value }, null);
+            try h.appendValue(a, matrixName(&buf, "PS", t.axis, t.m, self.alt) orelse return error.BadWcs, .{ .string = t.value }, null);
         }
         if (self.lonpole) |v| try h.appendValue(a, nameAlt(&buf, "LONPOLE", self.alt), .{ .float = v }, null);
         if (self.latpole) |v| try h.appendValue(a, nameAlt(&buf, "LATPOLE", self.alt), .{ .float = v }, null);
@@ -165,12 +171,15 @@ fn nameAlt(buf: *[8]u8, comptime base: []const u8, alt: u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{s}", .{ base, altSuffix(alt) }) catch unreachable;
 }
 
-fn indexedName(buf: *[8]u8, comptime base: []const u8, idx: usize, alt: u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}{d}{s}", .{ base, idx, altSuffix(alt) }) catch unreachable;
+// `null` when the formatted keyword would exceed the 8-char FITS limit (e.g. CTYPE1000,
+// CD100_100): such a keyword cannot exist in a valid header, so callers treat it as absent
+// rather than panicking via `catch unreachable`.
+fn indexedName(buf: *[8]u8, comptime base: []const u8, idx: usize, alt: u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}{d}{s}", .{ base, idx, altSuffix(alt) }) catch null;
 }
 
-fn matrixName(buf: *[8]u8, comptime base: []const u8, i: usize, j: usize, alt: u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}{d}_{d}{s}", .{ base, i, j, altSuffix(alt) }) catch unreachable;
+fn matrixName(buf: *[8]u8, comptime base: []const u8, i: usize, j: usize, alt: u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}{d}_{d}{s}", .{ base, i, j, altSuffix(alt) }) catch null;
 }
 
 // ── readers ────────────────────────────────────────────────────────────────────────────
@@ -182,12 +191,13 @@ fn getValueAlt(h: *const Header, comptime T: type, comptime base: []const u8, al
 
 fn getIndexedAlt(h: *const Header, comptime base: []const u8, idx: usize, alt: u8) ?f64 {
     var buf: [8]u8 = undefined;
-    return h.getValue(f64, indexedName(&buf, base, idx, alt)) catch null;
+    const name = indexedName(&buf, base, idx, alt) orelse return null;
+    return h.getValue(f64, name) catch null;
 }
 
 fn getStringAlt(a: Allocator, h: *const Header, comptime base: []const u8, idx: usize, alt: u8) std.mem.Allocator.Error!?[]u8 {
     var buf: [8]u8 = undefined;
-    const name = indexedName(&buf, base, idx, alt);
+    const name = indexedName(&buf, base, idx, alt) orelse return null;
     const s = h.getString(a, name) catch return null;
     return s;
 }
@@ -203,7 +213,8 @@ fn anyMatrix(h: *const Header, comptime base: []const u8, n: usize, alt: u8) boo
     var buf: [8]u8 = undefined;
     for (1..n + 1) |i| {
         for (1..n + 1) |j| {
-            if (h.has(matrixName(&buf, base, i, j, alt))) return true;
+            const name = matrixName(&buf, base, i, j, alt) orelse continue;
+            if (h.has(name)) return true;
         }
     }
     return false;
@@ -221,13 +232,14 @@ fn readMatrix(a: Allocator, h: *const Header, comptime base: []const u8, n: usiz
         m[i] = try a.alloc(f64, n);
         made += 1;
         for (0..n) |j| {
-            const name = matrixName(&buf, base, i + 1, j + 1, alt);
-            if (h.getValue(f64, name) catch null) |v| {
-                m[i][j] = v;
-            } else {
-                // Default: PC is identity (1 on diagonal, 0 off); CD is 0 everywhere.
-                m[i][j] = if (default_off_diag) |d| d else (if (i == j) @as(f64, 1) else 0);
-            }
+            // Default: PC is identity (1 on diagonal, 0 off); CD is 0 everywhere. A name that
+            // can't fit 8 chars (i/j ≥ 100) can't be present, so it keeps the default.
+            const def = if (default_off_diag) |d| d else (if (i == j) @as(f64, 1) else 0);
+            const name = matrixName(&buf, base, i + 1, j + 1, alt) orelse {
+                m[i][j] = def;
+                continue;
+            };
+            m[i][j] = if (h.getValue(f64, name) catch null) |v| v else def;
         }
     }
     return m;
@@ -239,7 +251,7 @@ fn readPv(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.E
     var buf: [8]u8 = undefined;
     for (1..n + 1) |i| {
         for (0..100) |m| {
-            const name = matrixName(&buf, "PV", i, m, alt);
+            const name = matrixName(&buf, "PV", i, m, alt) orelse continue;
             if (h.getValue(f64, name) catch null) |v| {
                 try list.append(a, .{ .axis = @intCast(i), .m = @intCast(m), .value = v });
             }
@@ -257,7 +269,7 @@ fn readPs(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.E
     var buf: [8]u8 = undefined;
     for (1..n + 1) |i| {
         for (0..100) |m| {
-            const name = matrixName(&buf, "PS", i, m, alt);
+            const name = matrixName(&buf, "PS", i, m, alt) orelse continue;
             const s = h.getString(a, name) catch continue;
             try list.append(a, .{ .axis = @intCast(i), .m = @intCast(m), .value = s });
         }
@@ -265,11 +277,14 @@ fn readPs(a: Allocator, h: *const Header, n: usize, alt: u8) std.mem.Allocator.E
     return list.toOwnedSlice(a);
 }
 
-fn writeMatrix(a: Allocator, h: *Header, comptime base: []const u8, m: [][]f64, alt: u8) (@import("../errors.zig").HeaderError || std.mem.Allocator.Error)!void {
+fn writeMatrix(a: Allocator, h: *Header, comptime base: []const u8, m: [][]f64, alt: u8) (WcsError || @import("../errors.zig").HeaderError || std.mem.Allocator.Error)!void {
     var buf: [8]u8 = undefined;
     for (m, 0..) |row, i| {
         for (row, 0..) |v, j| {
-            try h.appendValue(a, matrixName(&buf, base, i + 1, j + 1, alt), .{ .float = v }, null);
+            // i/j ≥ 100 would make `base{i}_{j}` exceed 8 chars — unrepresentable in standard
+            // FITS keywords, so the WCS cannot be serialized.
+            const name = matrixName(&buf, base, i + 1, j + 1, alt) orelse return error.BadWcs;
+            try h.appendValue(a, name, .{ .float = v }, null);
         }
     }
 }
@@ -348,6 +363,36 @@ test "CD and PC together is BadWcs" {
         testing.allocator.destroy(p.mem);
     }
     try testing.expectError(error.BadWcs, Wcs.fromHeader(testing.allocator, &p.h, ' '));
+}
+
+test "oversized WCSAXES is handled without overflowing the 8-char keyword buffer" {
+    // WCSAXES=100 is FITS-legal. CDi_j with i/j ≥ 100 (e.g. CD100_100, 9 chars) simply can't
+    // exist, so the matrix probe skips them — was a `catch unreachable` panic. fromHeader returns.
+    {
+        var p = try headerFrom(testing.allocator, &.{"WCSAXES =                  100"});
+        defer {
+            p.h.deinit(testing.allocator);
+            p.reader.deinit();
+            testing.allocator.destroy(p.reader);
+            p.mem.deinit();
+            testing.allocator.destroy(p.mem);
+        }
+        var w = try Wcs.fromHeader(testing.allocator, &p.h, ' ');
+        defer w.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 100), w.axes);
+    }
+    // WCSAXES > 999 is not FITS-legal; rejecting it also bounds the O(n²) matrix probe (DoS).
+    {
+        var p = try headerFrom(testing.allocator, &.{"WCSAXES =                 1000"});
+        defer {
+            p.h.deinit(testing.allocator);
+            p.reader.deinit();
+            testing.allocator.destroy(p.reader);
+            p.mem.deinit();
+            testing.allocator.destroy(p.mem);
+        }
+        try testing.expectError(error.BadWcs, Wcs.fromHeader(testing.allocator, &p.h, ' '));
+    }
 }
 
 test "PC defaults to identity, CD defaults to zero" {

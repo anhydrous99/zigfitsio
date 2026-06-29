@@ -98,11 +98,29 @@ pub const DateTime = struct {
         return std.fmt.parseInt(T, s, 10);
     }
 
+    fn isLeapYear(year: i32) bool {
+        return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+    }
+
+    fn daysInMonth(year: i32, month: u8) u8 {
+        return switch (month) {
+            1, 3, 5, 7, 8, 10, 12 => 31,
+            4, 6, 9, 11 => 30,
+            2 => if (isLeapYear(year)) 29 else 28,
+            else => 0,
+        };
+    }
+
     fn validate(self: *const DateTime) HeaderError!void {
         if (self.month < 1 or self.month > 12) return error.BadValueSyntax;
-        if (self.day < 1 or self.day > 31) return error.BadValueSyntax;
+        // Validate the day against the actual month length (leap-year aware): an impossible
+        // calendar date (Feb 31, Apr 31, …) would otherwise pass and be silently rolled over
+        // by the JD conversion, mutating the date the caller supplied.
+        if (self.day < 1 or self.day > daysInMonth(self.year, self.month)) return error.BadValueSyntax;
         if (self.hour > 23 or self.minute > 59 or self.second > 60) return error.BadValueSyntax; // 60 ⇒ leap second
-        if (self.frac < 0 or self.frac >= 1) return error.BadValueSyntax;
+        // Phrased to also reject NaN (all NaN comparisons are false, so `frac < 0 or frac >= 1`
+        // let a NaN frac — from an overlong fractional-seconds string — slip through).
+        if (!(self.frac >= 0 and self.frac < 1)) return error.BadValueSyntax;
     }
 
     /// Write the ISO-8601 representation. Fractional seconds are emitted (to millisecond
@@ -123,7 +141,10 @@ pub const DateTime = struct {
             });
         }
         if (self.frac > 0) {
-            const millis: u64 = @intFromFloat(@round(self.frac * 1000.0));
+            // frac ∈ [0,1), but frac ≥ 0.9995 rounds to 1000, which `{d:0>3}` prints as the
+            // malformed 4-digit ".1000". Clamp to 999 so at most 3 fractional digits are emitted.
+            var millis: u64 = @intFromFloat(@round(self.frac * 1000.0));
+            if (millis > 999) millis = 999;
             if (millis > 0) try w.print(".{d:0>3}", .{millis});
         }
     }
@@ -147,7 +168,13 @@ pub const DateTime = struct {
     }
 
     /// Reconstruct a calendar date/time from a Julian Date (Gregorian; Richards' algorithm).
-    pub fn fromJulianDate(jd: f64) DateTime {
+    /// A non-finite or wildly out-of-range `jd` is `error.BadValueSyntax` rather than a panic:
+    /// the bare `@intFromFloat(@floor(jd+0.5))` below is illegal behavior (and aborts in safe
+    /// builds) for Inf/NaN or any value whose floor exceeds i64.
+    pub fn fromJulianDate(jd: f64) HeaderError!DateTime {
+        // ±1e15 covers every astronomically meaningful JD (≈ ±2.7e12 years) while keeping
+        // `z = floor(jd+0.5)` and the downstream integer math comfortably within i64.
+        if (!std.math.isFinite(jd) or @abs(jd) > 1e15) return error.BadValueSyntax;
         // Split into integer day number (at noon boundary) and fraction of day from midnight.
         const jd_plus = jd + 0.5;
         const z: i64 = @intFromFloat(@floor(jd_plus));
@@ -505,7 +532,7 @@ test "fromJulianDate inverts toJulianDate" {
     };
     for (cases) |s| {
         const dt = try DateTime.parse(s);
-        const back = DateTime.fromJulianDate(dt.toJulianDate());
+        const back = try DateTime.fromJulianDate(dt.toJulianDate());
         try testing.expectEqual(dt.year, back.year);
         try testing.expectEqual(dt.month, back.month);
         try testing.expectEqual(dt.day, back.day);
@@ -522,6 +549,44 @@ test "malformed dates are rejected" {
     try testing.expectError(error.BadValueSyntax, DateTime.parse("2018-13-01")); // bad month
     try testing.expectError(error.BadValueSyntax, DateTime.parse("2018-08-13X09:30:15"));
     try testing.expectError(error.BadValueSyntax, DateTime.parse("2018-08-13T9:3:1"));
+}
+
+test "impossible calendar days are rejected (month length + leap year)" {
+    // Regression: day was only checked 1..31, so these passed and were silently rolled over.
+    try testing.expectError(error.BadValueSyntax, DateTime.parse("2019-02-31"));
+    try testing.expectError(error.BadValueSyntax, DateTime.parse("2019-02-29")); // 2019 not a leap year
+    try testing.expectError(error.BadValueSyntax, DateTime.parse("2018-04-31")); // April has 30
+    try testing.expectError(error.BadValueSyntax, DateTime.parse("2018-00-10")); // day 0 / month 0 guards
+    // Valid edge cases still parse.
+    _ = try DateTime.parse("2020-02-29"); // 2020 is a leap year
+    _ = try DateTime.parse("2018-04-30");
+    _ = try DateTime.parse("2000-02-29"); // div-by-400 leap year
+    try testing.expectError(error.BadValueSyntax, DateTime.parse("1900-02-29")); // div-by-100 non-leap
+}
+
+test "fromJulianDate rejects non-finite / out-of-range jd instead of panicking" {
+    // Regression: bare @intFromFloat(@floor(jd+0.5)) panicked on Inf / huge / NaN.
+    try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(std.math.inf(f64)));
+    try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(-std.math.inf(f64)));
+    try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(std.math.nan(f64)));
+    try testing.expectError(error.BadValueSyntax, DateTime.fromJulianDate(1.0e300));
+    _ = try DateTime.fromJulianDate(2451545.0); // a normal JD still works
+}
+
+test "format clamps sub-millisecond rounding to 3 digits (no .1000)" {
+    // Regression: frac ≥ 0.9995 rounded to 1000 and printed the malformed 4-digit ".1000".
+    var buf: [40]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const dt = DateTime{ .year = 2020, .month = 1, .day = 1, .hour = 12, .minute = 0, .second = 0, .frac = 0.9996 };
+    try dt.format(&w);
+    const out = w.buffered();
+    try testing.expect(std.mem.endsWith(u8, out, ".999"));
+    try testing.expect(!std.mem.containsAtLeast(u8, out, 1, ".1000"));
+}
+
+test "validate rejects a NaN fractional second" {
+    const dt = DateTime{ .year = 2020, .month = 1, .day = 1, .frac = std.math.nan(f64) };
+    try testing.expectError(error.BadValueSyntax, dt.validate());
 }
 
 test "mjd/jd conversions" {

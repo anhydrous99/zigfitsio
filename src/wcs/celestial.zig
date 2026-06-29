@@ -182,10 +182,12 @@ pub const Celestial = struct {
         const phi = if (r == 0) 0 else std.math.atan2(x, -y);
         const theta = switch (self.proj) {
             .tan => std.math.atan2(R0, r), // radians
-            .sin => std.math.acos(clamp(r / R0, -1, 1)),
+            // A pixel beyond the projection limb has no sky preimage. `clamp` would silently
+            // fold it onto the limb (a finite, wrong, non-round-tripping coordinate); reject it.
+            .sin => if (r > R0) return error.NonInvertible else std.math.acos(clamp(r / R0, -1, 1)),
             .arc => (90.0 - r) * DEG2RAD,
             .stg => std.math.pi / 2.0 - 2.0 * std.math.atan(r / (2.0 * R0)),
-            .zea => std.math.pi / 2.0 - 2.0 * std.math.asin(clamp(r / (2.0 * R0), -1, 1)),
+            .zea => if (r > 2.0 * R0) return error.NonInvertible else std.math.pi / 2.0 - 2.0 * std.math.asin(clamp(r / (2.0 * R0), -1, 1)),
             .car => unreachable,
         };
         return .{ .phi = phi, .theta = theta };
@@ -198,7 +200,9 @@ pub const Celestial = struct {
         }
         const r: f64 = switch (self.proj) {
             .tan => if (theta <= 0) return error.NonInvertible else R0 / std.math.tan(theta),
-            .sin => R0 * std.math.cos(theta),
+            // SIN only images the theta ≥ 0 hemisphere; a back-hemisphere point is unrepresentable
+            // (else r = R0·cos(theta) would alias it onto a front-hemisphere pixel).
+            .sin => if (theta < 0) return error.NonInvertible else R0 * std.math.cos(theta),
             .arc => 90.0 - theta * RAD2DEG,
             .stg => 2.0 * R0 * std.math.tan((std.math.pi / 2.0 - theta) / 2.0),
             .zea => 2.0 * R0 * std.math.sin((std.math.pi / 2.0 - theta) / 2.0),
@@ -418,6 +422,33 @@ test "each zenithal projection round-trips pixel→world→pixel" {
         const back = try c.worldToPixel(world);
         try testing.expect(@abs(back[0] - pt[0]) < 1e-5);
         try testing.expect(@abs(back[1] - pt[1]) < 1e-5);
+    }
+}
+
+test "SIN/ZEA reject a pixel beyond the projection limb instead of folding it (regression)" {
+    inline for (.{ .{ "SIN", 1401.0 }, .{ "ZEA", 3001.0 } }) |cfg| {
+        const code = cfg[0];
+        var p = try wcsFromCards(testing.allocator, &.{
+            "WCSAXES =                    2",
+            "CTYPE1  = 'RA---" ++ code ++ "'",
+            "CTYPE2  = 'DEC--" ++ code ++ "'",
+            "CRPIX1  =                  1.0",
+            "CRPIX2  =                  1.0",
+            "CRVAL1  =                150.0",
+            "CRVAL2  =                  2.5",
+            "CDELT1  =                 0.05",
+            "CDELT2  =                 0.05",
+        });
+        defer cleanup(testing.allocator, p);
+        var c = try Celestial.fromWcs(&p.w);
+        // SIN: r≈70°>57.3° limb; ZEA: r≈150°>114.6° limb. Both were silently folded onto the
+        // boundary (a finite, non-round-tripping coordinate); now they are NonInvertible.
+        try testing.expectError(error.NonInvertible, c.pixelToWorld(.{ cfg[1], 1.0 }));
+        // An in-bounds pixel still round-trips.
+        const world = try c.pixelToWorld(.{ 5.0, 5.0 });
+        const back = try c.worldToPixel(world);
+        try testing.expect(@abs(back[0] - 5.0) < 1e-4);
+        try testing.expect(@abs(back[1] - 5.0) < 1e-4);
     }
 }
 

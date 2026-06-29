@@ -98,7 +98,9 @@ pub const Spectral = struct {
         var i: usize = 1;
         var buf: [8]u8 = undefined;
         while (i <= naxis) : (i += 1) {
-            const name = std.fmt.bufPrint(&buf, "CTYPE{d}", .{i}) catch unreachable;
+            // "CTYPE{i}" exceeds 8 chars at i ≥ 1000 (and no FITS axis index is that large),
+            // so stop rather than panicking via `catch unreachable`.
+            const name = std.fmt.bufPrint(&buf, "CTYPE{d}", .{i}) catch break;
             const ct = h.getString(a, name) catch continue;
             if (SpectralType.isSpectral(ct)) {
                 var self: Spectral = .{
@@ -246,6 +248,14 @@ test "no spectral axis is BadWcs" {
         "CTYPE1  = 'RA---TAN'",
         "CTYPE2  = 'DEC--TAN'",
     });
+    defer cleanup(testing.allocator, p);
+    try testing.expectError(error.BadWcs, Spectral.fromHeader(testing.allocator, &p.h));
+}
+
+test "oversized WCSAXES does not overflow the CTYPE keyword buffer (regression)" {
+    // WCSAXES=1000 made "CTYPE1000" (9 chars) overflow the [8]u8 buffer via `catch unreachable`.
+    // The scan must stop cleanly and report no spectral axis instead of panicking.
+    var p = try headerFrom(testing.allocator, &.{"WCSAXES =                 1000"});
     defer cleanup(testing.allocator, p);
     try testing.expectError(error.BadWcs, Spectral.fromHeader(testing.allocator, &p.h));
 }
