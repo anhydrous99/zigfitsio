@@ -255,7 +255,7 @@ pub fn decompress(alloc: Allocator, src: []const u8) HcompressError!Decoded {
 
     // Restore the DC term, undo quantization, invert the transform.
     a[0] = sumall;
-    undigitize(a, scale);
+    try undigitize(a, scale);
     try hinv(alloc, a, nx, ny);
 
     const out = try alloc.alloc(i32, n);
@@ -552,11 +552,13 @@ fn digitize(a: []i64, scale: i32) void {
     }
 }
 
-// Multiply coefficients by `scale` (CFITSIO `undigitize`). `scale <= 1` is a no-op.
-fn undigitize(a: []i64, scale: i32) void {
+// Multiply coefficients by `scale` (CFITSIO `undigitize`). `scale <= 1` is a no-op. The factors
+// come from the attacker-controlled stream (`scale`, and `a[0] = sumall`), so the multiply is
+// checked: an out-of-range product is a corrupt tile, never an integer-overflow panic.
+fn undigitize(a: []i64, scale: i32) HcompressError!void {
     if (scale <= 1) return;
     const s: i64 = scale;
-    for (a) |*p| p.* = p.* * s;
+    for (a) |*p| p.* = std.math.mul(i64, p.*, s) catch return error.CorruptTile;
 }
 
 // ── quadtree nibble coding (pure helpers) ──────────────────────────────────────────────────────
@@ -1248,6 +1250,19 @@ test "corrupt streams error typed" {
     defer alloc.free(enc);
     // Cut the body off, keeping only the header: the quadtree decode must run out of bits.
     try testing.expectError(error.CorruptTile, decompress(alloc, enc[0..header_len]));
+
+    // Regression: a crafted DC term (sumall) times `scale` overflowed i64 in undigitize and
+    // panicked. nx=ny=2, scale=2, sumall=2^62, all-zero quadtrees, EOF nibble ⇒ 2^62*2 = 2^63.
+    const overflow_dc = [_]u8{
+        0xDD, 0x99, // magic
+        0x00, 0x00, 0x00, 0x02, // nx = 2
+        0x00, 0x00, 0x00, 0x02, // ny = 2
+        0x00, 0x00, 0x00, 0x02, // scale = 2
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sumall = 2^62
+        0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
+        0x00, // EOF nibble
+    };
+    try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_dc));
 }
 
 test "lossy (scale>1) round-trip stays within tolerance and is bounded" {

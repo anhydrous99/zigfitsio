@@ -641,6 +641,16 @@ pub const TiledImage = struct {
             },
             .hcompress_1 => {
                 if (self.znaxis < 2) return error.BadTiling;
+                // Validate the stream's declared nx/ny against the KNOWN tile geometry BEFORE the
+                // codec allocates from them (it sizes its mag/a arrays by nx*ny). Without this the
+                // other codecs are bounded by npix_tile/cap but HCOMPRESS would allocate ~nx*ny*16
+                // bytes from an attacker-controlled ~18-byte cell (NFR-SAFE-1 unbounded-alloc DoS).
+                // hcompress stores nx then ny big-endian after the 2-byte magic; it returns
+                // nx==tdim[1] (rows), ny==tdim[0] (fastest/cols).
+                if (cbytes.len < 10 or cbytes[0] != 0xDD or cbytes[1] != 0x99) return error.CorruptTile;
+                const sx = std.mem.readInt(u32, cbytes[2..][0..4], .big);
+                const sy = std.mem.readInt(u32, cbytes[6..][0..4], .big);
+                if (sx != tdim[1] or sy != tdim[0]) return error.CorruptTile;
                 const dec = try hcompress.decompress(alloc, cbytes);
                 defer alloc.free(dec.data);
                 if (dec.ny != tdim[0] or dec.nx != tdim[1]) return error.CorruptTile;
@@ -2104,6 +2114,35 @@ test "HCOMPRESS_1 tile produced by the codec decodes via TiledImage" {
     var out: [12]i32 = undefined;
     try ti.readAll(i32, &out);
     try testing.expectEqualSlices(i32, &vals, &out);
+}
+
+test "HCOMPRESS_1 tile with forged oversized nx/ny is CorruptTile, not an unbounded allocation" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+    const vals = [_]i32{ 1, 2, 3, 4, 10, 11, 12, 13, -7, -6, -5, -4 };
+    const enc = try hcompress.compress(alloc, &vals, 3, 4, 0);
+    defer alloc.free(enc);
+    // Forge the stream's declared geometry to 65535×65535 (~34 GB if the codec allocated from
+    // it). The tile-geometry pre-check must reject this against the known 4×3 tile dims BEFORE
+    // hcompress.decompress sizes any buffer from the header (regression: unbounded-alloc DoS).
+    std.mem.writeInt(u32, enc[2..][0..4], 65535, .big); // nx
+    std.mem.writeInt(u32, enc[6..][0..4], 65535, .big); // ny
+    const spec = ZSpec{
+        .ztype = "HCOMPRESS_1",
+        .zbitpix = 32,
+        .znaxisn = &.{ 4, 3 },
+        .ztilen = &.{ 4, 3 },
+        .nrows = 1,
+        .pcount = 2048,
+        .tforms = &.{"1PB"},
+        .ttypes = &.{"COMPRESSED_DATA"},
+    };
+    const hdu = try writeRawTileCell(alloc, &fx, spec, enc);
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [12]i32 = undefined;
+    try testing.expectError(error.CorruptTile, ti.readAll(i32, &out));
 }
 
 // ── CMP-8 compressed write ───────────────────────────────────────────────────────────────────

@@ -491,7 +491,9 @@ fn parseAsciiFloat(tok: []const u8, decimals: u8) errors.HeaderError!f64 {
 
     // With no explicit `.`, the rightmost `decimals` integer digits are fractional (rule 2).
     const decimal_shift: i64 = if (has_dot) @intCast(frac_part.len) else @intCast(decimals);
-    const total_exp = exp - decimal_shift;
+    // `exp` can be driven to ±i64-max by a crafted exponent, so this subtraction must be
+    // checked (was an integer-underflow panic for e.g. `1e-9223372036854775807`).
+    const total_exp = std.math.sub(i64, exp, decimal_shift) catch return error.BadValueSyntax;
 
     // Reassemble the significant digits and a single power-of-ten exponent for `parseFloat`.
     var nbuf: [MAX_NUM_FIELD + 32]u8 = undefined;
@@ -531,6 +533,10 @@ fn formatIntField(iv: i64, field: []u8) errors.ConvError!void {
 /// Format `v` as fixed-point with `decimals` fractional digits, right-justified in `field`
 /// (the `Fw.d` descriptor); `error.Overflow` if the rendered text exceeds the field width.
 fn formatDecimalField(v: f64, decimals: u8, field: []u8) errors.ConvError!void {
+    // A non-finite value has no conforming Fw.d form; rendering it would emit the literal
+    // "nan"/"inf" (≤ 3 chars, fits any field) and silently write a non-round-trippable field.
+    // Reject it, matching the Ew.d/Dw.d path and the "never silent corruption" contract.
+    if (!std.math.isFinite(v)) return error.Overflow;
     var tmp: [RENDER_BUF]u8 = undefined;
     const s = std.fmt.float.render(&tmp, v, .{ .mode = .decimal, .precision = decimals }) catch return error.Overflow;
     if (s.len > field.len) return error.Overflow;
@@ -899,6 +905,22 @@ test "parseAsciiFloat: implied decimal, bare-sign exponent, lowercase d, rejects
     try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1 2", 0));
     try testing.expectError(error.BadValueSyntax, parseAsciiFloat("abc", 0));
     try testing.expectError(error.BadValueSyntax, parseAsciiFloat("3.14e", 0));
+    // Regression: a crafted exponent at i64-min, combined with a decimal shift, underflowed
+    // the `exp - decimal_shift` subtraction and panicked. It must be a typed error instead.
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1e-9223372036854775807", 2));
+    try testing.expectError(error.BadValueSyntax, parseAsciiFloat("1.99e-9223372036854775807", 0));
+}
+
+test "formatDecimalField rejects nan/inf instead of silently writing non-conforming bytes" {
+    var field: [10]u8 = undefined;
+    // Regression: NaN/Inf rendered as literal "nan"/"inf" (≤ 3 chars) and was silently written
+    // into a numeric Fw.d field, producing a value that fails to read back.
+    try testing.expectError(error.Overflow, formatDecimalField(std.math.nan(f64), 2, &field));
+    try testing.expectError(error.Overflow, formatDecimalField(std.math.inf(f64), 2, &field));
+    try testing.expectError(error.Overflow, formatDecimalField(-std.math.inf(f64), 2, &field));
+    // A finite value still formats normally.
+    try formatDecimalField(3.14, 2, &field);
+    try testing.expectEqualStrings("      3.14", &field);
 }
 
 test "readCell surfaces BadValueSyntax for non-numeric field bytes" {

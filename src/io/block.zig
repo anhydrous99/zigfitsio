@@ -29,8 +29,13 @@ fn fillByte(f: Fill) u8 {
     };
 }
 
-/// Round `n` up to the next multiple of `BLOCK`.
+/// Round `n` up to the next multiple of `BLOCK`, saturating at the largest block multiple
+/// that fits `u64` instead of overflowing. A data unit declared within `BLOCK-1` of the
+/// `u64` ceiling is only reachable from a malformed `GCOUNT`/`PCOUNT`/`NAXISn` (`dataByteCount`),
+/// so it yields a huge-but-finite offset that a later read rejects cleanly (EndOfStream /
+/// "data extends past EOF") rather than panicking during the eager HDU scan (NFR-SAFE-1/2).
 pub fn roundUpBlocks(n: u64) u64 {
+    if (n > std.math.maxInt(u64) - (BLOCK - 1)) return (std.math.maxInt(u64) / BLOCK) * BLOCK;
     return ((n + BLOCK - 1) / BLOCK) * BLOCK;
 }
 
@@ -218,6 +223,19 @@ test "multi-block header scan issues one windowed read" {
         try testing.expect(std.mem.startsWith(u8, card, "CARD"));
     }
     try testing.expectEqual(@as(usize, 1), counter.reads); // all 108 cards, one device read
+}
+
+test "roundUpBlocks saturates instead of overflowing on a near-u64-max length" {
+    try testing.expectEqual(@as(u64, 0), roundUpBlocks(0));
+    try testing.expectEqual(BLOCK, roundUpBlocks(1));
+    try testing.expectEqual(BLOCK, roundUpBlocks(BLOCK));
+    try testing.expectEqual(@as(u64, 2) * BLOCK, roundUpBlocks(BLOCK + 1));
+    // Lengths within BLOCK-1 of the ceiling must saturate, not integer-overflow panic
+    // (regression: a crafted GCOUNT made data_bytes ≈ 2^64, crashing the HDU scan).
+    const sat = (std.math.maxInt(u64) / BLOCK) * BLOCK;
+    try testing.expectEqual(sat, roundUpBlocks(std.math.maxInt(u64)));
+    try testing.expectEqual(sat, roundUpBlocks(std.math.maxInt(u64) - 1));
+    try testing.expectEqual(sat, roundUpBlocks(std.math.maxInt(u64) - (BLOCK - 1) + 1));
 }
 
 test "block writer pads with the correct fill and flushes block-aligned" {

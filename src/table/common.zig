@@ -143,7 +143,10 @@ pub const BinTform = struct {
     /// `repeat × elemBytes`.
     pub fn fieldBytes(self: BinTform) TableError!u64 {
         return switch (self.type) {
-            .bit => (self.repeat + 7) / 8,
+            // `repeat` is parsed straight from TFORMn and can reach u64 max, so `repeat + 7`
+            // must not overflow (was an integer-overflow panic on a crafted bit count). Divide
+            // first, then add the partial-byte, which cannot overflow.
+            .bit => (self.repeat / 8) + @intFromBool(self.repeat % 8 != 0),
             .vla32 => 8,
             .vla64 => 16,
             else => std.math.mul(u64, self.repeat, self.type.elemBytes()) catch return error.BadTform,
@@ -480,6 +483,11 @@ test "bit field byte rounding" {
     try testing.expectEqual(@as(u64, 2), try (try BinTform.parse("9X")).fieldBytes());
     try testing.expectEqual(@as(u64, 1), try (try BinTform.parse("8X")).fieldBytes());
     try testing.expectEqual(@as(u64, 1), try (try BinTform.parse("1X")).fieldBytes());
+    // Regression: a near-u64-max bit count must not overflow `repeat + 7` (was a panic on a
+    // crafted TFORMn when opening a BINTABLE). Now it computes the byte width without overflow.
+    // ceil((2^64-1)/8) = 2^61 ; ceil((2^64-8)/8) = 2^61-1 (exactly divisible).
+    try testing.expectEqual(@as(u64, 1) << 61, try (try BinTform.parse("18446744073709551615X")).fieldBytes());
+    try testing.expectEqual((@as(u64, 1) << 61) - 1, try (try BinTform.parse("18446744073709551608X")).fieldBytes());
 }
 
 test "binary VLA descriptors P/Q with element type and emax" {

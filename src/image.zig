@@ -182,7 +182,9 @@ pub const ImageView = struct {
             const kw = std.fmt.bufPrint(&buf, "ZNAXIS{d}", .{i + 1}) catch unreachable;
             const v = self.hdu.header.getValue(i64, kw) catch return 0;
             if (v < 0) return 0;
-            n *= @intCast(v);
+            // ZNAXISn are not bounded at scan time (unlike NAXISn), so use checked multiply;
+            // an overflowing product was an unchecked-`*=` panic. 0 lets TiledImage.of report.
+            n = limits.mul(n, @intCast(v)) catch return 0;
         }
         return n;
     }
@@ -476,9 +478,16 @@ fn transformWrite(comptime Stored: type, comptime T: type, v: T, sc: Scaling, se
     return applyScaleWrite(Stored, T, v, sc);
 }
 
+// Magnitude bound for the integer fast-path BZERO. Every legitimate unsigned-convention BZERO
+// (2^7, 2^15, 2^31, 2^63) is far below this; staying under 2^100 keeps both `@intFromFloat`
+// (to i128) and the subsequent i128 add/sub well inside range, so an out-of-range header BZERO
+// (e.g. 1e40) falls through to the float path — which returns error.Overflow — instead of
+// panicking on an out-of-bounds `@intFromFloat`.
+const FAST_BZERO_LIMIT: f64 = 0x1p100;
+
 fn applyScaleRead(comptime Stored: type, comptime T: type, s: Stored, sc: Scaling) errors.ConvError!T {
     if (sc.mode == .raw) return convert.cast(T, s, .bulk);
-    if (sc.bscale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(sc.bzero)) {
+    if (sc.bscale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(sc.bzero) and @abs(sc.bzero) < FAST_BZERO_LIMIT) {
         const bz: i128 = @intFromFloat(sc.bzero);
         return convert.cast(T, @as(i128, s) + bz, .bulk); // unsigned convention in integer space
     }
@@ -492,7 +501,7 @@ fn applyScaleRead(comptime Stored: type, comptime T: type, s: Stored, sc: Scalin
 
 fn applyScaleWrite(comptime Stored: type, comptime T: type, v: T, sc: Scaling) errors.ConvError!Stored {
     if (sc.mode == .raw) return convert.cast(Stored, v, .bulk);
-    if (sc.bscale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(sc.bzero)) {
+    if (sc.bscale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(sc.bzero) and @abs(sc.bzero) < FAST_BZERO_LIMIT) {
         const bz: i128 = @intFromFloat(sc.bzero);
         return convert.cast(Stored, @as(i128, v) - bz, .bulk);
     }
@@ -962,6 +971,34 @@ test "ImageView.of transparently reads a tile-compressed image (design §17.1)" 
     // A plain (uncompressed) image view still reports not-compressed.
     var pimg = try ImageView.of(&f, try f.select(1));
     try testing.expect(!pimg.isCompressed());
+}
+
+test "integer scaling fast path: huge integral BZERO is a typed error, not an @intFromFloat panic" {
+    // Regression: |BZERO| > ~1.7e38 is integral-valued but out of i128 range, so the integer
+    // fast path's bare `@intFromFloat(bzero)` panicked. Large-but-legitimate conventions
+    // (2^63) still take the fast path; absurd values fall through to the float path → Overflow.
+    const huge: Scaling = .{ .bscale = 1, .bzero = 1.0e40 };
+    try testing.expectError(error.Overflow, applyScaleRead(i16, i32, @as(i16, 5), huge));
+    try testing.expectError(error.Overflow, applyScaleWrite(i16, i32, @as(i32, 5), huge));
+    const huge_neg: Scaling = .{ .bscale = 1, .bzero = -1.0e40 };
+    try testing.expectError(error.Overflow, applyScaleRead(i16, i32, @as(i16, 5), huge_neg));
+    // The standard 64-bit unsigned convention (BZERO=2^63) still resolves exactly via the fast path.
+    const u64conv: Scaling = .{ .bscale = 1, .bzero = 9223372036854775808.0 };
+    try testing.expectEqual(@as(i128, 9223372036854775808), try applyScaleRead(i64, i128, @as(i64, 0), u64conv));
+}
+
+test "compressedElementCount returns 0 (not a panic) on an overflowing ZNAXISn product" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+    // A BINTABLE carrying compressed-image keywords with a product of ZNAXISn that overflows u64.
+    var img = try ImageView.append(&f, .{ .bitpix = 8, .axes = &.{ 1, 1 } });
+    try img.hdu.header.appendValue(testing.allocator, "ZIMAGE", .{ .logical = true }, null);
+    try img.hdu.header.appendValue(testing.allocator, "ZNAXIS", .{ .int = 2 }, null);
+    try img.hdu.header.appendValue(testing.allocator, "ZNAXIS1", .{ .int = 1099511627776 }, null); // 2^40
+    try img.hdu.header.appendValue(testing.allocator, "ZNAXIS2", .{ .int = 1099511627776 }, null); // 2^40 ⇒ 2^80 overflows
+    try testing.expectEqual(@as(u64, 0), img.compressedElementCount());
 }
 
 test "multi-chunk transfer stays correct across the chunk boundary" {
