@@ -252,17 +252,37 @@ fn parseComplex(tok: []const u8) HeaderError!KeywordValue {
 // otherwise (a too-large or float-shaped token falls through to floating parse).
 fn parseNumeric(tok: []const u8) HeaderError!KeywordValue {
     if (!hasFloatChar(tok)) {
-        if (std.fmt.parseInt(i64, tok, 10)) |n| {
-            return .{ .int = n };
-        } else |_| {}
+        // FITS integers (§4.2.3) are an optional sign + decimal digits only. std.fmt.parseInt is
+        // more permissive (underscore separators, 0x/0o/0b prefixes), so screen the token first.
+        if (isFitsIntToken(tok)) {
+            if (std.fmt.parseInt(i64, tok, 10)) |n| {
+                return .{ .int = n };
+            } else |_| {} // too large for i64 → fall through to floating parse
+        }
     }
     return .{ .float = try parseFloatTok(tok) };
+}
+
+// True iff `s` is a FITS integer literal: an optional leading sign followed by ≥1 decimal digit.
+fn isFitsIntToken(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const digits = if (s[0] == '+' or s[0] == '-') s[1..] else s;
+    if (digits.len == 0) return false;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 // Parse a real token, mapping the FORTRAN `D`/`d` exponent to `E`/`e` first.
 fn parseFloatTok(s: []const u8) HeaderError!f64 {
     var buf: [80]u8 = undefined;
     if (s.len == 0 or s.len > buf.len) return error.BadValueSyntax;
+    // FITS reals (§4.2.4) use only digits, a sign, a decimal point, and an E/e/D/d exponent.
+    // std.fmt.parseFloat also accepts nan/inf, hex floats, and underscores — none of which are
+    // valid FITS values — so reject any other byte before parsing.
+    for (s) |c| switch (c) {
+        '0'...'9', '+', '-', '.', 'E', 'e', 'D', 'd' => {},
+        else => return error.BadValueSyntax,
+    };
     for (s, 0..) |c, i| {
         buf[i] = switch (c) {
             'D' => 'E',
@@ -270,7 +290,10 @@ fn parseFloatTok(s: []const u8) HeaderError!f64 {
             else => c,
         };
     }
-    return std.fmt.parseFloat(f64, buf[0..s.len]) catch error.BadValueSyntax;
+    const v = std.fmt.parseFloat(f64, buf[0..s.len]) catch return error.BadValueSyntax;
+    // A finite FITS real cannot overflow to ±inf (e.g. "1E999") or be NaN.
+    if (!std.math.isFinite(v)) return error.BadValueSyntax;
+    return v;
 }
 
 // True if `s` contains a real-number indicator: a decimal point or an exponent letter.
@@ -406,6 +429,19 @@ test "malformed tokens and complex yield BadValueSyntax" {
     try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "(3 4)")); // no comma
     try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "(3, )")); // empty part
     try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "(1, 2")); // no close paren
+}
+
+test "non-FITS numeric tokens (nan/inf/hex/underscore/overflow) are rejected" {
+    // Regression: std.fmt.parseInt/parseFloat accepted these and returned NaN/Inf/bogus values
+    // that propagated silently into scaling/WCS math. FITS §4.2.3/§4.2.4 forbid all of them.
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "nan"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "inf"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "-inf"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "infinity"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "1_000"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "0x10"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "1e3_0"));
+    try testing.expectError(error.BadValueSyntax, parseValue(testing.allocator, "1E999")); // overflow → inf
 }
 
 test "parseComment edge cases" {

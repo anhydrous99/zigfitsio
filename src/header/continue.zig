@@ -76,45 +76,72 @@ pub fn split(alloc: Allocator, name: []const u8, str: []const u8, comment: ?[]co
     var list: std.ArrayList(Card) = .empty;
     errdefer list.deinit(alloc);
 
-    // Fits in a single card?
-    if (str.len <= LAST_CHUNK) {
+    const FIELD: usize = 70; // value-field width (cols 10..80)
+    const ccost: usize = if (comment) |c| 3 + c.len else 0; // " / " + comment, on the final card
+
+    // Single card if the quoted string PLUS any comment fits the value field. Accounting for the
+    // comment here is what was missing: a 61–68 char string with a comment was wrongly forced
+    // down the single-card path and then rejected by Card.buildValue with CardOverflow.
+    if (2 + str.len + ccost <= FIELD) {
         try list.append(alloc, try Card.buildValue(name, .{ .string = str }, comment));
         return list.toOwnedSlice(alloc);
     }
+    // A comment too long to fit even alone on a final card (`'' / comment`) is unrepresentable.
+    if (comment != null and 2 + ccost > FIELD) return error.CardOverflow;
+
+    // A terminal card that ALSO carries the comment has no continuation `&`, so its data capacity
+    // is reduced by the comment cost. The room is reserved up front so the comment is never
+    // silently dropped (the old code wrote it with `catch {}` after a full value field).
+    const term_cap: usize = FIELD - 2 - ccost;
 
     var pos: usize = 0;
     var first = true;
+    var comment_done = comment == null;
     while (pos < str.len) {
         const remaining = str.len - pos;
-        const is_last = remaining <= LAST_CHUNK;
-        const take = if (is_last) remaining else CHUNK;
+        const terminal = remaining <= term_cap; // all remaining data + the comment fit one card
+        const take = if (terminal) remaining else @min(CHUNK, remaining);
         const chunk = str[pos .. pos + take];
         pos += take;
-
-        var raw: [80]u8 = [_]u8{' '} ** 80;
-        if (first) {
-            const nm = @import("name.zig").Name.parse(name) catch return error.BadKeywordName;
-            @memcpy(raw[0..8], &nm.bytes);
-            raw[8] = '=';
-            raw[9] = ' ';
-            first = false;
-        } else {
-            @memcpy(raw[0..8], "CONTINUE");
+        // A `&` marks that more cards follow — either more data or the dedicated comment card.
+        try list.append(alloc, try buildChunkCard(name, &first, chunk, !terminal, if (terminal) comment else null));
+        if (terminal) {
+            comment_done = true;
+            break;
         }
-        var w = std.Io.Writer.fixed(raw[10..]);
-        w.writeByte('\'') catch return error.CardOverflow;
-        w.writeAll(chunk) catch return error.CardOverflow;
-        if (!is_last) w.writeByte('&') catch return error.CardOverflow;
-        w.writeByte('\'') catch return error.CardOverflow;
-        if (is_last) {
-            if (comment) |c| {
-                w.writeAll(" / ") catch {};
-                w.writeAll(c) catch {};
-            }
-        }
-        try list.append(alloc, try Card.parse(&raw));
+    }
+    // The data ran out on a continuation card (a chunk in (term_cap, CHUNK]); the comment still
+    // needs a home, so place it on a dedicated empty-string continuation card (`'' / comment`),
+    // which contributes nothing to the reassembled value.
+    if (!comment_done) {
+        try list.append(alloc, try buildChunkCard(name, &first, "", false, comment));
     }
     return list.toOwnedSlice(alloc);
+}
+
+// Build one CONTINUE-run card: the first card uses `name = '...`, the rest `CONTINUE  '...`. A
+// trailing `&` (inside the quotes) is added when `continues`; a `/ comment` suffix when given.
+fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: bool, comment: ?[]const u8) HeaderError!Card {
+    var raw: [80]u8 = [_]u8{' '} ** 80;
+    if (first.*) {
+        const nm = @import("name.zig").Name.parse(name) catch return error.BadKeywordName;
+        @memcpy(raw[0..8], &nm.bytes);
+        raw[8] = '=';
+        raw[9] = ' ';
+        first.* = false;
+    } else {
+        @memcpy(raw[0..8], "CONTINUE");
+    }
+    var w = std.Io.Writer.fixed(raw[10..]);
+    w.writeByte('\'') catch return error.CardOverflow;
+    w.writeAll(chunk) catch return error.CardOverflow;
+    if (continues) w.writeByte('&') catch return error.CardOverflow;
+    w.writeByte('\'') catch return error.CardOverflow;
+    if (comment) |c| {
+        w.writeAll(" / ") catch return error.CardOverflow;
+        w.writeAll(c) catch return error.CardOverflow;
+    }
+    return Card.parse(&raw);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────────────
@@ -180,4 +207,33 @@ test "split keeps a short string in one card" {
     defer testing.allocator.free(cards);
     try testing.expectEqual(@as(usize, 1), cards.len);
     try testing.expect(cards[0].kind == .value);
+}
+
+test "split preserves the comment when the final data chunk would fill the card (no silent drop)" {
+    // 135 chars: greedy 67-char chunking leaves a full 68-char final chunk, so the old code wrote
+    // a full value field and then dropped the comment via `catch {}`. The comment must survive.
+    const long = "x" ** 135;
+    const cards = try split(testing.allocator, "DESC", long, "units");
+    defer testing.allocator.free(cards);
+    const a = try assemble(testing.allocator, cards, 0);
+    try testing.expect(a != null);
+    defer testing.allocator.free(a.?.value);
+    try testing.expectEqualStrings(long, a.?.value); // value still reassembles exactly
+    const last = cards[cards.len - 1];
+    try testing.expectEqualStrings("units", value.parseComment(last.valueField()).?);
+}
+
+test "split with a comment that overflows a single card falls through to multi-card" {
+    // A 68-char string fits one card alone but not with a comment; it must split, not be rejected
+    // with CardOverflow (regression: the single-card threshold ignored the comment).
+    const s = "y" ** 68;
+    const cards = try split(testing.allocator, "DESC", s, "note");
+    defer testing.allocator.free(cards);
+    try testing.expect(cards.len >= 2);
+    const a = try assemble(testing.allocator, cards, 0);
+    try testing.expect(a != null);
+    defer testing.allocator.free(a.?.value);
+    try testing.expectEqualStrings(s, a.?.value);
+    const last = cards[cards.len - 1];
+    try testing.expectEqualStrings("note", value.parseComment(last.valueField()).?);
 }
