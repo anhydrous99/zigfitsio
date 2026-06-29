@@ -31,6 +31,10 @@ pub const HttpDevice = struct {
     /// Whole-file cache, populated when the server ignores `Range` (200 fallback) or when
     /// the size can only be learned by downloading the body.
     cache: ?MemoryDevice = null,
+    /// Upper bound on a whole-body download into `cache`, so a server that ignores `Range` and
+    /// streams a huge/endless `200 OK` body cannot grow memory without limit (NFR-SAFE-1).
+    /// Defaults to the `Limits.max_open_alloc` default (4 GiB); tune on the struct if needed.
+    max_cache_bytes: u64 = 1 << 32,
     /// Scratch for `receiveHead` redirect following.
     redirect_buf: [16 * 1024]u8 = undefined,
     /// Scratch for the body reader.
@@ -65,6 +69,9 @@ pub const HttpDevice = struct {
         const self: *HttpDevice = @ptrCast(@alignCast(ctx));
         if (buf.len == 0) return 0;
         if (self.cache) |*c| return cachePread(c, buf, offset);
+        // An offset whose byte range would overflow u64 is past any possible EOF; report 0
+        // (end-of-stream) like the other backends rather than overflowing in formatRange.
+        if (offset > std.math.maxInt(u64) - buf.len) return 0;
 
         var range_buf: [64]u8 = undefined;
         const range = formatRange(&range_buf, offset, buf.len);
@@ -168,6 +175,9 @@ pub const HttpDevice = struct {
         while (true) {
             const n = r.readSliceShort(&tmp) catch return error.ReadFailed;
             if (n == 0) break;
+            // Bound the download: a server that ignores Range and streams a huge/endless body
+            // must not grow the cache without limit (NFR-SAFE-1).
+            if (pos + n > self.max_cache_bytes) return error.DeviceFull;
             try dev.writeAll(tmp[0..n], pos);
             pos += n;
         }
@@ -195,7 +205,9 @@ pub const HttpDevice = struct {
 /// Asserts `len > 0`; `buf` must hold at least 47 bytes (it always does at the call sites).
 fn formatRange(buf: []u8, offset: u64, len: usize) []const u8 {
     std.debug.assert(len > 0);
-    const end = offset + @as(u64, len) - 1;
+    // Saturating: a near-u64-max offset+len must not integer-overflow panic. The resulting
+    // range lies past any real EOF, so the server answers range_not_satisfiable → pread 0.
+    const end = (offset +| @as(u64, len)) -| 1;
     return std.fmt.bufPrint(buf, "bytes={d}-{d}", .{ offset, end }) catch unreachable;
 }
 
@@ -231,6 +243,10 @@ test "formatRange builds a correct bytes= header" {
     // 64-bit offset is not truncated.
     const huge: u64 = (3 << 30) + 5;
     try testing.expectEqualStrings("bytes=3221225477-3221225484", formatRange(&buf, huge, 8));
+    // Regression: a near-u64-max offset+len must saturate, not integer-overflow panic.
+    const max = std.math.maxInt(u64);
+    _ = formatRange(&buf, max, 1);
+    _ = formatRange(&buf, max - 2, 8);
 }
 
 test "parseContentRangeTotal extracts the size after the slash" {
