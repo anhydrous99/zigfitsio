@@ -18,6 +18,8 @@ backlog.
 ```sh
 zig build              # build the static library
 zig build test         # run the test suite
+zig build capi         # build the C-ABI shared library (for the Python/C bindings)
+zig build capi-test    # test the C-ABI shim
 zig build bench        # throughput benchmarks
 zig build fitsverify   # run the structural-validation CLI demo
 zig build fuzz         # fuzz the header/table parsers
@@ -35,6 +37,34 @@ zig fetch --save git+https://github.com/anhydrous99/zigfitsio
 const fits = b.dependency("zigfitsio", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("zigfitsio", fits.module("zigfitsio"));
 ```
+
+## Language bindings (C ABI + Python)
+
+A stable **C ABI** and a **Python** package live under [`bindings/`](./bindings). They are
+additive — the pure-Zig library in `src/` is unchanged — and are layered:
+
+- **C-ABI shim** ([`bindings/capi/`](./bindings/capi), `zig build capi`): a dynamic library
+  `zigfitsio_capi` exporting `zf_*` symbols. The comptime-generic Zig API is monomorphized behind
+  runtime datatype codes, and Zig errors are surfaced as CFITSIO-compatible status ints via
+  `errors.cfitsioStatus`. The hand-written contract is [`bindings/c/zigfitsio.h`](./bindings/c/zigfitsio.h).
+  This is **not** a CFITSIO `fits_*`/`ff*` drop-in — it is a purpose-built ABI for bindings.
+- **Low-level Python** (`zigfitsio.lowlevel`): a 1:1 `ctypes` binding over the C ABI, with a typed
+  `FitsError` hierarchy. Pure Python — no C compiler needed at install.
+- **High-level Python** (`zigfitsio`): a NumPy-first API modeled on `astropy.io.fits` — `open`,
+  `HDUList`, the HDU classes, `Column`, a dict-like `Header`, `getdata`/`getheader`/`writeto`/
+  `verify`, and celestial WCS transforms. Interoperability is verified **both directions** against
+  Astropy and the committed CFITSIO golden corpus.
+
+```python
+import numpy as np, zigfitsio as zf
+
+zf.writeto("img.fits", np.arange(12, dtype="f4").reshape(3, 4), overwrite=True)
+with zf.open("img.fits") as hdul:
+    print(hdul[0].data, hdul[0].header["NAXIS1"])
+```
+
+See [`bindings/python/README.md`](./bindings/python/README.md) for install, the full API, and the
+packaging/wheel workflow.
 
 ## Status
 

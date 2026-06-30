@@ -83,6 +83,24 @@ All notable changes to `zigfitsio` are documented here. The format follows
   no `DATASUM`/`CHECKSUM` was written. Now wired (`src/fits.zig` reserves the cards at HDU-build
   time; `src/checksum.zig` registers `updateAll`).
 
+### Added (language bindings batch)
+- **C-ABI shim (`bindings/capi/`, `zig build capi`):** a dynamic library `zigfitsio_capi`
+  exporting `zf_*` symbols over the public Zig module. The comptime-generic API is monomorphized
+  behind runtime datatype codes; Zig errors map to CFITSIO-compatible status ints via
+  `errors.cfitsioStatus`, with a thread-local last-error (message + `Diagnostics` detail). Covers
+  the full surface: lifecycle (file/memory/gzip), HDU navigation + delete/copy, header read/edit,
+  images (read/write/section/reshape with scaling + nulls), binary & ASCII tables, VLAs, tiled
+  compression write, checksum, structural validation, and WCS celestial transforms. The
+  hand-written contract is `bindings/c/zigfitsio.h`; `zig build capi-test` round-trips the ABI.
+  This is **not** a CFITSIO `fits_*`/`ff*` drop-in — it is a purpose-built ABI for bindings.
+- **Python bindings (`bindings/python/`):** a low-level `ctypes` 1:1 binding (`zigfitsio.lowlevel`)
+  with a typed `FitsError` hierarchy, and a high-level NumPy-first API (`zigfitsio`) modeled on
+  `astropy.io.fits` — `open`, `HDUList`, `Primary`/`Image`/`CompImage`/`BinTable`/`AsciiTable`
+  HDUs, `Column`, a dict-like `Header`, `getdata`/`getheader`/`getval`/`writeto`/`verify`, and
+  celestial WCS. Includes a pytest suite (low + high level, **Astropy cross-checks both
+  directions**, and the committed golden corpus), packaging (`pyproject.toml` + a hatch build hook
+  that compiles and bundles the shared library), and a cibuildwheel matrix workflow.
+
 ### Notes
 - The HTTP(S) range-GET backend (`RMT-2`) is **done**.
 - **Byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity is now done** (`X-FIXTURES`/`X-SUM`/

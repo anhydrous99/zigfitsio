@@ -64,3 +64,29 @@ merged, or reset at batch granularity:
 
 This section is a snapshot of the delivery state and becomes moot once the branch is
 merged.
+
+## 3. Language bindings (Python / C ABI) — scope & known gaps
+
+The bindings under `bindings/` are **additive**: a `zf_*` C-ABI shim (`bindings/capi/`, built by
+`zig build capi`) over the public Zig module, a low-level `ctypes` binding, and a high-level
+NumPy/Astropy-style API. `src/` is unchanged and contains **no C** (the `.h` contract lives under
+`bindings/c/`, outside the `GC-1` guard's `src tools test` scope). Interoperability is verified
+both directions against Astropy and the committed golden corpus. Honest limits as delivered:
+
+- **Not a CFITSIO drop-in.** The exported symbols are `zf_*`, not `fits_*`/`ff*`; the ABI is
+  purpose-built for bindings (opaque handles + runtime datatype codes), not a CFITSIO replacement.
+- **Integer null masks.** Float nulls surface as NaN; for integer images/columns the raw `BLANK`/
+  `TNULLn` values are readable (and exposed via `zf_table_col_info`), but the high-level API does
+  not yet return `numpy.ma` masked arrays for them — masking integer nulls is a follow-up.
+- **VLA writing assumes a reserved heap.** `zf_write_col_vla` uses a heap manager created for the
+  table assuming the heap starts empty (i.e. `PCOUNT` reserved up front); reading VLAs is complete.
+- **Unsigned-integer image/column *writing*.** The high-level write path maps `u1/i2/i4/i8/f4/f8`
+  to `BITPIX`/`TFORM`; *reading* the unsigned convention (`BZERO`/`TZEROn` → `u2/u4/u8`) is handled,
+  but *writing* `uint16/32/64` via the BZERO convention is not yet wired.
+- **Iterator and the raw `Device` vtable** are intentionally not exposed 1:1; the Python layer
+  provides NumPy-native equivalents (column/section reads) and the file/memory/gzip open paths.
+- **Toolchain for wheels.** The `ziglang` PyPI package can lag the 0.16 toolchain this project
+  targets, so wheel builds use a real Zig 0.16 (CI `setup-zig` / the in-container installer); the
+  hatch build hook falls back to a system `zig` when `ziglang` is absent.
+
+None of these require ABI changes to address — they are extension points, not design constraints.

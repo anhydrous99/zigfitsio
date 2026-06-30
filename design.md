@@ -1583,10 +1583,11 @@ Cross-cutting tracks run continuously from M0: fuzzing (§23), the CI portabilit
 
 **Open questions inherited from requirements §7.2 (to resolve before 1.0):**
 
-1. CFITSIO C-compatible export layer as a later separate module? (Explicitly out of scope
-   now; the design keeps `errors.cfitsioStatus` so a future shim has a code map ready.)
-2. **License** (MIT / Apache-2.0 / BSD-3) — must be CFITSIO-independent (`NFR-DOC-2`).
-   Pending; gates the `LICENSE` path in `build.zig.zon`.
+1. CFITSIO `fits_*` *drop-in* export layer (compatible symbol names)? Still out of scope. A
+   purpose-built `zf_*` C ABI plus low/high-level Python bindings now ship under `bindings/`
+   (additive; no C in `src/`), consuming `errors.cfitsioStatus` for status codes — see the
+   bindings tree and `bindings/c/zigfitsio.h`.
+2. **License** — **resolved:** MIT (`LICENSE`), CFITSIO-independent (`NFR-DOC-2`).
 3. WCS transform breadth — full projection set vs. common subset (§18.2 implements the
    common set first; extensible registry).
 4. Minimum compression set for 1.0 — GZIP-only vs. also Rice/HCOMPRESS (M2 ships GZIP; M3

@@ -957,7 +957,9 @@ Every requirement ID maps to at least one task. `tools/check_tasks.py` re-verifi
 - **1.0 compression scope** — M2 ships GZIP only; Rice/PLIO/HCOMPRESS + write land in M3.
 - **WCS breadth** — WCS-2 implements the common projection set first behind an extensible registry.
 - **Remote/gzip in 1.0** — RMT-1/RMT-2 are leaf backends, so 1.0-vs-extension is a build-graph decision.
-- **CFITSIO C-export shim** — out of scope now; ERR-4 keeps the status map ready.
+- **CFITSIO `fits_*` drop-in shim** — still out of scope. A purpose-built `zf_*` C ABI plus
+  low/high-level Python bindings now ship under `bindings/` (additive; no C in `src/`), consuming
+  ERR-4's `cfitsioStatus` map for status codes. A CFITSIO-compatible symbol drop-in is not planned.
 - **Endianness verification** — proven by the X-CI big-endian QEMU cell, not the LE host matrix.
 - **Fixture provenance** — all CFITSIO/Astropy goldens and malformed fixtures are owned by X-FIXTURES,
   which also declares the CI tool environment; no other task silently assumes them.
