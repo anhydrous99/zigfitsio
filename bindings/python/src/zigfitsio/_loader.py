@@ -35,9 +35,11 @@ def _candidate_paths() -> list[Path]:
     candidates.append(here / name)
     candidates.append(here / "_lib" / name)
 
-    # Development fallback: a `zig-out/lib` somewhere above this file.
+    # Development fallback: `zig-out/{bin,lib}` somewhere above this file. Zig installs the Windows
+    # DLL under bin/ (only the import .lib lands in lib/); .so/.dylib live under lib/.
+    subdir = "bin" if sys.platform == "win32" else "lib"
     for parent in here.parents:
-        cand = parent / "zig-out" / "lib" / name
+        cand = parent / "zig-out" / subdir / name
         if cand.exists():
             candidates.append(cand)
             break

@@ -160,6 +160,7 @@ class FitsWcsError(FitsError):
 
 # CFITSIO status code → exception class (nearest mapping; default FitsError).
 _CODE_TO_CLASS = {
+    104: FitsIOError,  # null input pointer (defensive C-ABI guard)
     113: FitsMemoryError,
     106: FitsIOError,
     107: FitsIOError,
@@ -244,10 +245,10 @@ _PROTOS = [
     # images
     ("zf_create_img", INT, [VOID, INT, INT, PLONG]),
     ("zf_resize_img", INT, [VOID, INT, INT, PLONG]),
-    ("zf_read_img", INT, [VOID, INT, LONG, LONG, VOID, VOID, VOID]),
-    ("zf_write_img", INT, [VOID, INT, LONG, LONG, VOID, VOID, VOID]),
-    ("zf_read_subset", INT, [VOID, INT, INT, PLONG, PLONG, PLONG, LONG, VOID, VOID, VOID]),
-    ("zf_write_subset", INT, [VOID, INT, INT, PLONG, PLONG, PLONG, LONG, VOID, VOID, VOID]),
+    ("zf_read_img", INT, [VOID, INT, LL, LL, VOID, VOID, VOID]),
+    ("zf_write_img", INT, [VOID, INT, LL, LL, VOID, VOID, VOID]),
+    ("zf_read_subset", INT, [VOID, INT, INT, PLONG, PLONG, PLONG, LL, VOID, VOID, VOID]),
+    ("zf_write_subset", INT, [VOID, INT, INT, PLONG, PLONG, PLONG, LL, VOID, VOID, VOID]),
     # header
     ("zf_card_count", INT, [VOID, PLONG]),
     ("zf_read_card", INT, [VOID, LONG, CHARP]),
@@ -272,6 +273,7 @@ _PROTOS = [
     ("zf_copy_hdu", INT, [VOID, LONG]),
     # tables
     ("zf_create_tbl", INT, [VOID, INT, LL, INT, PCHARP, PCHARP, PCHARP, CHARP]),
+    ("zf_create_tbl_heap", INT, [VOID, INT, LL, INT, PCHARP, PCHARP, PCHARP, CHARP, LL]),
     ("zf_table_open", INT, [VOID, PVOID]),
     ("zf_table_close", None, [VOID]),
     ("zf_table_nrows", INT, [VOID, PLL]),

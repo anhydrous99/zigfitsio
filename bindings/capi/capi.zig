@@ -166,25 +166,29 @@ pub export fn zf_open_gzip(buf_ptr: [*]const u8, buf_len: usize, opts: ?*const Z
 }
 
 /// Flush buffered writes (and update checksums if `checksum_on_close` was set).
-pub export fn zf_flush(h: *Handle) c_int {
+pub export fn zf_flush(h_opt: ?*Handle) c_int {
+    const h = h_opt orelse return abi.failNull();
     h.fits.flush() catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Export the handle's current bytes as a whole-file gzip stream written to `path`.
-pub export fn zf_save_gzip(h: *Handle, path_ptr: [*]const u8, path_len: usize) c_int {
+pub export fn zf_save_gzip(h_opt: ?*Handle, path_ptr: [*]const u8, path_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     h.fits.saveGzipFile(path_ptr[0..path_len]) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Total logical size in bytes of the handle's underlying device.
-pub export fn zf_data_size(h: *Handle, out: *u64) c_int {
+pub export fn zf_data_size(h_opt: ?*Handle, out: *u64) c_int {
+    const h = h_opt orelse return abi.failNull();
     out.* = h.fits.device().getSize() catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Read up to `len` raw bytes at `offset` from the device into `dst`; `out_read` gets the count.
-pub export fn zf_read_bytes(h: *Handle, offset: u64, dst: [*]u8, len: usize, out_read: *usize) c_int {
+pub export fn zf_read_bytes(h_opt: ?*Handle, offset: u64, dst: [*]u8, len: usize, out_read: *usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     out_read.* = h.fits.device().pread(dst[0..len], offset) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
@@ -205,42 +209,48 @@ pub export fn zf_close(h: ?*Handle) void {
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 /// Total number of HDUs (forces a full scan).
-pub export fn zf_hdu_count(h: *Handle, out: *c_long) c_int {
+pub export fn zf_hdu_count(h_opt: ?*Handle, out: *c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     const n = h.fits.hduCount() catch |e| return abi.fail(&h.diag, e);
     out.* = @intCast(n);
     return 0;
 }
 
 /// Select HDU `n` (1-based) as the current HDU.
-pub export fn zf_select(h: *Handle, n: c_long) c_int {
+pub export fn zf_select(h_opt: ?*Handle, n: c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (n < 1) return abi.fail(&h.diag, error.WrongHduType);
     _ = h.fits.select(@intCast(n)) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Move the current HDU by `delta` (relative navigation).
-pub export fn zf_move(h: *Handle, delta: c_long) c_int {
+pub export fn zf_move(h_opt: ?*Handle, delta: c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     _ = h.fits.move(@intCast(delta)) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Select the first extension matching `EXTNAME` (case-insensitive); if `has_extver` is set,
 /// also match `EXTVER`.
-pub export fn zf_select_by_name(h: *Handle, name_ptr: [*]const u8, name_len: usize, extver: c_long, has_extver: c_int) c_int {
+pub export fn zf_select_by_name(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, extver: c_long, has_extver: c_int) c_int {
+    const h = h_opt orelse return abi.failNull();
     const ev: ?i64 = if (has_extver != 0) @intCast(extver) else null;
     _ = h.fits.selectByName(name_ptr[0..name_len], ev) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// The current HDU number (1-based).
-pub export fn zf_current_hdu(h: *Handle, out: *c_long) c_int {
+pub export fn zf_current_hdu(h_opt: ?*Handle, out: *c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (h.fits.hdus.items.len == 0) return abi.fail(&h.diag, error.WrongHduType);
     out.* = @intCast(h.fits.chdu + 1);
     return 0;
 }
 
 /// The current HDU's kind: 0 primary, 1 image, 2 ascii_table, 3 binary_table, 4 random_groups.
-pub export fn zf_hdu_type(h: *Handle, out: *c_int) c_int {
+pub export fn zf_hdu_type(h_opt: ?*Handle, out: *c_int) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     out.* = abi.kindCode(hdu.kind);
     return 0;
@@ -249,7 +259,8 @@ pub export fn zf_hdu_type(h: *Handle, out: *c_int) c_int {
 /// Image geometry of the current HDU. Reports the uncompressed `Z*` geometry for a
 /// tile-compressed image. `axes` is filled most-rapidly-varying first up to `axes_cap`;
 /// `naxis_out` gets the true NAXIS, `filled` the number written.
-pub export fn zf_img_param(h: *Handle, bitpix_out: *c_int, naxis_out: *c_int, axes: [*]c_long, axes_cap: c_int, filled: *c_int) c_int {
+pub export fn zf_img_param(h_opt: ?*Handle, bitpix_out: *c_int, naxis_out: *c_int, axes: [*]c_long, axes_cap: c_int, filled: *c_int) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const cap: usize = if (axes_cap > 0) @intCast(axes_cap) else 0;
     const compressed = hdu.kind == .binary_table and (hdu.header.getValue(bool, "ZIMAGE") catch false);
@@ -289,7 +300,8 @@ fn axesFrom(naxis: c_int, axes: ?[*]const c_long, buf: *[999]u64) []const u64 {
 }
 
 /// Append a new image HDU (primary if the file is empty, else an IMAGE extension).
-pub export fn zf_create_img(h: *Handle, bitpix: c_int, naxis: c_int, axes: ?[*]const c_long) c_int {
+pub export fn zf_create_img(h_opt: ?*Handle, bitpix: c_int, naxis: c_int, axes: ?[*]const c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     var buf: [999]u64 = undefined;
     const spec = fits.ImageSpec{ .bitpix = @intCast(bitpix), .axes = axesFrom(naxis, axes, &buf) };
     _ = h.fits.appendImageHdu(spec) catch |e| return abi.fail(&h.diag, e);
@@ -297,7 +309,8 @@ pub export fn zf_create_img(h: *Handle, bitpix: c_int, naxis: c_int, axes: ?[*]c
 }
 
 /// Resize / redefine the current image HDU in place.
-pub export fn zf_resize_img(h: *Handle, bitpix: c_int, naxis: c_int, axes: ?[*]const c_long) c_int {
+pub export fn zf_resize_img(h_opt: ?*Handle, bitpix: c_int, naxis: c_int, axes: ?[*]const c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     var buf: [999]u64 = undefined;
@@ -382,7 +395,8 @@ fn imgWrite(view: *fits.ImageView, ty: ZfType, first0: u64, ptr: *const anyopaqu
 /// Read `nelem` pixels of the current image starting at 1-based flat `firstelem`, converting
 /// to `dtype`. `nulval` (or null) is the substituted null sentinel; `scaling` (or null)
 /// overrides BSCALE/BZERO/BLANK.
-pub export fn zf_read_img(h: *Handle, dtype: c_int, firstelem: c_long, nelem: c_long, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
+pub export fn zf_read_img(h_opt: ?*Handle, dtype: c_int, firstelem: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (firstelem < 1) return abi.fail(&h.diag, error.BadDimensions);
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
@@ -393,7 +407,8 @@ pub export fn zf_read_img(h: *Handle, dtype: c_int, firstelem: c_long, nelem: c_
 }
 
 /// Write `nelem` pixels to the current image starting at 1-based flat `firstelem`.
-pub export fn zf_write_img(h: *Handle, dtype: c_int, firstelem: c_long, nelem: c_long, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *const anyopaque) c_int {
+pub export fn zf_write_img(h_opt: ?*Handle, dtype: c_int, firstelem: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *const anyopaque) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (firstelem < 1) return abi.fail(&h.diag, error.BadDimensions);
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
@@ -443,7 +458,8 @@ fn fillBounds(naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc:
 }
 
 /// Read a rectangular section (0-based inclusive `lower..upper`, optional per-axis `inc`).
-pub export fn zf_read_subset(h: *Handle, dtype: c_int, naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc: ?[*]const c_long, nelem: c_long, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
+pub export fn zf_read_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc: ?[*]const c_long, nelem: c_longlong, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (nelem < 0) return abi.fail(&h.diag, error.BadDimensions);
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
@@ -458,7 +474,8 @@ pub export fn zf_read_subset(h: *Handle, dtype: c_int, naxis: c_int, lower: [*]c
 }
 
 /// Write a rectangular section (symmetric with `zf_read_subset`).
-pub export fn zf_write_subset(h: *Handle, dtype: c_int, naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc: ?[*]const c_long, nelem: c_long, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
+pub export fn zf_write_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc: ?[*]const c_long, nelem: c_longlong, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (nelem < 0) return abi.fail(&h.diag, error.BadDimensions);
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
@@ -487,14 +504,16 @@ fn commentOf(ptr: ?[*]const u8, len: usize) ?[]const u8 {
 }
 
 /// Number of header cards in the current HDU (including END).
-pub export fn zf_card_count(h: *Handle, out: *c_long) c_int {
+pub export fn zf_card_count(h_opt: ?*Handle, out: *c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     out.* = @intCast(hdu.header.count());
     return 0;
 }
 
 /// Copy the raw 80 bytes of card `index` (0-based) into `buf80`.
-pub export fn zf_read_card(h: *Handle, index: c_long, buf80: [*]u8) c_int {
+pub export fn zf_read_card(h_opt: ?*Handle, index: c_long, buf80: [*]u8) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     if (index < 0 or @as(usize, @intCast(index)) >= hdu.header.count()) return abi.fail(&h.diag, error.KeywordNotFound);
     const card = hdu.header.at(@intCast(index));
@@ -503,27 +522,31 @@ pub export fn zf_read_card(h: *Handle, index: c_long, buf80: [*]u8) c_int {
 }
 
 /// Whether keyword `name` exists in the current header.
-pub export fn zf_key_exists(h: *Handle, name_ptr: [*]const u8, name_len: usize) c_int {
+pub export fn zf_key_exists(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch return 0;
     return if (hdu.header.has(name_ptr[0..name_len])) 1 else 0;
 }
 
 /// Read an integer-valued keyword.
-pub export fn zf_read_key_lng(h: *Handle, name_ptr: [*]const u8, name_len: usize, out: *c_longlong) c_int {
+pub export fn zf_read_key_lng(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, out: *c_longlong) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     out.* = @intCast(hdu.header.getValue(i64, name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e));
     return 0;
 }
 
 /// Read a floating-valued keyword.
-pub export fn zf_read_key_dbl(h: *Handle, name_ptr: [*]const u8, name_len: usize, out: *f64) c_int {
+pub export fn zf_read_key_dbl(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, out: *f64) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     out.* = hdu.header.getValue(f64, name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Read a logical (boolean) keyword as 0/1.
-pub export fn zf_read_key_log(h: *Handle, name_ptr: [*]const u8, name_len: usize, out: *c_int) c_int {
+pub export fn zf_read_key_log(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, out: *c_int) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const b = hdu.header.getValue(bool, name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e);
     out.* = if (b) 1 else 0;
@@ -531,7 +554,8 @@ pub export fn zf_read_key_log(h: *Handle, name_ptr: [*]const u8, name_len: usize
 }
 
 /// Read a string-valued keyword into `buf`; `out_len` gets the full length.
-pub export fn zf_read_key_str(h: *Handle, name_ptr: [*]const u8, name_len: usize, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+pub export fn zf_read_key_str(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const s = hdu.header.getString(gpa, name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e);
     defer gpa.free(s);
@@ -541,7 +565,8 @@ pub export fn zf_read_key_str(h: *Handle, name_ptr: [*]const u8, name_len: usize
 
 /// Read a (possibly CONTINUE-continued) long string. On success `out_ptr`/`out_len` own a
 /// buffer the caller must release with `zf_free`.
-pub export fn zf_read_key_longstr(h: *Handle, name_ptr: [*]const u8, name_len: usize, out_ptr: *?[*]u8, out_len: *usize) c_int {
+pub export fn zf_read_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, out_ptr: *?[*]u8, out_len: *usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     out_ptr.* = null;
     out_len.* = 0;
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
@@ -552,7 +577,8 @@ pub export fn zf_read_key_longstr(h: *Handle, name_ptr: [*]const u8, name_len: u
 }
 
 /// Copy keyword `name`'s comment into `buf` (empty if none).
-pub export fn zf_key_comment(h: *Handle, name_ptr: [*]const u8, name_len: usize, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+pub export fn zf_key_comment(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const c = hdu.header.comment(name_ptr[0..name_len]) orelse {
         out_len.* = 0;
@@ -570,27 +596,32 @@ fn writeKey(h: *Handle, name: []const u8, v: fits.KeywordValue, comment: ?[]cons
 }
 
 /// Create or update an integer keyword.
-pub export fn zf_write_key_lng(h: *Handle, name_ptr: [*]const u8, name_len: usize, value: c_longlong, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+pub export fn zf_write_key_lng(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value: c_longlong, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     return writeKey(h, name_ptr[0..name_len], .{ .int = @intCast(value) }, commentOf(comment_ptr, comment_len));
 }
 
 /// Create or update a floating keyword.
-pub export fn zf_write_key_dbl(h: *Handle, name_ptr: [*]const u8, name_len: usize, value: f64, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+pub export fn zf_write_key_dbl(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value: f64, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     return writeKey(h, name_ptr[0..name_len], .{ .float = value }, commentOf(comment_ptr, comment_len));
 }
 
 /// Create or update a logical keyword.
-pub export fn zf_write_key_log(h: *Handle, name_ptr: [*]const u8, name_len: usize, value: c_int, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+pub export fn zf_write_key_log(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value: c_int, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     return writeKey(h, name_ptr[0..name_len], .{ .logical = value != 0 }, commentOf(comment_ptr, comment_len));
 }
 
 /// Create or update a string keyword (single card; ≤ 68 chars).
-pub export fn zf_write_key_str(h: *Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+pub export fn zf_write_key_str(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     return writeKey(h, name_ptr[0..name_len], .{ .string = value_ptr[0..value_len] }, commentOf(comment_ptr, comment_len));
 }
 
 /// Append a long string keyword using the CONTINUE convention (inserts before END).
-pub export fn zf_write_key_longstr(h: *Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+pub export fn zf_write_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const name = name_ptr[0..name_len];
     hdu.header.delete(name) catch {}; // replace if present
@@ -606,7 +637,8 @@ pub export fn zf_write_key_longstr(h: *Handle, name_ptr: [*]const u8, name_len: 
 }
 
 /// Delete the first card named `name`.
-pub export fn zf_delete_key(h: *Handle, name_ptr: [*]const u8, name_len: usize) c_int {
+pub export fn zf_delete_key(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.delete(name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e);
     h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
@@ -614,7 +646,8 @@ pub export fn zf_delete_key(h: *Handle, name_ptr: [*]const u8, name_len: usize) 
 }
 
 /// Rename keyword `old` to `new`.
-pub export fn zf_rename_key(h: *Handle, old_ptr: [*]const u8, old_len: usize, new_ptr: [*]const u8, new_len: usize) c_int {
+pub export fn zf_rename_key(h_opt: ?*Handle, old_ptr: [*]const u8, old_len: usize, new_ptr: [*]const u8, new_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.rename(old_ptr[0..old_len], new_ptr[0..new_len]) catch |e| return abi.fail(&h.diag, e);
     h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
@@ -622,7 +655,8 @@ pub export fn zf_rename_key(h: *Handle, old_ptr: [*]const u8, old_len: usize, ne
 }
 
 /// Insert a raw 80-byte card before END.
-pub export fn zf_write_record(h: *Handle, card80: [*]const u8) c_int {
+pub export fn zf_write_record(h_opt: ?*Handle, card80: [*]const u8) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const card = fits.Card.parse(card80[0..80]) catch |e| return abi.fail(&h.diag, e);
     hdu.header.insert(gpa, endIndex(&hdu.header), card) catch |e| return abi.fail(&h.diag, e);
@@ -631,7 +665,8 @@ pub export fn zf_write_record(h: *Handle, card80: [*]const u8) c_int {
 }
 
 /// Insert a raw 80-byte card at `index` (0-based).
-pub export fn zf_insert_record(h: *Handle, index: c_long, card80: [*]const u8) c_int {
+pub export fn zf_insert_record(h_opt: ?*Handle, index: c_long, card80: [*]const u8) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     if (index < 0 or @as(usize, @intCast(index)) > hdu.header.count()) return abi.fail(&h.diag, error.KeywordNotFound);
     const card = fits.Card.parse(card80[0..80]) catch |e| return abi.fail(&h.diag, e);
@@ -677,7 +712,7 @@ fn asciiTypeCode(t: tc.AsciiType) abi.ZfType {
     };
 }
 
-fn createTbl(h: *Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, ttype: [*]const ?[*:0]const u8, tform: [*]const ?[*:0]const u8, tunit: ?[*]const ?[*:0]const u8, extname: ?[*:0]const u8) fits.Error!void {
+fn createTbl(h: *Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, ttype: [*]const ?[*:0]const u8, tform: [*]const ?[*:0]const u8, tunit: ?[*]const ?[*:0]const u8, extname: ?[*:0]const u8, pcount: c_longlong) fits.Error!void {
     const nc: usize = if (ncols > 0) @intCast(ncols) else 0;
     const ascii = table_type == 1;
 
@@ -708,7 +743,7 @@ fn createTbl(h: *Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, tty
     try hdr.appendValue(gpa, "NAXIS", .{ .int = 2 }, null);
     try hdr.appendValue(gpa, "NAXIS1", .{ .int = @intCast(naxis1) }, null);
     try hdr.appendValue(gpa, "NAXIS2", .{ .int = nrows }, null);
-    try hdr.appendValue(gpa, "PCOUNT", .{ .int = 0 }, null);
+    try hdr.appendValue(gpa, "PCOUNT", .{ .int = if (pcount > 0) pcount else 0 }, null);
     try hdr.appendValue(gpa, "GCOUNT", .{ .int = 1 }, null);
     try hdr.appendValue(gpa, "TFIELDS", .{ .int = @intCast(nc) }, null);
     var buf: [16]u8 = undefined;
@@ -730,13 +765,23 @@ fn createTbl(h: *Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, tty
 
 /// Create and append a new table HDU. `table_type`: 0 binary, 1 ASCII. `ttype`/`tform` are
 /// arrays of `ncols` NUL-terminated C strings; `tunit` is an optional array; `extname` optional.
-pub export fn zf_create_tbl(h: *Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, ttype: [*]const ?[*:0]const u8, tform: [*]const ?[*:0]const u8, tunit: ?[*]const ?[*:0]const u8, extname: ?[*:0]const u8) c_int {
-    createTbl(h, table_type, nrows, ncols, ttype, tform, tunit, extname) catch |e| return abi.fail(&h.diag, e);
+pub export fn zf_create_tbl(h_opt: ?*Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, ttype: [*]const ?[*:0]const u8, tform: [*]const ?[*:0]const u8, tunit: ?[*]const ?[*:0]const u8, extname: ?[*:0]const u8) c_int {
+    const h = h_opt orelse return abi.failNull();
+    createTbl(h, table_type, nrows, ncols, ttype, tform, tunit, extname, 0) catch |e| return abi.fail(&h.diag, e);
+    return 0;
+}
+
+/// Like `zf_create_tbl` but reserves `pcount` bytes of heap (PCOUNT) up front so a binary table's
+/// variable-length-array cells can be written with `zf_write_col_vla`.
+pub export fn zf_create_tbl_heap(h_opt: ?*Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, ttype: [*]const ?[*:0]const u8, tform: [*]const ?[*:0]const u8, tunit: ?[*]const ?[*:0]const u8, extname: ?[*:0]const u8, pcount: c_longlong) c_int {
+    const h = h_opt orelse return abi.failNull();
+    createTbl(h, table_type, nrows, ncols, ttype, tform, tunit, extname, pcount) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Open a table view over the current HDU.
-pub export fn zf_table_open(h: *Handle, out: *?*TableHandle) c_int {
+pub export fn zf_table_open(h_opt: ?*Handle, out: *?*TableHandle) c_int {
+    const h = h_opt orelse return abi.failNull();
     out.* = null;
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const th = gpa.create(TableHandle) catch return abi.fail(null, error.OutOfMemory);
@@ -773,7 +818,8 @@ pub export fn zf_table_close(t: ?*TableHandle) void {
 }
 
 /// Number of rows in the table.
-pub export fn zf_table_nrows(t: *TableHandle, out: *c_longlong) c_int {
+pub export fn zf_table_nrows(t_opt: ?*TableHandle, out: *c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     out.* = @intCast(switch (t.kind) {
         .binary => t.bin.?.rowCount(),
         .ascii => t.asc.?.rowCount(),
@@ -782,7 +828,8 @@ pub export fn zf_table_nrows(t: *TableHandle, out: *c_longlong) c_int {
 }
 
 /// Number of columns in the table.
-pub export fn zf_table_ncols(t: *TableHandle, out: *c_int) c_int {
+pub export fn zf_table_ncols(t_opt: ?*TableHandle, out: *c_int) c_int {
+    const t = t_opt orelse return abi.failNull();
     out.* = @intCast(switch (t.kind) {
         .binary => t.bin.?.columnCount(),
         .ascii => t.asc.?.columnCount(),
@@ -804,14 +851,16 @@ fn resolveCol(t: *TableHandle, name: []const u8) fits.Error!u16 {
 }
 
 /// Resolve a column name (case-insensitive, wildcards) to a 0-based index.
-pub export fn zf_table_colnum(t: *TableHandle, name_ptr: [*]const u8, name_len: usize, out: *c_int) c_int {
+pub export fn zf_table_colnum(t_opt: ?*TableHandle, name_ptr: [*]const u8, name_len: usize, out: *c_int) c_int {
+    const t = t_opt orelse return abi.failNull();
     const idx = resolveCol(t, name_ptr[0..name_len]) catch |e| return abi.fail(&t.owner.diag, e);
     out.* = @intCast(idx);
     return 0;
 }
 
 /// Fill `info` with metadata for 0-based column `col`.
-pub export fn zf_table_col_info(t: *TableHandle, col: c_int, info: *ZfColInfo) c_int {
+pub export fn zf_table_col_info(t_opt: ?*TableHandle, col: c_int, info: *ZfColInfo) c_int {
+    const t = t_opt orelse return abi.failNull();
     const ci: usize = if (col >= 0) @intCast(col) else return abi.fail(&t.owner.diag, error.NoSuchColumn);
     info.* = .{};
     switch (t.kind) {
@@ -864,14 +913,16 @@ fn colNameUnit(t: *TableHandle, col: usize, want_unit: bool) ?[]const u8 {
 }
 
 /// Copy 0-based column `col`'s name (`TTYPEn`) into `buf`.
-pub export fn zf_table_col_name(t: *TableHandle, col: c_int, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+pub export fn zf_table_col_name(t_opt: ?*TableHandle, col: c_int, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+    const t = t_opt orelse return abi.failNull();
     const ci: usize = if (col >= 0) @intCast(col) else return abi.fail(&t.owner.diag, error.NoSuchColumn);
     abi.copyOut(colNameUnit(t, ci, false) orelse "", buf, buf_len, out_len);
     return 0;
 }
 
 /// Copy 0-based column `col`'s unit (`TUNITn`) into `buf`.
-pub export fn zf_table_col_unit(t: *TableHandle, col: c_int, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+pub export fn zf_table_col_unit(t_opt: ?*TableHandle, col: c_int, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
+    const t = t_opt orelse return abi.failNull();
     const ci: usize = if (col >= 0) @intCast(col) else return abi.fail(&t.owner.diag, error.NoSuchColumn);
     abi.copyOut(colNameUnit(t, ci, true) orelse "", buf, buf_len, out_len);
     return 0;
@@ -933,7 +984,8 @@ fn colDispatch(comptime dir: Dir, t: *TableHandle, ty: ZfType, col: u16, first_r
 }
 
 /// Read `nelem` elements of 0-based column `col` starting at 1-based `firstrow`, as `dtype`.
-pub export fn zf_read_col(t: *TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
+pub export fn zf_read_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
+    const t = t_opt orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     colDispatch(.read, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
@@ -941,7 +993,8 @@ pub export fn zf_read_col(t: *TableHandle, dtype: c_int, col: c_int, firstrow: c
 }
 
 /// Write `nelem` elements to 0-based column `col` starting at 1-based `firstrow`, from `dtype`.
-pub export fn zf_write_col(t: *TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
+pub export fn zf_write_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
+    const t = t_opt orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     colDispatch(.write, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
@@ -950,7 +1003,8 @@ pub export fn zf_write_col(t: *TableHandle, dtype: c_int, col: c_int, firstrow: 
 
 /// Read `nrows` text cells of character column `col` (0-based) starting at 1-based `firstrow`,
 /// each into `buf[i*stride .. i*stride+width]` (raw fixed-width field bytes).
-pub export fn zf_read_col_str(t: *TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: c_longlong, stride: c_longlong, buf: [*]u8) c_int {
+pub export fn zf_read_col_str(t_opt: ?*TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: c_longlong, stride: c_longlong, buf: [*]u8) c_int {
+    const t = t_opt orelse return abi.failNull();
     if (nrows <= 0) return 0;
     if (col < 0 or firstrow < 1 or width < 0 or stride < width) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     const w: usize = @intCast(width);
@@ -972,7 +1026,8 @@ pub export fn zf_read_col_str(t: *TableHandle, col: c_int, firstrow: c_longlong,
 
 /// Write `nrows` text cells of character column `col` (0-based) starting at 1-based `firstrow`,
 /// each from `buf[i*stride .. i*stride+width]`.
-pub export fn zf_write_col_str(t: *TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: c_longlong, stride: c_longlong, buf: [*]const u8) c_int {
+pub export fn zf_write_col_str(t_opt: ?*TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: c_longlong, stride: c_longlong, buf: [*]const u8) c_int {
+    const t = t_opt orelse return abi.failNull();
     if (nrows <= 0) return 0;
     if (col < 0 or firstrow < 1 or width < 0 or stride < width) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     const w: usize = @intCast(width);
@@ -998,28 +1053,32 @@ fn requireBinary(t: *TableHandle) fits.Error!*fits.BinTable {
 }
 
 /// Append `n` empty rows to a binary table.
-pub export fn zf_append_rows(t: *TableHandle, n: c_longlong) c_int {
+pub export fn zf_append_rows(t_opt: ?*TableHandle, n: c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     tbl.appendRows(@intCast(n)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
 /// Insert `n` empty rows before 0-based `before_row` in a binary table.
-pub export fn zf_insert_rows(t: *TableHandle, before_row: c_longlong, n: c_longlong) c_int {
+pub export fn zf_insert_rows(t_opt: ?*TableHandle, before_row: c_longlong, n: c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     tbl.insertRows(@intCast(before_row), @intCast(n)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
 /// Delete `n` rows starting at 0-based `first_row` in a binary table.
-pub export fn zf_delete_rows(t: *TableHandle, first_row: c_longlong, n: c_longlong) c_int {
+pub export fn zf_delete_rows(t_opt: ?*TableHandle, first_row: c_longlong, n: c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     tbl.deleteRows(@intCast(first_row), @intCast(n)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
 /// Insert a new column at 0-based `at` in a binary table.
-pub export fn zf_insert_col(t: *TableHandle, at: c_int, tform: [*:0]const u8, ttype: ?[*:0]const u8) c_int {
+pub export fn zf_insert_col(t_opt: ?*TableHandle, at: c_int, tform: [*:0]const u8, ttype: ?[*:0]const u8) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     const tt: ?[]const u8 = if (ttype) |p| std.mem.span(p) else null;
     tbl.insertColumn(gpa, @intCast(at), std.mem.span(tform), tt) catch |e| return abi.fail(&t.owner.diag, e);
@@ -1027,7 +1086,8 @@ pub export fn zf_insert_col(t: *TableHandle, at: c_int, tform: [*:0]const u8, tt
 }
 
 /// Delete 0-based column `col` from a binary table.
-pub export fn zf_delete_col(t: *TableHandle, col: c_int) c_int {
+pub export fn zf_delete_col(t_opt: ?*TableHandle, col: c_int) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     tbl.deleteColumn(@intCast(col)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
@@ -1036,7 +1096,8 @@ pub export fn zf_delete_col(t: *TableHandle, col: c_int) c_int {
 // ── Variable-length arrays ────────────────────────────────────────────────────────────────────
 
 /// Read the (len, offset) descriptor of a VLA cell (1-based `row`).
-pub export fn zf_read_descript(t: *TableHandle, col: c_int, row: c_longlong, out_len: *c_longlong, out_off: *c_longlong) c_int {
+pub export fn zf_read_descript(t_opt: ?*TableHandle, col: c_int, row: c_longlong, out_len: *c_longlong, out_off: *c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     const d = fits.heap.readDescriptor(tbl, .{ .index = @intCast(col) }, @intCast(row - 1)) catch |e| return abi.fail(&t.owner.diag, e);
     out_len.* = d.len;
@@ -1070,7 +1131,8 @@ fn vlaRead(ty: ZfType, tbl: *fits.BinTable, col: u16, row: u64, array: *anyopaqu
 
 /// Read a VLA cell (1-based `row`) into `array` (capacity `cap` elements); `out_nelem` gets the
 /// true element count (may exceed `cap`).
-pub export fn zf_read_col_vla(t: *TableHandle, dtype: c_int, col: c_int, row: c_longlong, cap: c_longlong, array: *anyopaque, out_nelem: *c_longlong) c_int {
+pub export fn zf_read_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, row: c_longlong, cap: c_longlong, array: *anyopaque, out_nelem: *c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or cap < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     vlaRead(@enumFromInt(dtype), tbl, @intCast(col), @intCast(row - 1), array, @intCast(cap), out_nelem) catch |e| return abi.fail(&t.owner.diag, e);
@@ -1100,7 +1162,8 @@ fn vlaWrite(ty: ZfType, tbl: *fits.BinTable, mgr: *fits.heap.HeapManager, col: u
 
 /// Write a VLA cell (1-based `row`) from `nelem` elements of `array`. Uses a heap manager
 /// created lazily for the table (assumes the heap starts empty / PCOUNT was reserved).
-pub export fn zf_write_col_vla(t: *TableHandle, dtype: c_int, col: c_int, row: c_longlong, array: *const anyopaque, nelem: c_longlong) c_int {
+pub export fn zf_write_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, row: c_longlong, array: *const anyopaque, nelem: c_longlong) c_int {
+    const t = t_opt orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or nelem < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     if (t.mgr == null) {
@@ -1115,14 +1178,16 @@ pub export fn zf_write_col_vla(t: *TableHandle, dtype: c_int, col: c_int, row: c
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 /// Delete HDU `n` (1-based).
-pub export fn zf_delete_hdu(h: *Handle, n: c_long) c_int {
+pub export fn zf_delete_hdu(h_opt: ?*Handle, n: c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (n < 1) return abi.fail(&h.diag, error.WrongHduType);
     h.fits.deleteHdu(@intCast(n)) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Copy HDU `src_n` (1-based) to the end of the file and make it current.
-pub export fn zf_copy_hdu(h: *Handle, src_n: c_long) c_int {
+pub export fn zf_copy_hdu(h_opt: ?*Handle, src_n: c_long) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (src_n < 1) return abi.fail(&h.diag, error.WrongHduType);
     _ = h.fits.copyHdu(@intCast(src_n)) catch |e| return abi.fail(&h.diag, e);
     return 0;
@@ -1133,7 +1198,8 @@ pub export fn zf_copy_hdu(h: *Handle, src_n: c_long) c_int {
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 /// Compute and write `DATASUM` + `CHECKSUM` for the current HDU.
-pub export fn zf_write_chksum(h: *Handle) c_int {
+pub export fn zf_write_chksum(h_opt: ?*Handle) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     fits.checksum.ensureCards(&hdu.header, gpa) catch |e| return abi.fail(&h.diag, e);
     h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
@@ -1142,13 +1208,15 @@ pub export fn zf_write_chksum(h: *Handle) c_int {
 }
 
 /// Recompute and rewrite the integrity keywords for every HDU that already has them.
-pub export fn zf_update_chksum_all(h: *Handle) c_int {
+pub export fn zf_update_chksum_all(h_opt: ?*Handle) c_int {
+    const h = h_opt orelse return abi.failNull();
     fits.checksum.updateAll(&h.fits) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Verify the current HDU's integrity. `out_checksum`/`out_datasum`: 1 match, 0 absent, -1 mismatch.
-pub export fn zf_verify_chksum(h: *Handle, out_checksum: *c_int, out_datasum: *c_int) c_int {
+pub export fn zf_verify_chksum(h_opt: ?*Handle, out_checksum: *c_int, out_datasum: *c_int) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const r = fits.checksum.verify(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     out_checksum.* = verifyCode(r.sum);
@@ -1165,7 +1233,8 @@ fn verifyCode(v: fits.checksum.Verify) c_int {
 }
 
 /// Compute the data-unit `DATASUM` of the current HDU (32-bit FITS 1's-complement sum).
-pub export fn zf_datasum(h: *Handle, out: *u64) c_int {
+pub export fn zf_datasum(h_opt: ?*Handle, out: *u64) c_int {
+    const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     out.* = fits.checksum.datasum(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     return 0;
@@ -1179,7 +1248,8 @@ const FindingsHandle = abi.FindingsHandle;
 
 /// Run the structural validation pass; the result is an opaque list released with
 /// `zf_findings_free`.
-pub export fn zf_validate(h: *Handle, out: *?*FindingsHandle) c_int {
+pub export fn zf_validate(h_opt: ?*Handle, out: *?*FindingsHandle) c_int {
+    const h = h_opt orelse return abi.failNull();
     out.* = null;
     const fh = gpa.create(FindingsHandle) catch return abi.fail(null, error.OutOfMemory);
     fh.* = .{ .list = fits.validate.verify(gpa, &h.fits) catch |e| {
@@ -1191,14 +1261,16 @@ pub export fn zf_validate(h: *Handle, out: *?*FindingsHandle) c_int {
 }
 
 /// Number of findings.
-pub export fn zf_findings_count(fh: *FindingsHandle, out: *c_long) c_int {
+pub export fn zf_findings_count(fh_opt: ?*FindingsHandle, out: *c_long) c_int {
+    const fh = fh_opt orelse return abi.failNull();
     out.* = @intCast(fh.list.items.len);
     return 0;
 }
 
 /// Get finding `i`: `severity` (0 error, 1 warning), 1-based `hdu` (0 = whole file), the keyword
 /// (empty if none), and the message.
-pub export fn zf_findings_get(fh: *FindingsHandle, i: c_long, severity: *c_int, hdu: *c_int, kw_buf: [*]u8, kw_len: usize, kw_out: *usize, msg_buf: [*]u8, msg_len: usize, msg_out: *usize) c_int {
+pub export fn zf_findings_get(fh_opt: ?*FindingsHandle, i: c_long, severity: *c_int, hdu: *c_int, kw_buf: [*]u8, kw_len: usize, kw_out: *usize, msg_buf: [*]u8, msg_len: usize, msg_out: *usize) c_int {
+    const fh = fh_opt orelse return abi.failNull();
     if (i < 0 or @as(usize, @intCast(i)) >= fh.list.items.len) return abi.fail(null, error.CellOutOfRange);
     const f = fh.list.items[@intCast(i)];
     severity.* = switch (f.severity) {
@@ -1232,7 +1304,8 @@ fn celestialOf(h: *Handle, alt: c_int) fits.Error!fits.Celestial {
 
 /// Convert a 1-based pixel coordinate `(px, py)` to celestial `(lon, lat)` degrees using the
 /// current HDU's WCS (`alt` selects an alternate WCS letter; 0/space = primary).
-pub export fn zf_wcs_pix2world(h: *Handle, alt: c_int, px: f64, py: f64, out_lon: *f64, out_lat: *f64) c_int {
+pub export fn zf_wcs_pix2world(h_opt: ?*Handle, alt: c_int, px: f64, py: f64, out_lon: *f64, out_lat: *f64) c_int {
+    const h = h_opt orelse return abi.failNull();
     const cel = celestialOf(h, alt) catch |e| return abi.fail(&h.diag, e);
     const world = cel.pixelToWorld(.{ px, py }) catch |e| return abi.fail(&h.diag, e);
     out_lon.* = world[0];
@@ -1241,7 +1314,8 @@ pub export fn zf_wcs_pix2world(h: *Handle, alt: c_int, px: f64, py: f64, out_lon
 }
 
 /// Convert celestial `(lon, lat)` degrees to a 1-based pixel coordinate `(px, py)`.
-pub export fn zf_wcs_world2pix(h: *Handle, alt: c_int, lon: f64, lat: f64, out_px: *f64, out_py: *f64) c_int {
+pub export fn zf_wcs_world2pix(h_opt: ?*Handle, alt: c_int, lon: f64, lat: f64, out_px: *f64, out_py: *f64) c_int {
+    const h = h_opt orelse return abi.failNull();
     const cel = celestialOf(h, alt) catch |e| return abi.fail(&h.diag, e);
     const pix = cel.worldToPixel(.{ lon, lat }) catch |e| return abi.fail(&h.diag, e);
     out_px.* = pix[0];
@@ -1273,7 +1347,8 @@ fn writeCompressedDispatch(ty: ZfType, h: *Handle, spec: fits.CompressSpec, ptr:
 /// Append a tile-compressed image HDU. `codec`/`quantize` are NUL-terminated names
 /// (`"GZIP_1"`, `"RICE_1"`, `"SUBTRACTIVE_DITHER_1"`, ...). `tile` (or null) overrides the
 /// default row-strip tiling.
-pub export fn zf_write_compressed(h: *Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, pixels: *const anyopaque, nelem: c_longlong) c_int {
+pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, pixels: *const anyopaque, nelem: c_longlong) c_int {
+    const h = h_opt orelse return abi.failNull();
     if (nelem < 0 or naxis <= 0) return abi.fail(&h.diag, error.BadDimensions);
     var axbuf: [999]u64 = undefined;
     var tilebuf: [999]u64 = undefined;

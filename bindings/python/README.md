@@ -91,10 +91,12 @@ ll.lib.zf_close(h)
 
 ## Conventions
 
-- Image data is exchanged as **native-endian** NumPy arrays. Array shape is the reversed FITS
-  axis order (`(NAXIS2, NAXIS1)`), C-contiguous — identical memory layout to `astropy.io.fits`.
-- `BSCALE`/`BZERO` scaling and the unsigned-integer convention are applied automatically; the
-  output dtype is widened to float when real scaling is present.
+- Image and table data is exchanged as **native-endian** NumPy arrays; non-native (byte-swapped)
+  input is coerced automatically before writing. Image shape is the reversed FITS axis order
+  (`(NAXIS2, NAXIS1)`), C-contiguous — identical memory layout to `astropy.io.fits`.
+- `BSCALE`/`BZERO` and `TSCAL`/`TZERO` scaling and the unsigned-integer convention are applied
+  automatically on read (images and table columns) and honored on write; the output dtype is
+  widened to float when real scaling is present, or to `u2/u4/u8` for the unsigned convention.
 - Errors are raised as typed `FitsError` subclasses (`KeywordNotFound` is also a `KeyError`).
 
 ## Development

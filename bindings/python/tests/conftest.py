@@ -15,8 +15,8 @@ if str(_SRC) not in sys.path:
 
 # Prefer a dev build if present and no explicit override was given.
 if "ZIGFITSIO_LIBRARY" not in os.environ:
-    for name in ("libzigfitsio_capi.dylib", "libzigfitsio_capi.so", "zigfitsio_capi.dll"):
-        cand = _REPO / "zig-out" / "lib" / name
+    for sub, name in (("lib", "libzigfitsio_capi.dylib"), ("lib", "libzigfitsio_capi.so"), ("bin", "zigfitsio_capi.dll")):
+        cand = _REPO / "zig-out" / sub / name
         if cand.exists():
             os.environ["ZIGFITSIO_LIBRARY"] = str(cand)
             break

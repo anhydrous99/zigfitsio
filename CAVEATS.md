@@ -78,11 +78,13 @@ both directions against Astropy and the committed golden corpus. Honest limits a
 - **Integer null masks.** Float nulls surface as NaN; for integer images/columns the raw `BLANK`/
   `TNULLn` values are readable (and exposed via `zf_table_col_info`), but the high-level API does
   not yet return `numpy.ma` masked arrays for them — masking integer nulls is a follow-up.
-- **VLA writing assumes a reserved heap.** `zf_write_col_vla` uses a heap manager created for the
-  table assuming the heap starts empty (i.e. `PCOUNT` reserved up front); reading VLAs is complete.
-- **Unsigned-integer image/column *writing*.** The high-level write path maps `u1/i2/i4/i8/f4/f8`
-  to `BITPIX`/`TFORM`; *reading* the unsigned convention (`BZERO`/`TZEROn` → `u2/u4/u8`) is handled,
-  but *writing* `uint16/32/64` via the BZERO convention is not yet wired.
+- **VLA writing.** The high-level `from_columns`/`writeto` path writes variable-length-array
+  columns, reserving the heap (`PCOUNT`) up front via `zf_create_tbl_heap`; reading VLAs is
+  complete. The lower-level `zf_write_col_vla` still assumes the heap is reserved (create the table
+  with `zf_create_tbl_heap`). Writing *complex* VLAs is not supported.
+- **Unsigned-integer writing.** The high-level write path maps `u1/i2/i4/i8/f4/f8` directly and
+  writes `u2/u4/u8` images and columns via the `BZERO`/`TZEROn` convention (integer-space, exact for
+  all widths incl. `uint64`); reading the same convention (`BZERO`/`TZEROn` → `u2/u4/u8`) is handled.
 - **Iterator and the raw `Device` vtable** are intentionally not exposed 1:1; the Python layer
   provides NumPy-native equivalents (column/section reads) and the file/memory/gzip open paths.
 - **Toolchain for wheels.** The `ziglang` PyPI package can lag the 0.16 toolchain this project

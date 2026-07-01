@@ -83,8 +83,59 @@ def parse_card(raw: bytes) -> "_Card | None":
     if text[8:10] == "= ":
         value, comment = _parse_value_comment(text[10:])
         return _Card(name, value, comment)
-    # HIERARCH or other: keep the raw remainder as a commentary-style record.
+    if name == "HIERARCH":
+        # `HIERARCH keyword tokens = value / comment`; the spaced token string is the keyword.
+        rest = text[8:]
+        eq = rest.find("=")
+        if eq >= 0:
+            keyword = rest[:eq].strip()
+            if keyword:
+                value, comment = _parse_value_comment(rest[eq + 1 :])
+                return _Card(keyword, value, comment)
+    # other: keep the raw remainder as a commentary-style record.
     return _Card(name, text[8:].rstrip(), "", commentary=True)
+
+
+def parse_cards(raws: "list[bytes]") -> "list[_Card]":
+    """Parse a sequence of physical 80-byte cards, folding CONTINUE long-string continuations.
+
+    A string value whose text ends in ``&`` is continued by the following ``CONTINUE`` cards; the
+    fragments are concatenated (each ``&`` sentinel dropped) and the comment taken from the last
+    fragment. A lone ``&``-terminated value with no following CONTINUE keeps the ``&`` literally.
+    """
+    cards: "list[_Card]" = []
+    i = 0
+    n = len(raws)
+    while i < n:
+        card = parse_card(raws[i])
+        i += 1
+        if card is None:  # END
+            continue
+        if (
+            not card.commentary
+            and isinstance(card.value, str)
+            and card.value.endswith("&")
+            and i < n
+            and raws[i][0:8].rstrip() == b"CONTINUE"
+        ):
+            parts = [card.value[:-1]]
+            comment = card.comment
+            while i < n and raws[i][0:8].rstrip() == b"CONTINUE":
+                text = raws[i].decode("ascii", "replace")
+                frag, cont_comment = _parse_value_comment(text[8:])
+                i += 1
+                if cont_comment:
+                    comment = cont_comment
+                frag = frag if isinstance(frag, str) else ""
+                if frag.endswith("&"):
+                    parts.append(frag[:-1])
+                else:
+                    parts.append(frag)
+                    break
+            card.value = "".join(parts)
+            card.comment = comment
+        cards.append(card)
+    return cards
 
 
 class Header:

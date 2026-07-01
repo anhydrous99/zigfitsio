@@ -123,6 +123,19 @@ pub fn fail(diag: ?*const fits.Diagnostics, err: fits.Error) c_int {
     return st.status;
 }
 
+/// Record a null-input-pointer failure (a C caller passed a null handle/table/findings pointer)
+/// into the thread-local slot and return CFITSIO's `NULL_INPUT_PTR` (104). The exported `zf_*`
+/// functions guard their handle parameters with `orelse return abi.failNull()`.
+pub fn failNull() c_int {
+    var st: ErrState = .{};
+    st.status = 104;
+    const text = "null input pointer";
+    @memcpy(st.msg[0..text.len], text);
+    st.msg_len = text.len;
+    last_err = st;
+    return 104;
+}
+
 // ── C-layout option / scaling structs ───────────────────────────────────────────────────────
 
 /// Open/create options (mirrors `fits.OpenOpts` + `Limits`). A `0` limit field means "use the

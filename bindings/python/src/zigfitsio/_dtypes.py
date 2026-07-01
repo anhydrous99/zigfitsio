@@ -49,6 +49,36 @@ def zf_code(dtype) -> int:
         raise ll.FitsTypeError(410, f"unsupported numpy dtype {dtype!r}") from exc
 
 
+# ZfType element code -> numpy dtype (inverse of _DTYPE_TO_ZF, plus the two complex codes which
+# have no distinct numpy entry in _DTYPE_TO_ZF). Used to pick a read dtype from a column's
+# reported typecode instead of guessing from the TFORM letter.
+ZF_TO_DTYPE = {code: dt for dt, code in _DTYPE_TO_ZF.items()}
+ZF_TO_DTYPE[ll.ZF_COMPLEX64] = np.dtype("c8")
+ZF_TO_DTYPE[ll.ZF_COMPLEX128] = np.dtype("c16")
+
+
+def zf_to_dtype(code: int) -> np.dtype:
+    """numpy dtype for a ZfType element code (the inverse of :func:`zf_code`)."""
+    try:
+        return ZF_TO_DTYPE[int(code)]
+    except KeyError as exc:
+        raise ll.FitsTypeError(410, f"unsupported ZfType code {code}") from exc
+
+
+# numpy unsigned dtype -> (signed BITPIX, BZERO offset, on-disk signed dtype) for writing images
+# via the FITS unsigned-integer convention (store value-BZERO as a signed int, record BZERO).
+_UNSIGNED_IMG_WRITE = {
+    np.dtype("u2"): (16, 32768, np.dtype("i2")),
+    np.dtype("u4"): (32, 2147483648, np.dtype("i4")),
+    np.dtype("u8"): (64, 9223372036854775808, np.dtype("i8")),
+}
+
+
+def unsigned_img_plan(dtype):
+    """(bitpix, bzero, stored_dtype) if ``dtype`` writes via the BZERO convention, else ``None``."""
+    return _UNSIGNED_IMG_WRITE.get(np.dtype(dtype).newbyteorder("="))
+
+
 def bitpix_to_dtype(bitpix: int) -> np.dtype:
     try:
         return BITPIX_TO_DTYPE[int(bitpix)]

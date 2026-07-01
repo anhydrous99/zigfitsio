@@ -6,7 +6,29 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed (Python bindings, `0.1.1`)
+A swarm bug hunt over the ctypes bindings + C-ABI boundary fixed 27 confirmed defects (the prior
+suite exercised none of these paths; `bindings/python/tests/test_bugfixes.py` now pins them):
+- **Critical:** `open()` → `writeto()`/`to_bytes()` no longer silently drops image/table data — an
+  attached HDU list is copied byte-faithfully (raw device passthrough), and the reconstruction path
+  serializes materialized data for detached/mixed lists.
+- **Crashes:** using an attached HDU after `close()`, and `verify()` on a Python-built HDU list, now
+  raise `FitsError` instead of segfaulting; the C-ABI `zf_*` exports null-check their handle
+  argument (`NULL_INPUT_PTR`, 104).
+- **Silent corruption:** non-native-endian arrays are coerced to native before write; numpy scalar
+  header values (`np.int64/np.float32/np.bool_`) are written with the correct FITS type; out-of-range
+  integer keywords raise instead of wrapping; non-ASCII table strings and ragged/empty tables raise.
+- **Reads:** binary-table columns honor `TSCAL`/`TZERO` (fractional scaling → float; unsigned
+  `TZEROn` → `u2/u4/u8`, no more overflow); VLA columns decode with their real element type (not
+  always `float64`); long-string `CONTINUE` values and `HIERARCH` keywords are parsed.
+- **Writes (feature completion):** unsigned `u2/u4/u8` images and columns, and variable-length-array
+  columns, are now writable; update-mode image data edits are written back on `flush()`.
+- **API/packaging:** `getdata` falls through an empty primary and `hdul['PRIMARY']` resolves
+  (astropy parity); the wheel build hook and dev loader find the Windows DLL under `zig-out/bin` and
+  derive the library name + wheel tag from `ZIG_TARGET`; image element-count ABI widened to 64-bit.
+
 ### Added
+- `zf_create_tbl_heap` C-ABI entry point (reserves `PCOUNT` heap for VLA writes).
 - Build scaffolding: `zig build` (static library), `test`, `bench`, `fuzz`, and
   `wasm-check` steps; dependency-free `build.zig.zon` (`SETUP-1`).
 - MIT license; README usage examples and changelog (`X-DOC`).

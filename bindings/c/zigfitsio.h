@@ -132,10 +132,10 @@ int  zf_img_param(ZfFits* h, int* bitpix, int* naxis, long* axes, int axes_cap, 
 /* ── Images ──────────────────────────────────────────────────────────────────────────────── */
 int  zf_create_img(ZfFits* h, int bitpix, int naxis, const long* axes);
 int  zf_resize_img(ZfFits* h, int bitpix, int naxis, const long* axes);
-int  zf_read_img(ZfFits* h, int dtype, long firstelem, long nelem, const void* nulval, const ZfScaling* scaling, void* array);
-int  zf_write_img(ZfFits* h, int dtype, long firstelem, long nelem, const void* nulval, const ZfScaling* scaling, const void* array);
-int  zf_read_subset(ZfFits* h, int dtype, int naxis, const long* lower, const long* upper, const long* inc, long nelem, const void* nulval, const ZfScaling* scaling, void* array);
-int  zf_write_subset(ZfFits* h, int dtype, int naxis, const long* lower, const long* upper, const long* inc, long nelem, const void* nulval, const ZfScaling* scaling, void* array);
+int  zf_read_img(ZfFits* h, int dtype, long long firstelem, long long nelem, const void* nulval, const ZfScaling* scaling, void* array);
+int  zf_write_img(ZfFits* h, int dtype, long long firstelem, long long nelem, const void* nulval, const ZfScaling* scaling, const void* array);
+int  zf_read_subset(ZfFits* h, int dtype, int naxis, const long* lower, const long* upper, const long* inc, long long nelem, const void* nulval, const ZfScaling* scaling, void* array);
+int  zf_write_subset(ZfFits* h, int dtype, int naxis, const long* lower, const long* upper, const long* inc, long long nelem, const void* nulval, const ZfScaling* scaling, void* array);
 
 /* ── Header ──────────────────────────────────────────────────────────────────────────────── */
 int  zf_card_count(ZfFits* h, long* out);
@@ -165,6 +165,10 @@ int  zf_copy_hdu(ZfFits* h, long src_n);
 int  zf_create_tbl(ZfFits* h, int table_type, long long nrows, int ncols,
                    const char* const* ttype, const char* const* tform,
                    const char* const* tunit, const char* extname);
+/* Like zf_create_tbl but reserves `pcount` heap bytes (PCOUNT) up front for VLA writes. */
+int  zf_create_tbl_heap(ZfFits* h, int table_type, long long nrows, int ncols,
+                        const char* const* ttype, const char* const* tform,
+                        const char* const* tunit, const char* extname, long long pcount);
 int  zf_table_open(ZfFits* h, ZfTable** out);
 void zf_table_close(ZfTable* t);
 int  zf_table_nrows(ZfTable* t, long long* out);
