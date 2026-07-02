@@ -78,6 +78,13 @@ pub const FileDevice = struct {
         self.file.sync(self.io()) catch return error.WriteFailed;
     }
 
+    // A read-only device has no buffered writes to flush, so sync is a no-op. Crucially it must
+    // NOT reach the OS: FlushFileBuffers on a read-only Windows handle fails with
+    // ERROR_ACCESS_DENIED (POSIX fsync on a read-only fd is a harmless success, which is why this
+    // only surfaced on Windows). `Fits.flush` runs on any handle — including a read-only open
+    // copied via writeto()/to_bytes() — so this path is reached in normal use.
+    fn noSyncFn(_: *anyopaque) IoError!void {}
+
     fn closeFn(ctx: *anyopaque) void {
         const self: *FileDevice = @ptrCast(@alignCast(ctx));
         self.file.close(self.io());
@@ -89,7 +96,7 @@ pub const FileDevice = struct {
         .pwrite = null,
         .getSize = getSize,
         .setSize = null,
-        .sync = syncFn,
+        .sync = noSyncFn,
         .close = closeFn,
     };
     const rw_vtable: Device.VTable = .{
@@ -121,6 +128,10 @@ test "file device create→write→reopen→read round-trip; read-only rejects w
         defer dev.close();
         try testing.expect(!dev.isWritable());
         try testing.expectError(error.NotWritable, dev.writeAll("x", 0));
+        // A read-only sync is a no-op that must succeed and never reach the OS — FlushFileBuffers
+        // on a read-only handle fails on Windows. `Fits.flush` hits this when a read-only open is
+        // copied via writeto()/to_bytes().
+        try dev.sync();
         var buf: [9]u8 = undefined;
         try dev.readAll(&buf, 0);
         try testing.expectEqualStrings("FITS-DATA", &buf);
