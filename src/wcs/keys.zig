@@ -175,23 +175,33 @@ pub const Wcs = struct {
 
 // ── name builders ──────────────────────────────────────────────────────────────────────
 
-fn altSuffix(alt: u8) []const u8 {
-    return if (alt == ' ' or alt == 0) "" else &[_]u8{alt};
+// The alternate-WCS letter as a keyword suffix, written into `buf` (empty for the primary
+// description). The byte must live in caller-owned storage: returning a slice of a temporary
+// `&[_]u8{alt}` dangles into reclaimed stack the moment this returns — harmless in Debug (the
+// stack still holds the byte) but a garbage suffix in ReleaseFast, which silently mis-reads
+// every alternate-WCS keyword (e.g. `CTYPE1A`).
+fn altSuffix(buf: *[1]u8, alt: u8) []const u8 {
+    if (alt == ' ' or alt == 0) return "";
+    buf[0] = alt;
+    return buf[0..1];
 }
 
 fn nameAlt(buf: *[8]u8, comptime base: []const u8, alt: u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}{s}", .{ base, altSuffix(alt) }) catch unreachable;
+    var sfx: [1]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ base, altSuffix(&sfx, alt) }) catch unreachable;
 }
 
 // `null` when the formatted keyword would exceed the 8-char FITS limit (e.g. CTYPE1000,
 // CD100_100): such a keyword cannot exist in a valid header, so callers treat it as absent
 // rather than panicking via `catch unreachable`.
 fn indexedName(buf: *[8]u8, comptime base: []const u8, idx: usize, alt: u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{s}{d}{s}", .{ base, idx, altSuffix(alt) }) catch null;
+    var sfx: [1]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}{d}{s}", .{ base, idx, altSuffix(&sfx, alt) }) catch null;
 }
 
 fn matrixName(buf: *[8]u8, comptime base: []const u8, i: usize, j: usize, alt: u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{s}{d}_{d}{s}", .{ base, i, j, altSuffix(alt) }) catch null;
+    var sfx: [1]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}{d}_{d}{s}", .{ base, i, j, altSuffix(&sfx, alt) }) catch null;
 }
 
 // ── readers ────────────────────────────────────────────────────────────────────────────
