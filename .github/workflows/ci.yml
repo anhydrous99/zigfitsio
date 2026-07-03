@@ -145,7 +145,7 @@ jobs:
       # so it must be skipped on the weekly `schedule` trigger — every later step then runs via
       # its `|| github.event_name == 'schedule'` arm (a skipped step's output is '' != 'true').
       - if: github.event_name != 'schedule'
-        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         id: f
         with:
           filters: |
