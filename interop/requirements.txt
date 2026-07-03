@@ -3,4 +3,4 @@
 # This is NOT a Zig build dependency; install into a throwaway venv:
 #   python3 -m venv /tmp/astropy-venv && /tmp/astropy-venv/bin/pip install -r requirements.txt
 astropy<6
-numpy<2
+numpy<3
