@@ -6,7 +6,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed (Python bindings, `0.1.1`)
+_Nothing yet._
+
+## [0.1.1] - 2026-07-02
+
+### Fixed
 A swarm bug hunt over the ctypes bindings + C-ABI boundary fixed 27 confirmed defects (the prior
 suite exercised none of these paths; `bindings/python/tests/test_bugfixes.py` now pins them):
 - **Critical:** `open()` → `writeto()`/`to_bytes()` no longer silently drops image/table data — an
@@ -27,8 +31,21 @@ suite exercised none of these paths; `bindings/python/tests/test_bugfixes.py` no
   (astropy parity); the wheel build hook and dev loader find the Windows DLL under `zig-out/bin` and
   derive the library name + wheel tag from `ZIG_TARGET`; image element-count ABI widened to 64-bit.
 
+Core-library and build fixes in the same window:
+- **WCS:** `altSuffix` no longer returns a dangling stack temporary — alternate-WCS keyword
+  lookups misbehaved in ReleaseFast builds (Debug's stack layout masked it).
+- **I/O:** `appendHdu` rolls back device growth when it fails after the header write; `sync` on a
+  read-only file device is a no-op (Windows `FlushFileBuffers` fails on read-only handles, which
+  POSIX `fsync` had masked).
+- **Packaging/CI:** wheel builds fixed on Windows (skip 32-bit `*-win32`) and macOS (pin the 11.0
+  deployment target); the retired `macos-13` runner replaced with `macos-15-intel`.
+
 ### Added
 - `zf_create_tbl_heap` C-ABI entry point (reserves `PCOUNT` heap for VLA writes).
+
+## [0.1.0] - 2026-06-30
+
+### Added
 - Build scaffolding: `zig build` (static library), `test`, `bench`, `fuzz`, and
   `wasm-check` steps; dependency-free `build.zig.zon` (`SETUP-1`).
 - MIT license; README usage examples and changelog (`X-DOC`).
@@ -62,28 +79,10 @@ suite exercised none of these paths; `bindings/python/tests/test_bugfixes.py` no
   (incl. a big-endian QEMU cell and a wasm32-freestanding build); real bulk-image throughput
   benchmarks (`X-BENCH`); and the **full** upper-layer stack now compiles for
   wasm32-freestanding (`X-WASM`).
-
-### Fixed / changed
-- **FITS-conformance correctness pass:** ASCII-table fields now space-fill (not NUL/zero) per
-  `FR-IO-2`; the `CONTINUE`/`HIERARCH`/complex-value header API is wired through
-  `getLongString`/`appendLongString`/`getHierarch`/`getComplex`; float-exponent formatting
-  follows §4.2.4 and FORTRAN-real parsing accepts `D`/`E` exponents; `TDISP` `EN`/`ES`/`G`
-  rendering; `copyHdu` rolls back cleanly on partial failure; write-path keyword-order
-  validation; WCS `CAR`/`LATPOLE` pole rotation corrected; `MJDREF` precedence + a time-keyword
-  writer and completeness fixes; image-section streaming; `TDIM` string arrays; heap-bounds
-  hardening; and grouping-table fixes.
-- **Standard-wire-format codec rewrites:** `PLIO_1` now follows the FITS Table 38 instruction
-  set and `HCOMPRESS_1` the White-1992 quadtree wire format; tiled `ZBLANK`, transparent
-  compressed-image reads (`ImageView.of`), and the write-side codec wiring are all in place.
-- **Iterator** null substitution.
-
-### Added (this batch)
 - **HTTP(S) range-GET backend (`RMT-2`):** `src/io/http.zig`'s `HttpDevice` serves a remote
   FITS file as a seekable read-only `Device` via Range GETs, falling back to a full in-memory
   download when the server lacks range support; excluded from the freestanding build graph.
 - A transparent `.fits.gz` open path and a committed sample FITS corpus.
-
-### Added (e2e & interop batch)
 - **In-house end-to-end harness (`test/e2e.zig`):** a CFITSIO `testprog.c`-equivalent that builds a
   maximal multi-HDU file exercising every `BITPIX`/`TFORM`, all four tile codecs, VLA, WCS,
   `CONTINUE`/`HIERARCH`, and checksums, then reopens and asserts — plus a deterministic
@@ -95,17 +94,6 @@ suite exercised none of these paths; `bindings/python/tests/test_bugfixes.py` no
 - **`interop` CI job (`X-XVAL`/`X-INTEROP`/`X-CONF`):** opens every zigfitsio-written file with
   CFITSIO `funpack`, Astropy, and `fitsverify` (`tools/emit_fixtures.zig`, `zig build
   emit-fixtures`); path-gated and toolchain-isolated from the hermetic matrix.
-
-### Fixed (interop bugs caught by the golden corpus)
-- **`PLIO_1` was not CFITSIO-interoperable in either direction:** the codec omitted the IRAF/CFITSIO
-  7-word line-list header and stored `COMPRESSED_DATA` as `1PB` instead of `1PI`. Both fixed —
-  zigfitsio now reads genuine CFITSIO PLIO tiles and writes tiles `funpack`/Astropy decode to the
-  exact pixels.
-- **`checksum_on_close` was a silent no-op:** the `flush` hook was declared but never registered, so
-  no `DATASUM`/`CHECKSUM` was written. Now wired (`src/fits.zig` reserves the cards at HDU-build
-  time; `src/checksum.zig` registers `updateAll`).
-
-### Added (language bindings batch)
 - **C-ABI shim (`bindings/capi/`, `zig build capi`):** a dynamic library `zigfitsio_capi`
   exporting `zf_*` symbols over the public Zig module. The comptime-generic API is monomorphized
   behind runtime datatype codes; Zig errors map to CFITSIO-compatible status ints via
@@ -122,6 +110,27 @@ suite exercised none of these paths; `bindings/python/tests/test_bugfixes.py` no
   celestial WCS. Includes a pytest suite (low + high level, **Astropy cross-checks both
   directions**, and the committed golden corpus), packaging (`pyproject.toml` + a hatch build hook
   that compiles and bundles the shared library), and a cibuildwheel matrix workflow.
+
+### Fixed
+- **FITS-conformance correctness pass:** ASCII-table fields now space-fill (not NUL/zero) per
+  `FR-IO-2`; the `CONTINUE`/`HIERARCH`/complex-value header API is wired through
+  `getLongString`/`appendLongString`/`getHierarch`/`getComplex`; float-exponent formatting
+  follows §4.2.4 and FORTRAN-real parsing accepts `D`/`E` exponents; `TDISP` `EN`/`ES`/`G`
+  rendering; `copyHdu` rolls back cleanly on partial failure; write-path keyword-order
+  validation; WCS `CAR`/`LATPOLE` pole rotation corrected; `MJDREF` precedence + a time-keyword
+  writer and completeness fixes; image-section streaming; `TDIM` string arrays; heap-bounds
+  hardening; and grouping-table fixes.
+- **Standard-wire-format codec rewrites:** `PLIO_1` now follows the FITS Table 38 instruction
+  set and `HCOMPRESS_1` the White-1992 quadtree wire format; tiled `ZBLANK`, transparent
+  compressed-image reads (`ImageView.of`), and the write-side codec wiring are all in place.
+- **Iterator** null substitution.
+- **`PLIO_1` was not CFITSIO-interoperable in either direction:** the codec omitted the IRAF/CFITSIO
+  7-word line-list header and stored `COMPRESSED_DATA` as `1PB` instead of `1PI`. Both fixed —
+  zigfitsio now reads genuine CFITSIO PLIO tiles and writes tiles `funpack`/Astropy decode to the
+  exact pixels (caught by the golden corpus).
+- **`checksum_on_close` was a silent no-op:** the `flush` hook was declared but never registered, so
+  no `DATASUM`/`CHECKSUM` was written. Now wired (`src/fits.zig` reserves the cards at HDU-build
+  time; `src/checksum.zig` registers `updateAll`).
 
 ### Notes
 - The HTTP(S) range-GET backend (`RMT-2`) is **done**.

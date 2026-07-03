@@ -16,6 +16,15 @@ on:
     # week of PRs could pass with a silently-broken interop leg).
     - cron: "0 6 * * 1" # Monday 06:00 UTC
 
+permissions:
+  contents: read
+
+# Cancel superseded PR runs only. The group includes event_name so the weekly `schedule`
+# run (whose ref is also refs/heads/main) never shares a group with main-push runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   ZIG_VERSION: "0.16.0"
 

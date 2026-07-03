@@ -1,8 +1,15 @@
-name: Python wheels
+name: Python wheels & release
 
 # Build the Python bindings: cross-platform binary wheels (cibuildwheel) plus an sdist.
 # Linux wheels compile Zig inside the manylinux container via `bindings/python/ci/install_zig.sh`;
 # macOS/Windows wheels use the host Zig installed by setup-zig.
+#
+# Release automation (CD, see RELEASING.md): pushing a tag `vX.Y.Z` additionally gates on
+# version consistency + the core Zig suite, publishes wheels + sdist to PyPI via trusted
+# publishing (OIDC), then creates a GitHub Release with the CHANGELOG section as notes and
+# the artifacts attached. PyPI trusted publishing is bound to THIS FILENAME
+# (python-wheels.yml) — renaming the file or the repo breaks publishing until the publisher
+# config on PyPI is updated.
 
 on:
   push:
@@ -18,11 +25,77 @@ on:
       - "hatch_build.py"
       - ".github/workflows/python-wheels.yml"
   workflow_dispatch:
+    inputs:
+      publish_testpypi:
+        description: "Publish the built wheels + sdist to TestPyPI (OIDC rehearsal)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs only; never cancel tag/main/dispatch runs (a cancelled
+# half-published release run is worse than a wasted one).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   ZIG_VERSION: "0.16.0"
 
 jobs:
+  # Release gate: the version literal lives in four places (build.zig.zon, src/version.zig
+  # value + test literal, pyproject.toml). Internal consistency is checked on every run so
+  # drift is caught in PRs; tag runs additionally require tag == version and a matching
+  # CHANGELOG section (which github-release extracts), failing fast before anything publishes.
+  version-check:
+    name: version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions agree across build.zig.zon / src/version.zig / pyproject.toml
+        run: |
+          set -euo pipefail
+          zon="$(grep -Eo '\.version = "[^"]+"' build.zig.zon | cut -d'"' -f2)"
+          zig="$(grep -Eo 'version_string = "[^"]+"' src/version.zig | cut -d'"' -f2)"
+          # tomllib needs Python >=3.11 (true on any ubuntu-latest runner); the grep arm
+          # keeps the script runnable locally on older interpreters.
+          py="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null ||
+            grep -Eo '^version *= *"[^"]+"' pyproject.toml | head -n1 | cut -d'"' -f2)"
+          echo "build.zig.zon=$zon  src/version.zig=$zig  pyproject.toml=$py"
+          if [ "$zon" != "$zig" ] || [ "$zon" != "$py" ]; then
+            echo "::error::version mismatch: build.zig.zon=$zon src/version.zig=$zig pyproject.toml=$py"
+            exit 1
+          fi
+          if ! grep -qF "expectEqualStrings(\"$zon\"" src/version.zig; then
+            echo "::error::the version unit test in src/version.zig still asserts an old literal"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tagv="${GITHUB_REF_NAME#v}"
+            if [ "$tagv" != "$zon" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match project version $zon"
+              exit 1
+            fi
+            if ! grep -qE "^## \[${tagv//./\\.}\]" CHANGELOG.md; then
+              echo "::error::CHANGELOG.md has no '## [$tagv]' section (needed for release notes)"
+              exit 1
+            fi
+          fi
+
+  # Tag pushes do not trigger ci.yml (its full matrix already ran on the same commit's main
+  # push); this single cell gates publishing on the core Zig suite.
+  zig-test:
+    name: zig build test (release gate)
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test --summary all
+
   wheels:
     name: wheels ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -36,13 +109,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: ${{ env.ZIG_VERSION }}
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.21.3
+        env:
+          # Forward the pin to install_zig.sh inside the manylinux container.
+          CIBW_ENVIRONMENT_PASS_LINUX: ZIG_VERSION
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
+          # v4 artifacts are immutable within a run; without this, "Re-run all jobs" (the
+          # recovery path for a failed release) dies on the name conflict.
+          overwrite: true
 
   sdist:
     name: sdist
@@ -58,6 +137,7 @@ jobs:
         with:
           name: sdist
           path: dist/*.tar.gz
+          overwrite: true
 
   # Fast non-matrix smoke test: build the lib + run the suite on a single host (mirrors the
   # local dev flow), so PRs get quick Python feedback without waiting on the full wheel matrix.
@@ -68,7 +148,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: ${{ env.ZIG_VERSION }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -79,3 +159,83 @@ jobs:
         env:
           PYTHONPATH: bindings/python/src
           ZIGFITSIO_LIBRARY: ${{ github.workspace }}/zig-out/lib/libzigfitsio_capi.so
+
+  # OIDC/plumbing rehearsal lane: manually dispatched, publishes to TestPyPI (a separate index
+  # with its own independently configured trusted publisher). Exists to prove the OIDC
+  # handshake + artifact merge before the first real PyPI publish.
+  publish-testpypi:
+    name: publish to TestPyPI (rehearsal)
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_testpypi
+    needs: [version-check, zig-test, wheels, sdist, smoke]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/zigfitsio
+    permissions:
+      id-token: write # OIDC trusted publishing; no API token anywhere
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # flatten wheels-* + sdist into dist/
+      - run: ls -l dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # TestPyPI files are immutable too; re-running the rehearsal for an
+          # already-uploaded version should no-op (it still proves the OIDC handshake).
+          skip-existing: true
+
+  publish-pypi:
+    name: publish to PyPI
+    # Strictly tag pushes: a workflow_dispatch run pointed at a tag ref must NOT publish here.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version-check, zig-test, wheels, sdist, smoke]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/zigfitsio
+    permissions:
+      id-token: write # OIDC trusted publishing; no API token anywhere
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # flatten wheels-* + sdist into dist/
+      - run: ls -l dist/
+      # No skip-existing: a duplicate upload to PyPI should fail loudly.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [publish-pypi] # announce only after the package is actually installable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract the CHANGELOG section for ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          # Print the body between '## [<ver>]' and the next '## [' heading (string match,
+          # not regex; the heading lines themselves are excluded).
+          awk -v ver="$ver" '
+            /^## \[/ { inblock = index($0, "## [" ver "]") == 1; next }
+            inblock { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::extracted CHANGELOG section for $ver is empty"
+            exit 1
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: true # appended after the CHANGELOG excerpt
+          files: dist/*
+          fail_on_unmatched_files: true
