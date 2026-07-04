@@ -1,9 +1,9 @@
 # Caveats & Known Limitations
 
 Honest caveats for the FITS-conformance hardening work (originally delivered on branch
-`finish-fits-conformance`, since merged). The library builds clean and passes **537/537 Zig
-tests** (plus 110 Python binding tests), `zig build wasm-check`, `zig build fuzz`, and
-`zig build bench`, with **zero `@cImport`** (pure Zig std, `GC-1`/`GC-2`).
+`finish-fits-conformance`, since merged). The library builds clean and passes **539/539 Zig
+tests** (including the C-ABI suite; plus 110 Python binding tests), `zig build wasm-check`,
+`zig build fuzz`, and `zig build bench`, with **zero `@cImport`** (pure Zig std, `GC-1`/`GC-2`).
 
 The cross-tool interoperability previously listed here as *unconfirmed* is now **verified
 against CFITSIO 4.6.4 + Astropy** (§1); the genuinely-remaining limits are stated plainly below.
@@ -59,6 +59,12 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   HCOMPRESS via quantization/dithering (CFITSIO can) remains unsupported on the write path —
   `error.UnsupportedCodec`, never a silent mis-write. (Float images compress via GZIP with
   `SUBTRACTIVE_DITHER_1/2` as before.)
+- **Explicit HCOMPRESS tile shapes are more permissive than CFITSIO's author.** CFITSIO's
+  `imcomp_init_table` rejects HCOMPRESS tiles/images with any dimension under 4 pixels;
+  zigfitsio deliberately accepts them (the repo's own fixtures use 4×3 tiles, and every tested
+  decoder — zigfitsio, CFITSIO/funpack — reads them exactly). The *default* tiling follows
+  CFITSIO's row-block rule, so this only applies to explicit `tile=` choices; note Astropy
+  refuses HCOMPRESS tiles that squeeze to one dimension (e.g. `{N, 1}`).
 
 ## 2. Delivery status — unmerged branch (point-in-time)
 

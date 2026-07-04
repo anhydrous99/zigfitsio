@@ -20,7 +20,14 @@ def _funpack_pixels(src, fmt, count):
     out = os.path.join(tempfile.mkdtemp(), "u.fits")
     subprocess.run(["funpack", "-O", out, src], check=True)
     raw = open(out, "rb").read()
-    off = ((raw.rfind(b"END     ") // 2880) + 1) * 2880  # data after the last END card
+    # Data start after the last END card. A real END card sits at an 80-byte-aligned offset;
+    # requiring that keeps a chance byte pattern inside binary data from being mistaken for it.
+    idx = raw.rfind(b"END     ")
+    while idx >= 0 and idx % 80 != 0:
+        idx = raw.rfind(b"END     ", 0, idx)
+    if idx < 0:
+        raise AssertionError("no aligned END card found in %s" % out)
+    off = ((idx // 2880) + 1) * 2880
     width = struct.calcsize(fmt)
     return struct.unpack(">%d%s" % (count, fmt), raw[off:off + count * width])
 

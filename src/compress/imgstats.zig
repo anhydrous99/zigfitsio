@@ -247,8 +247,9 @@ test "noiseEstimates: single 9-pixel row, hand-computed" {
 test "noiseEstimates: CFITSIO 4.6.4 bit-exact reference vectors" {
     const alloc = testing.allocator;
     // Expected f64 bit patterns produced by CFITSIO 4.6.4 `fits_img_stats_int` over the exact
-    // same inputs (authored with a local parity harness against the Homebrew cfitsio 4.6.4
-    // dylib; 12 shape/pattern cases were verified bit-exact — these two are committed).
+    // same inputs. These two committed vectors are the in-repo bit-exactness evidence; they
+    // were authored with a local (uncommitted) parity harness against the Homebrew cfitsio
+    // 4.6.4 dylib, which also checked ten further shape/pattern cases at authoring time.
 
     // (a) 16×16 repetitive pattern with constant runs (v[c] = 100 if c%5==0 else 7): exercises
     //     the constant-background skip AND the nvals/nvals2 quirk (noise3 median is exactly 0).

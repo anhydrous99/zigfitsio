@@ -993,7 +993,13 @@ pub const CompressSpec = struct {
     bitpix: i64,
     /// `ZNAXISn` (most-rapidly-varying first); must be non-empty with non-zero extents.
     axes: []const u64,
-    /// `ZTILEn`. `null` selects the default row-strip tiling (full first axis, 1 elsewhere).
+    /// `ZTILEn`. `null` selects the default tiling: row strips (full first axis, 1 elsewhere),
+    /// except HCOMPRESS_1, which uses CFITSIO's 2-D row-block rule (see `writeCompressed`).
+    /// Deliberate divergence for EXPLICIT tiles: CFITSIO's author additionally rejects
+    /// HCOMPRESS tiles/images with a dimension under 4 pixels (`imcomp_init_table`); zigfitsio
+    /// accepts them (they encode/decode correctly here and in CFITSIO/funpack — the *decoders*
+    /// take any dims), but be aware such files sit outside CFITSIO's authoring envelope, and
+    /// Astropy refuses HCOMPRESS tiles that squeeze to one dimension (e.g. `{N, 1}`).
     tile: ?[]const u64 = null,
     /// `ZCMPTYPE`. The write path implements `GZIP_1`/`GZIP_2` (any BITPIX), and `RICE_1`/`PLIO_1`/
     /// `HCOMPRESS_1` for integer 8/16/32-bit images (HCOMPRESS additionally requires `ZNAXIS ≥ 2`);
