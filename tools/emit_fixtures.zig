@@ -35,11 +35,12 @@ pub fn main(init: std.process.Init) !void {
     try emitCompressed(alloc, outdir, "compress_plio.fits", .plio_1);
     try emitCompressed(alloc, outdir, "compress_hcompress.fits", .hcompress_1);
     try emitLossyHcompress(alloc, outdir);
+    try emitQuantizedFloat(alloc, outdir);
     try emitChecksumImage(alloc, outdir, "image_checksum.fits");
     try emitBinTable(alloc, outdir, "bintable.fits");
     try emitAsciiTable(alloc, outdir, "ascii.fits");
 
-    std.debug.print("emit-fixtures: wrote 13 files to {s}\n", .{outdir});
+    std.debug.print("emit-fixtures: wrote 19 files to {s}\n", .{outdir});
 }
 
 fn joinPath(alloc: Allocator, outdir: []const u8, name: []const u8) ![]u8 {
@@ -116,6 +117,70 @@ fn emitLossyOne(alloc: Allocator, outdir: []const u8, base: []const u8, pixels: 
     try ti.readAll(i32, &out);
     var raw: [1024 * 4]u8 = undefined;
     for (out, 0..) |v, i| std.mem.writeInt(i32, raw[i * 4 ..][0..4], v, .little);
+
+    const pix_path = try std.fmt.allocPrint(alloc, "{s}/{s}.pix", .{ outdir, base });
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var pf = try std.Io.Dir.cwd().createFile(io, pix_path, .{});
+    defer pf.close(io);
+    try pf.writePositionalAll(io, &raw, 0);
+}
+
+// ── Quantized-float outbound trio: dithered HCOMPRESS/RICE + NO_DITHER HCOMPRESS ──────────────
+//
+// f32 pixels quantized with the CFITSIO fits_quantize parity port (compress/quantize.zig,
+// q = 4 default) and compressed through the integer codecs. Each `.fits` is paired with a raw
+// little-endian-f32 `.pix` sidecar holding zigfitsio's OWN dequantized decode; check_funpack.py
+// asserts CFITSIO `funpack` reproduces the sidecar to the exact f32 bit pattern (outbound
+// quantized-float parity: two independent decoders agree on zigfitsio-authored bytes).
+
+fn emitQuantizedFloat(alloc: Allocator, outdir: []const u8) !void {
+    // The same all-positive LCG noise+gradient family as the inbound goldens (all-positive so
+    // no near-zero reconstruction sits on an FP-contraction knife edge — see the golden
+    // generator's note; CFITSIO's own builds disagree on those bits).
+    var field: [1024]f32 = undefined;
+    var state: u32 = 12345;
+    for (&field, 0..) |*v, i| {
+        state = state *% 1664525 +% 1013904223;
+        const u = @as(f64, @floatFromInt(state >> 8)) / 16777216.0;
+        const r: f64 = @floatFromInt(i / 32);
+        const c: f64 = @floatFromInt(i % 32);
+        v.* = @floatCast(10.0 + (r + c) * 0.5 + (u - 0.5) * 8.0);
+    }
+
+    try emitQuantizedOne(alloc, outdir, "compress_hcompress_fdith", &field, .hcompress_1, .subtractive_dither_1);
+    try emitQuantizedOne(alloc, outdir, "compress_rice_fdith", &field, .rice_1, .subtractive_dither_1);
+    try emitQuantizedOne(alloc, outdir, "compress_hcompress_fq0", &field, .hcompress_1, .no_dither);
+}
+
+fn emitQuantizedOne(
+    alloc: Allocator,
+    outdir: []const u8,
+    base: []const u8,
+    pixels: *const [1024]f32,
+    codec: Codec,
+    method: @FieldType(fits.CompressSpec, "quantize"),
+) !void {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}.fits", .{ outdir, base });
+    var f = try fits.createFile(alloc, path, .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // empty primary (fpack layout)
+    const hdu = try fits.writeCompressed(f32, &f, .{
+        .bitpix = -32,
+        .axes = &.{ 32, 32 }, // default tiling: HCOMPRESS row blocks (32×16), RICE row strips
+        .codec = codec,
+        .quantize = method,
+        .zdither0 = 1,
+    }, pixels);
+    try f.flush();
+
+    // Sidecar: zigfitsio's own dequantized decode — the funpack parity expectation.
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    var out: [1024]f32 = undefined;
+    try ti.readAll(f32, &out);
+    var raw: [1024 * 4]u8 = undefined;
+    for (out, 0..) |v, i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], @bitCast(v), .little);
 
     const pix_path = try std.fmt.allocPrint(alloc, "{s}/{s}.pix", .{ outdir, base });
     var threaded: std.Io.Threaded = .init_single_threaded;

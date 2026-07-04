@@ -312,6 +312,7 @@ _PROTOS = [
     # compression
     ("zf_write_compressed", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, VOID, LL]),
     ("zf_write_compressed2", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, FLT, INT, VOID, LL]),
+    ("zf_write_compressed3", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, FLT, INT, FLT, INT, VOID, LL]),
 ]
 
 

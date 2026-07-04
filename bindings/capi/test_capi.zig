@@ -240,6 +240,37 @@ test "zf_write_compressed2: lossy HCOMPRESS knobs cross the ABI (arg order, ZVAL
     try testing.expect(capi.zf_write_compressed2(hh, I32, 32, 2, &axes, &tile, "RICE_1", null, 1, -4.0, 0, &curved, 256) != 0);
 }
 
+test "zf_write_compressed3: quantized-float write crosses the ABI (level plumbed, gates fail loud)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null)); // primary
+
+    // A positive noisy field; absolute step 0.25 so the round-trip bound is deterministic.
+    var pix: [256]f32 = undefined;
+    var state: u32 = 999;
+    for (&pix, 0..) |*v, i| {
+        state = state *% 1664525 +% 1013904223;
+        v.* = 10.0 + @as(f32, @floatFromInt(i % 16)) + @as(f32, @floatFromInt(state >> 24)) / 64.0;
+    }
+    const axes = [_]c_long{ 16, 16 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_compressed3(hh, F32, -32, 2, &axes, null, "HCOMPRESS_1", "SUBTRACTIVE_DITHER_1", 1, -0.25, 1, 0.0, 0, &pix, 256));
+
+    // Transparent decode: |err| bounded by the absolute step / 2.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(hh, 2));
+    var out: [256]f32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, F32, 1, 256, null, null, &out));
+    for (pix, out) |o, g| try testing.expect(@abs(o - g) <= 0.125 + 1e-5);
+
+    // A set quantize_level on a non-quantizing write is an error status, never silent.
+    var ints: [256]i32 = undefined;
+    for (&ints, 0..) |*v, i| v.* = @intCast(i);
+    try testing.expect(capi.zf_write_compressed3(hh, I32, 32, 2, &axes, null, "RICE_1", null, 1, 4.0, 1, 0.0, 0, &ints, 256) != 0);
+    // has_quantize_level = 0 leaves the level unset: the same integer write succeeds.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_compressed3(hh, I32, 32, 2, &axes, null, "RICE_1", null, 1, 0.0, 0, 0.0, 0, &ints, 256));
+}
+
 test "checksum write + verify, and validation pass" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

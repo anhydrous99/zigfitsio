@@ -77,6 +77,24 @@ def main(d):
         if not ok:
             fails += 1
 
+    # Quantized-float trio (dithered HCOMPRESS/RICE, NO_DITHER HCOMPRESS over a 32x32 f32
+    # field): funpack's dequantized decode must equal zigfitsio's own decode (the .pix sidecar)
+    # to the exact f32 BIT pattern — compared as u32 so the assert is bitwise, not tolerant.
+    for name in ("hcompress_fdith", "rice_fdith", "hcompress_fq0"):
+        src = os.path.join(d, "compress_%s.fits" % name)
+        pix = os.path.join(d, "compress_%s.pix" % name)
+        if not (os.path.exists(src) and os.path.exists(pix)):
+            print("skip: %s absent" % src)
+            continue
+        vals = _funpack_pixels(src, "I", 1024)  # raw f32 bit patterns, big-endian in the file
+        want = struct.unpack("<1024I", open(pix, "rb").read())
+        ok = vals == want
+        print(("ok:   " if ok else "FAIL: ") + "funpack %s == zigfitsio decode (f32 bit-exact)" % name)
+        if not ok:
+            fails += 1
+            bad = [i for i, (a, b) in enumerate(zip(vals, want)) if a != b][:5]
+            print("  first mismatches at %s" % bad, file=sys.stderr)
+
     print("check_funpack: %d failure(s)" % fails)
     return 1 if fails else 0
 

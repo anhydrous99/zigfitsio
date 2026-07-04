@@ -241,6 +241,40 @@ def test_compimage_hcompress_lossy_kwargs(tmp_fits):
     assert not np.array_equal(plain, smooth)
 
 
+@pytest.mark.parametrize("codec,quantize", [
+    ("HCOMPRESS_1", "SUBTRACTIVE_DITHER_1"),
+    ("HCOMPRESS_1", "NO_DITHER"),
+    ("RICE_1", "SUBTRACTIVE_DITHER_1"),
+])
+def test_compimage_quantized_float_roundtrip(tmp_fits, codec, quantize):
+    """Quantized-float writes through the integer codecs (CFITSIO fits_quantize parity)."""
+    rng = np.random.default_rng(42)
+    field = (10.0 + np.mgrid[0:32, 0:32].sum(axis=0) * 0.5 + rng.random((32, 32)) * 8.0).astype("f4")
+    p = tmp_fits()
+    zf.HDUList([
+        zf.PrimaryHDU(),
+        zf.CompImageHDU(field, compression=codec, quantize=quantize, quantize_level=-0.25),
+    ]).writeto(p, overwrite=True)
+    with zf.open(p) as hdul:
+        hdr = hdul[1].header
+        assert str(hdr["ZQUANTIZ"]).strip() == quantize
+        # ZDITHER0 accompanies only the dithered methods.
+        assert (hdr.get("ZDITHER0") is not None) == (quantize != "NO_DITHER")
+        out = hdul[1].data
+        assert out.dtype.kind == "f"
+        # Absolute step 0.25 ⇒ |err| ≤ 0.125 (+ f32 rounding slack).
+        assert np.abs(out.astype("f8") - field.astype("f8")).max() <= 0.125 + 1e-5
+
+
+def test_compimage_quantize_level_rejected_without_quantization(tmp_fits):
+    """quantize_level must never be silently ignored on a non-quantizing write."""
+    ramp = np.arange(256, dtype="i4").reshape(16, 16)
+    with pytest.raises(zf.FitsError):
+        zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(ramp, compression="RICE_1", quantize_level=4.0)]).writeto(
+            tmp_fits("bad_qlevel.fits"), overwrite=True
+        )
+
+
 def test_compimage_lossy_reemit_preserves_request(tmp_fits):
     """writeto() of a scanned lossy HCOMPRESS image keeps its SCALE/SMOOTH request."""
     r, c = np.mgrid[0:32, 0:32].astype("i4")

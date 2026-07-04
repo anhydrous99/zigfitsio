@@ -229,6 +229,18 @@ int  zf_write_compressed2(ZfFits* h, int dtype, int bitpix, int naxis, const lon
                           long long zdither0, float hcomp_scale, int hcomp_smooth,
                           const void* pixels, long long nelem);
 
+/* zf_write_compressed2 plus the CFITSIO quantization level (fits_set_quantize_level /
+ * fpack -q semantics) for float images with a quantizing method ("NO_DITHER",
+ * "SUBTRACTIVE_DITHER_1", "SUBTRACTIVE_DITHER_2"): quantize_level > 0 sets the per-tile step
+ * to sigma/level (sigma = MAD background noise), 0 the CFITSIO default (sigma/4), < 0 the
+ * absolute step |level|. Pass has_quantize_level = 0 to leave the level unset (library
+ * default). A set level with a non-quantizing write is an error (never silently ignored). */
+int  zf_write_compressed3(ZfFits* h, int dtype, int bitpix, int naxis, const long* axes,
+                          const long* tile, const char* codec, const char* quantize,
+                          long long zdither0, float quantize_level, int has_quantize_level,
+                          float hcomp_scale, int hcomp_smooth,
+                          const void* pixels, long long nelem);
+
 #ifdef __cplusplus
 }
 #endif

@@ -48,6 +48,25 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   pixels zigfitsio itself decodes (`check_funpack.py`).
 - `DATASUM` recomputes to a CFITSIO-authored golden vector (`X-SUM`).
 - WCS TAN `pixel→world` agrees with Astropy reference points within tolerance.
+- **Quantized-float writes through the integer codecs are CFITSIO-parity** (closing the former
+  "HCOMPRESS write is integer-only" limit): float images (BITPIX −32/−64) compress with
+  `HCOMPRESS_1`/`RICE_1` under `NO_DITHER`/`SUBTRACTIVE_DITHER_1`/`_2` via an exact port of
+  CFITSIO 4.6.4 `fits_quantize_float`/`_double` (`src/compress/quantize.zig`: `FnNoise5`
+  MAD-based `sigma/q` steps, absolute steps, the `iqfactor` ZZERO fudge, `NINT` rounding, the
+  §10.2 dither draws, and the raw-float `GZIP_COMPRESSED_DATA` fallback for unquantizable
+  tiles), pinned **bit-exact against the real CFITSIO dylib** on committed reference vectors
+  (`bscale`/`bzero` f64 bits + every stored integer, six cases). `funpack`, Astropy, and
+  fitsverify all read zigfitsio's quantized-float output; funpack/Astropy reproduce zigfitsio's
+  own dequantized decode to the exact f32 bit pattern (`check_funpack.py`). The
+  `CompressSpec.quantize_level` knob follows `fpack -q` semantics (`zf_write_compressed3` /
+  Python `CompImageHDU(quantize_level=…)`). Deliberate fail-loud divergences, conforming files
+  unaffected: HCOMPRESS + `SUBTRACTIVE_DITHER_2` errors (CFITSIO silently coerces to
+  `DITHER_1`); float + integer codec *without* quantization errors (CFITSIO silently truncates
+  floats to ints); PLIO + floats errors up front (its 0..2²⁴ range cannot hold the quantizer's
+  output; CFITSIO fails per tile at runtime); a ±Inf tile is stored losslessly (CFITSIO's
+  quantizer has no Inf guard and stores garbage). The pre-existing dithered-GZIP path keeps
+  its legacy `(max−min)/100000` scheme when `quantize_level` is unset, so existing callers'
+  bytes are unchanged — set `quantize_level` for CFITSIO-parity quantization there.
 
 **Genuinely-remaining limits:**
 
@@ -55,10 +74,6 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   **4.6.4** (the version the committed bytes were authored with); it runs *informationally* so a
   distro CFITSIO version skew cannot red the build — the *semantic* interop checks (funpack
   decodes to the exact pixels; Astropy opens every file) are the authoritative gate.
-- **`HCOMPRESS_1` write is integer-only** (BITPIX 8/16/32): compressing a *float* image with
-  HCOMPRESS via quantization/dithering (CFITSIO can) remains unsupported on the write path —
-  `error.UnsupportedCodec`, never a silent mis-write. (Float images compress via GZIP with
-  `SUBTRACTIVE_DITHER_1/2` as before.)
 - **Explicit HCOMPRESS tile shapes are more permissive than CFITSIO's author.** CFITSIO's
   `imcomp_init_table` rejects HCOMPRESS tiles/images with any dimension under 4 pixels;
   zigfitsio deliberately accepts them (the repo's own fixtures use 4×3 tiles, and every tested
