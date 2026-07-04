@@ -74,6 +74,77 @@ static void gen_ramp_i16(const char *root, const char *rel) {
     fits_close_file(f, &status);                  check(status, "ramp_i16 close");
 }
 
+/* ── 32x32 curved surface (pixel[r*32+c] = r*r + 2*c*c + r*c) for the LOSSY hcompress goldens.
+ * A quadratic has nonzero curvature everywhere, so decode-side smoothing (hsmooth) visibly
+ * changes pixels — a pure ramp would make the SMOOTH golden vacuous. Values max 3844 (i16-safe).
+ * The committed expectations are the funpack-decoded pixel files (not a formula). */
+
+#define CURV_W 32
+#define CURV_H 32
+#define CURV_N (CURV_W * CURV_H)
+
+static void fill_curved(int *data) {
+    for (int r = 0; r < CURV_H; r++)
+        for (int c = 0; c < CURV_W; c++)
+            data[r * CURV_W + c] = r * r + 2 * c * c + r * c;
+}
+
+static void gen_curved_i16(const char *root, const char *rel) {
+    char path[1024];
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *f;
+    long naxes[2] = { CURV_W, CURV_H };
+    int data[CURV_N];
+    short sdata[CURV_N];
+    fill_curved(data);
+    for (int i = 0; i < CURV_N; i++) sdata[i] = (short)data[i];
+    fits_create_file(&f, path, &status);          check(status, "curved_i16 create");
+    fits_create_img(f, SHORT_IMG, 2, naxes, &status); check(status, "curved_i16 img");
+    fits_write_img(f, TSHORT, 1, CURV_N, sdata, &status); check(status, "curved_i16 write");
+    fits_close_file(f, &status);                  check(status, "curved_i16 close");
+}
+
+static void gen_curved_i32(const char *root, const char *rel) {
+    char path[1024];
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *f;
+    long naxes[2] = { CURV_W, CURV_H };
+    int data[CURV_N];
+    fill_curved(data);
+    fits_create_file(&f, path, &status);          check(status, "curved_i32 create");
+    fits_create_img(f, LONG_IMG, 2, naxes, &status); check(status, "curved_i32 img");
+    fits_write_img(f, TINT, 1, CURV_N, data, &status); check(status, "curved_i32 write");
+    fits_close_file(f, &status);                  check(status, "curved_i32 close");
+}
+
+/* compress/tile_hcompress_lossy32.fits and compress/tile_hcompress_smooth.fits — HCOMPRESS_1
+ * with ABSOLUTE scale 16 (fits_set_hcomp_scale(-16): negative = absolute, so no data-dependent
+ * noise estimation enters the committed bytes) over the curved i32 source, 32x16 tiles. The two
+ * files differ ONLY in the recorded ZNAME2='SMOOTH'/ZVAL2 request (0 vs 1): the compressed
+ * streams are identical, so any difference between their funpack decodes is purely hsmooth —
+ * that non-vacuousness is asserted by the Zig golden consumer. fpack cannot set the smooth flag
+ * (no CLI option), hence this API-level author. */
+static void gen_hcomp_lossy(const char *root, const char *rel, int smooth) {
+    char srcpath[1024], path[1024];
+    /* plain (no '!' prefix) read path for the source authored earlier in this run */
+    snprintf(srcpath, sizeof srcpath, "%s/%s", root, "compress/src_hcompress_lossy32.fits");
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *in, *out;
+    long tiledim[2] = { CURV_W, 16 };
+    fits_open_file(&in, srcpath, READONLY, &status); check(status, "hcomp_lossy open src");
+    fits_create_file(&out, path, &status);           check(status, "hcomp_lossy create");
+    fits_set_compression_type(out, HCOMPRESS_1, &status); check(status, "hcomp_lossy ctype");
+    fits_set_tile_dim(out, 2, tiledim, &status);     check(status, "hcomp_lossy tiledim");
+    fits_set_hcomp_scale(out, -16.0f, &status);      check(status, "hcomp_lossy scale");
+    fits_set_hcomp_smooth(out, smooth, &status);     check(status, "hcomp_lossy smooth");
+    fits_img_compress(in, out, &status);             check(status, "hcomp_lossy compress");
+    fits_close_file(out, &status);                   check(status, "hcomp_lossy close out");
+    fits_close_file(in, &status);                    check(status, "hcomp_lossy close in");
+}
+
 /* ── Plain inbound images (X-INTEROP inbound) ─────────────────────────────────────────────*/
 
 /* images/img_i16.fits — 8x4 i16, value[i] = i - 8 (spans zero). */
@@ -316,6 +387,13 @@ int main(int argc, char **argv) {
     gen_ramp_i32(root, "compress/src_gzip.fits");
     gen_ramp_i32(root, "compress/src_hcompress.fits");
     gen_ramp_i16(root, "compress/src_plio.fits");
+
+    /* lossy hcompress: fpack authors the i16 SMOOTH=0 golden from this source… */
+    gen_curved_i16(root, "compress/src_hcompress_lossy16.fits");
+    /* …and the i32 SMOOTH=0/SMOOTH=1 pair is authored here (fpack has no smooth flag). */
+    gen_curved_i32(root, "compress/src_hcompress_lossy32.fits");
+    gen_hcomp_lossy(root, "compress/tile_hcompress_lossy32.fits", 0);
+    gen_hcomp_lossy(root, "compress/tile_hcompress_smooth.fits", 1);
 
     /* plain inbound */
     gen_img_i16(root);

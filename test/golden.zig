@@ -137,6 +137,70 @@ test "golden: CMP-6 HCOMPRESS_1 lossless tile decodes to ramp (fpack -h -s 0)" {
     try expectRampTile(testing.allocator, "compress/tile_hcompress.fits");
 }
 
+// ── CMP-6 lossy: CFITSIO lossy HCOMPRESS tiles must decode EXACTLY like funpack ─────────────
+//
+// Each lossy `.fz` (absolute scale 16 over a curved 32×32 surface, 32×16 tiles) is paired with
+// a committed `*_expected.fits` — funpack's own decode of those bytes, i.e. the authoritative
+// pixels. Lossy HCOMPRESS decode is deterministic integer math, so zigfitsio must reproduce
+// funpack bit-for-bit: `lossy16`/`lossy32` cover the plain (`ZVAL2 = 0`) inverse across both
+// CFITSIO decode variants (int for ZBITPIX 16, LONGLONG for 32), and `smooth` (`ZVAL2 = 1`)
+// proves decode-side hsmooth is CFITSIO-identical — not merely "close".
+
+const curv_n = 32 * 32;
+
+fn readExpectedPixels(alloc: Allocator, rel: []const u8, out: *[curv_n]i32) !void {
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1); // funpack restores the image as the primary HDU
+    try testing.expectEqualSlices(u64, &.{ 32, 32 }, hdu.axes);
+    var v = try fits.ImageView.of(&f, hdu);
+    try v.readAll(i32, out, .{});
+}
+
+fn expectLossyTile(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u8) !void {
+    var expected: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, expected_rel, &expected);
+
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{fz_rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, curv_n), ti.elementCount());
+    var out: [curv_n]i32 = undefined;
+    try ti.readAll(i32, &out);
+    try testing.expectEqualSlices(i32, &expected, &out);
+}
+
+test "golden: CMP-6 lossy HCOMPRESS_1 i16 tile decodes exactly like funpack (fpack -h -s -16)" {
+    try requireCorpus();
+    try expectLossyTile(testing.allocator, "compress/tile_hcompress_lossy16.fits", "compress/tile_hcompress_lossy16_expected.fits");
+}
+
+test "golden: CMP-6 lossy HCOMPRESS_1 i32 tile decodes exactly like funpack (scale -16, SMOOTH=0)" {
+    try requireCorpus();
+    try expectLossyTile(testing.allocator, "compress/tile_hcompress_lossy32.fits", "compress/tile_hcompress_lossy32_expected.fits");
+}
+
+test "golden: CMP-6 smoothed lossy HCOMPRESS_1 tile (ZVAL2=1) decodes exactly like funpack hsmooth" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    try expectLossyTile(alloc, "compress/tile_hcompress_smooth.fits", "compress/tile_hcompress_smooth_expected.fits");
+
+    // Non-vacuousness: the smooth file differs from the SMOOTH=0 file only in ZVAL2 (identical
+    // compressed streams), so their funpack decodes differing proves the smoothing pass — in
+    // funpack AND (via the exact-match asserts above) in zigfitsio — actually changed pixels.
+    var plain: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, "compress/tile_hcompress_lossy32_expected.fits", &plain);
+    var smoothed: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, "compress/tile_hcompress_smooth_expected.fits", &smoothed);
+    try testing.expect(!std.mem.eql(i32, &plain, &smoothed));
+}
+
 // CMP-5: a genuine CFITSIO `fpack -p` PLIO tile decodes to the exact ramp. This golden caught a
 // real interop bug — zigfitsio's PLIO codec omitted the 7-word IRAF/CFITSIO line-list header, so
 // it could neither read CFITSIO tiles nor write CFITSIO-readable ones. Fixed in

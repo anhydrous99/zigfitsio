@@ -27,11 +27,21 @@ golden: $(GEN)
 	./$(GEN) $(GOLDEN)
 	# 2. fpack each tile source with a standard codec. -C suppresses timestamped checksum cards
 	#    (determinism); -O names the output directly. fpack refuses an existing target, so clear.
-	rm -f $(CMP)/tile_rice.fits $(CMP)/tile_gzip.fits $(CMP)/tile_hcompress.fits $(CMP)/tile_plio.fits
+	rm -f $(CMP)/tile_rice.fits $(CMP)/tile_gzip.fits $(CMP)/tile_hcompress.fits $(CMP)/tile_plio.fits \
+	      $(CMP)/tile_hcompress_lossy16.fits $(CMP)/tile_hcompress_lossy16_expected.fits \
+	      $(CMP)/tile_hcompress_lossy32_expected.fits $(CMP)/tile_hcompress_smooth_expected.fits
 	fpack -C -r      -O $(CMP)/tile_rice.fits      $(CMP)/src_rice.fits
 	fpack -C -g1     -O $(CMP)/tile_gzip.fits      $(CMP)/src_gzip.fits
 	fpack -C -h -s 0 -O $(CMP)/tile_hcompress.fits $(CMP)/src_hcompress.fits
 	fpack -C -p      -O $(CMP)/tile_plio.fits      $(CMP)/src_plio.fits
+	# 2b. Lossy HCOMPRESS: fpack authors the i16 SMOOTH=0 golden (-s -16 = ABSOLUTE scale 16,
+	#     data-independent, deterministic). The i32 SMOOTH=0/1 pair was authored by the C
+	#     generator (fpack has no smooth flag). funpack (same CFITSIO) authors the expected
+	#     pixel files — the authoritative decode each consumer must reproduce EXACTLY.
+	fpack -C -h -s -16 -O $(CMP)/tile_hcompress_lossy16.fits $(CMP)/src_hcompress_lossy16.fits
+	funpack -C -O $(CMP)/tile_hcompress_lossy16_expected.fits $(CMP)/tile_hcompress_lossy16.fits
+	funpack -C -O $(CMP)/tile_hcompress_lossy32_expected.fits $(CMP)/tile_hcompress_lossy32.fits
+	funpack -C -O $(CMP)/tile_hcompress_smooth_expected.fits  $(CMP)/tile_hcompress_smooth.fits
 	# 3. The intermediate uncompressed sources are not committed — only the .fz tiles are.
 	rm -f $(CMP)/src_*.fits
 	# 4. Determinism normalizer (defensive: strips any DATE / timestamped comment a tool injects).

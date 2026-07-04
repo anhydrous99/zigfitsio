@@ -33,6 +33,30 @@ def main(root):
             data = hdul[1].data  # compressed image is the first extension
         _check(np.array_equal(data.astype(np.int64), ramp), "tile_%s ramp" % codec, state)
 
+    # Lossy HCOMPRESS (absolute scale 16; `smooth` carries ZVAL2=1): Astropy's decoder must
+    # reproduce funpack's committed expected pixels exactly — three independent decoders
+    # (CFITSIO/funpack, Astropy, zigfitsio) agreeing on the same lossy bytes.
+    for name in ("lossy16", "lossy32", "smooth"):
+        fz = os.path.join(root, "compress", "tile_hcompress_%s.fits" % name)
+        exp = os.path.join(root, "compress", "tile_hcompress_%s_expected.fits" % name)
+        with fits.open(fz) as hdul:
+            data = hdul[1].data
+        with fits.open(exp) as hdul:
+            want = hdul[0].data
+        _check(
+            np.array_equal(data.astype(np.int64), want.astype(np.int64)),
+            "tile_hcompress_%s == funpack expected" % name,
+            state,
+        )
+    with fits.open(os.path.join(root, "compress", "tile_hcompress_lossy32_expected.fits")) as h0, fits.open(
+        os.path.join(root, "compress", "tile_hcompress_smooth_expected.fits")
+    ) as h1:
+        _check(
+            not np.array_equal(h0[0].data, h1[0].data),
+            "hcompress smooth expected differs from plain (non-vacuous)",
+            state,
+        )
+
     with fits.open(os.path.join(root, "images", "img_i16.fits")) as hdul:
         d = hdul[0].data.astype(np.int64).ravel()
         _check(np.array_equal(d, np.arange(32) - 8), "img_i16 value[i]=i-8", state)
