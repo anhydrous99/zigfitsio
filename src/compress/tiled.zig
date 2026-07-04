@@ -694,7 +694,12 @@ pub const TiledImage = struct {
                 const sx = std.mem.readInt(u32, cbytes[2..][0..4], .big);
                 const sy = std.mem.readInt(u32, cbytes[6..][0..4], .big);
                 if (sx != tdim[1] or sy != tdim[0]) return error.CorruptTile;
-                const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile));
+                // `ZNAME2 = 'SMOOTH'`/`ZVAL2` (FITS 4.0 Table 39) requests decode-side
+                // coefficient smoothing (CFITSIO `hcomp_smooth`); absent or zero means none.
+                // The quantization scale itself comes from each tile's embedded stream header —
+                // `ZVAL1` (SCALE) is advisory, exactly as in CFITSIO.
+                const smooth = (self.paramNum("SMOOTH") orelse 0) != 0;
+                const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile), .{ .smooth = smooth });
                 defer alloc.free(dec.data);
                 if (dec.ny != tdim[0] or dec.nx != tdim[1]) return error.CorruptTile;
                 return i32ToBig(alloc, dec.data, w);
@@ -709,6 +714,22 @@ pub const TiledImage = struct {
             if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, p.name, " "), key)) {
                 return switch (p.value) {
                     .int => |v| v,
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    // Like `paramInt`, but also coerces a float-valued card (truncating toward zero). CFITSIO
+    // writes HCOMPRESS `ZVAL1` as a float and reads `ZVAL2` with implicit numeric conversion,
+    // so both card forms occur in the wild for numeric codec parameters.
+    fn paramNum(self: *const TiledImage, key: []const u8) ?i64 {
+        for (self.params) |p| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, p.name, " "), key)) {
+                return switch (p.value) {
+                    .int => |v| v,
+                    .float => |v| if (std.math.isFinite(v)) std.math.lossyCast(i64, @trunc(v)) else null,
                     else => null,
                 };
             }
@@ -1623,6 +1644,10 @@ const ZSpec = struct {
     zscale: ?f64 = null,
     zzero: ?f64 = null,
     zblank: ?i64 = null,
+    /// Optional `ZNAMEn` codec-parameter names (paired with `zvals`, n = 1..).
+    znames: []const []const u8 = &.{},
+    /// Optional `ZVALn` integer values (paired with `znames`).
+    zvals: []const i64 = &.{},
 };
 
 fn buildZHeader(alloc: Allocator, spec: ZSpec) !Header {
@@ -1660,6 +1685,10 @@ fn buildZHeader(alloc: Allocator, spec: ZSpec) !Header {
     if (spec.zscale) |s| try h.appendValue(alloc, "ZSCALE", .{ .float = s }, null);
     if (spec.zzero) |z| try h.appendValue(alloc, "ZZERO", .{ .float = z }, null);
     if (spec.zblank) |b| try h.appendValue(alloc, "ZBLANK", .{ .int = b }, null);
+    for (spec.znames, spec.zvals, 1..) |name, val, idx| {
+        try h.appendValue(alloc, std.fmt.bufPrint(&nb, "ZNAME{d}", .{idx}) catch unreachable, .{ .string = name }, null);
+        try h.appendValue(alloc, std.fmt.bufPrint(&nb, "ZVAL{d}", .{idx}) catch unreachable, .{ .int = val }, null);
+    }
     try h.ensureEnd(alloc);
     return h;
 }
@@ -2238,6 +2267,91 @@ test "HCOMPRESS_1 tile produced by the codec decodes via TiledImage" {
     var out: [12]i32 = undefined;
     try ti.readAll(i32, &out);
     try testing.expectEqualSlices(i32, &vals, &out);
+}
+
+test "HCOMPRESS_1 lossy tile: ZNAME2='SMOOTH'/ZVAL2 drives decode-side hsmooth" {
+    const alloc = testing.allocator;
+
+    // A curved 16×16 surface, lossy scale 16 — a stream where smoothing visibly changes pixels.
+    const nx = 16; // rows
+    const ny = 16; // cols (fastest)
+    var vals: [nx * ny]i32 = undefined;
+    for (0..nx) |r| {
+        for (0..ny) |c| vals[r * ny + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    const enc = try hcompress.compress(alloc, &vals, nx, ny, 16);
+    defer alloc.free(enc);
+
+    // Codec-level references for both decode modes.
+    const plain = try hcompress.decompress(alloc, enc, nx * ny, .{});
+    defer alloc.free(plain.data);
+    const smoothed = try hcompress.decompress(alloc, enc, nx * ny, .{ .smooth = true });
+    defer alloc.free(smoothed.data);
+    try testing.expect(!std.mem.eql(i32, plain.data, smoothed.data)); // non-vacuous fixture
+
+    // ZVAL2 = 1 → the container decode must produce the SMOOTHED pixels…
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeRawTileCell(alloc, &fx, .{
+            .ztype = "HCOMPRESS_1",
+            .zbitpix = 32,
+            .znaxisn = &.{ ny, nx },
+            .ztilen = &.{ ny, nx },
+            .nrows = 1,
+            .pcount = 4096,
+            .tforms = &.{"1PB"},
+            .ttypes = &.{"COMPRESSED_DATA"},
+            .znames = &.{ "SCALE", "SMOOTH" },
+            .zvals = &.{ 16, 1 },
+        }, enc);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [nx * ny]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, smoothed.data, &out);
+    }
+    // …ZVAL2 = 0 (and the absent-param default) must produce the PLAIN pixels.
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeRawTileCell(alloc, &fx, .{
+            .ztype = "HCOMPRESS_1",
+            .zbitpix = 32,
+            .znaxisn = &.{ ny, nx },
+            .ztilen = &.{ ny, nx },
+            .nrows = 1,
+            .pcount = 4096,
+            .tforms = &.{"1PB"},
+            .ttypes = &.{"COMPRESSED_DATA"},
+            .znames = &.{ "SCALE", "SMOOTH" },
+            .zvals = &.{ 16, 0 },
+        }, enc);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [nx * ny]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, plain.data, &out);
+    }
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeRawTileCell(alloc, &fx, .{
+            .ztype = "HCOMPRESS_1",
+            .zbitpix = 32,
+            .znaxisn = &.{ ny, nx },
+            .ztilen = &.{ ny, nx },
+            .nrows = 1,
+            .pcount = 4096,
+            .tforms = &.{"1PB"},
+            .ttypes = &.{"COMPRESSED_DATA"},
+        }, enc);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [nx * ny]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, plain.data, &out);
+    }
 }
 
 test "HCOMPRESS_1 tile with forged oversized nx/ny is CorruptTile, not an unbounded allocation" {
