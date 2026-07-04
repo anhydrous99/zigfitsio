@@ -221,10 +221,12 @@ test "zf_write_compressed2: lossy HCOMPRESS knobs cross the ABI (arg order, ZVAL
     const k1 = "ZVAL1";
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_dbl(hh, k1, k1.len, &zval1));
     try testing.expectEqual(@as(f64, -16.0), zval1);
-    var zval2: c_long = 0;
+    // `zf_read_key_lng` takes a `*c_longlong`; on Windows (LLP64) `c_long` is 32-bit, so a
+    // `*c_long` here is a genuine pointer-type mismatch that fails to compile. Match the ABI type.
+    var zval2: c_longlong = 0;
     const k2 = "ZVAL2";
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(hh, k2, k2.len, &zval2));
-    try testing.expectEqual(@as(c_long, 1), zval2);
+    try testing.expectEqual(@as(c_longlong, 1), zval2);
 
     // Transparent decode: genuinely lossy, but within the scale-16 quantization bound.
     var out: [256]i32 = undefined;
