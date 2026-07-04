@@ -699,6 +699,11 @@ pub const TiledImage = struct {
                 // coefficient smoothing (CFITSIO `hcomp_smooth`); absent or zero means none.
                 // The quantization scale itself comes from each tile's embedded stream header —
                 // `ZVAL1` (SCALE) is advisory, exactly as in CFITSIO.
+                // Deliberate divergence: the flag is looked up by NAME ('SMOOTH', any n), while
+                // CFITSIO reads ZVAL2 positionally regardless of what ZNAME2 says. Identical on
+                // every conforming file (CFITSIO always writes ZNAME2='SMOOTH'); on a
+                // hand-crafted header with a mislabeled ZNAME2, honoring the declared name is
+                // the safer reading.
                 const smooth = (self.paramNum("SMOOTH") orelse 0) != 0;
                 const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile), .{ .smooth = smooth });
                 defer alloc.free(dec.data);
@@ -1433,6 +1438,12 @@ fn encodeRaw(alloc: Allocator, codec: Codec, raw: []const u8, ctx: EncodeCtx) (e
             // tdim[0] is the fastest axis = columns = ny; tdim[1] = rows = nx (see `decodeCompressed`).
             const ny = std.math.cast(usize, ctx.tdim[0]) orelse return error.DataConstraintViolated;
             const nx = std.math.cast(usize, ctx.tdim[1]) orelse return error.DataConstraintViolated;
+            // HCOMPRESS is strictly 2-D: a tile with a non-unit higher dimension has
+            // vals.len != nx*ny and must fail loud HERE — before `hcompressTileScale`, whose
+            // noise estimator asserts this exact geometry precondition — mirroring the check
+            // `hcompress.compress` itself applies on the lossless path.
+            const npix = std.math.mul(usize, nx, ny) catch return error.DataConstraintViolated;
+            if (vals.len != npix) return error.DataConstraintViolated;
             // Per-tile integer scale from the float request (0 = lossless; CFITSIO-identical
             // noise-adaptive/absolute mapping — the scale is embedded in the tile stream).
             const scale = try hcompressTileScale(alloc, vals, ny, nx, ctx.hcomp_scale);
@@ -2803,9 +2814,11 @@ test "writeCompressed HCOMPRESS_1 noise-adaptive scale (request > 0) matches the
 test "writeCompressed HCOMPRESS_1 default tiling follows CFITSIO's row-block rule" {
     const alloc = testing.allocator;
     // ≤ 30 rows ⇒ whole image (24 → 24); > 30 ⇒ CFITSIO's preference order: 64 % 16 == 0 ⇒ 16,
-    // and 37 % 16 == 5 > 3 (last tile keeps ≥ 4 rows) ⇒ 16. Asserted through the written
-    // header (ZTILEn) — the authoritative record — plus an exact lossless round-trip.
-    inline for (.{ .{ 24, 24 }, .{ 64, 16 }, .{ 37, 16 } }) |tc| {
+    // 37 % 16 == 5 > 3 (last tile keeps ≥ 4 rows) ⇒ 16, and 51 rejects 16 (51 % 16 == 3) and
+    // 24 (51 % 24 == 3) before accepting 20 (51 % 20 == 11) — pinning the chain ORDER, not just
+    // the first candidate. Asserted through the written header (ZTILEn) — the authoritative
+    // record — plus an exact lossless round-trip.
+    inline for (.{ .{ 24, 24 }, .{ 64, 16 }, .{ 37, 16 }, .{ 51, 20 } }) |tc| {
         const rows = tc[0];
         const want: i64 = tc[1];
         var fx = try Fixture.init(alloc);
@@ -2854,6 +2867,26 @@ test "writeCompressed rejects misused/invalid HCOMPRESS lossy knobs (fail loud)"
         .codec = .hcompress_1,
         .hcomp_scale = std.math.nan(f32),
     }, &src));
+}
+
+test "writeCompressed HCOMPRESS_1 with a 3-D tile fails loud, even on the lossy path" {
+    // Regression (review M1): a tile with a non-unit higher dimension used to reach the noise
+    // estimator's geometry assert when hcomp_scale > 0 (SIGABRT in Debug/ReleaseSafe) instead
+    // of erroring; the lossless path already returned DataConstraintViolated. Both must error.
+    const alloc = testing.allocator;
+    var src: [4 * 4 * 2]i32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast(i);
+    inline for (.{ 0.0, 4.0, -8.0 }) |scale| {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        try testing.expectError(error.DataConstraintViolated, writeCompressed(i32, &fx.f, .{
+            .bitpix = 32,
+            .axes = &.{ 4, 4, 2 },
+            .tile = &.{ 4, 4, 2 },
+            .codec = .hcompress_1,
+            .hcomp_scale = scale,
+        }, &src));
+    }
 }
 
 // ── CMP-7 subtractive dithering on the write→read float path ──────────────────────────────────

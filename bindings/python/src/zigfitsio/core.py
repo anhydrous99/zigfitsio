@@ -548,10 +548,13 @@ class CompImageHDU(ImageHDU):
                 while hdr.get(f"ZNAME{i}") is not None:
                     zname = str(hdr.get(f"ZNAME{i}")).strip().upper()
                     zval = hdr.get(f"ZVAL{i}")
-                    if zname == "SCALE" and zval is not None:
-                        hscale = float(zval)
-                    elif zname == "SMOOTH" and zval is not None:
-                        hsmooth = bool(int(zval))
+                    try:  # a nonstandard (e.g. string-valued) ZVALn falls back to the defaults
+                        if zname == "SCALE" and zval is not None:
+                            hscale = float(zval)
+                        elif zname == "SMOOTH" and zval is not None:
+                            hsmooth = bool(int(float(zval)))
+                    except (TypeError, ValueError):
+                        pass
                     i += 1
         tile = _carr(tile_spec) if tile_spec else None
         q = _enc(quant) if quant else None
