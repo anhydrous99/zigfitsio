@@ -224,6 +224,7 @@ test {
     _ = @import("compress/plio.zig");
     _ = @import("compress/hcompress.zig");
     _ = @import("compress/imgstats.zig");
+    _ = @import("compress/quantize.zig");
     _ = @import("compress/dither.zig");
     _ = @import("filename.zig");
     _ = @import("template.zig");
