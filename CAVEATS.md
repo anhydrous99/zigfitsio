@@ -1,9 +1,9 @@
 # Caveats & Known Limitations
 
-Honest caveats for the FITS-conformance hardening work delivered on branch
-`finish-fits-conformance`. The library builds clean and passes **459/459 tests**,
-`zig build wasm-check`, `zig build fuzz`, and `zig build bench`, with **zero `@cImport`**
-(pure Zig std, `GC-1`/`GC-2`).
+Honest caveats for the FITS-conformance hardening work (originally delivered on branch
+`finish-fits-conformance`, since merged). The library builds clean and passes **537/537 Zig
+tests** (plus 110 Python binding tests), `zig build wasm-check`, `zig build fuzz`, and
+`zig build bench`, with **zero `@cImport`** (pure Zig std, `GC-1`/`GC-2`).
 
 The cross-tool interoperability previously listed here as *unconfirmed* is now **verified
 against CFITSIO 4.6.4 + Astropy** (§1); the genuinely-remaining limits are stated plainly below.
@@ -33,20 +33,32 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
 
 **What is now verified (committed goldens + the `interop` CI job):**
 
-- `RICE_1`, `GZIP_1`/`GZIP_2`, `PLIO_1`, and lossless `HCOMPRESS_1` decode committed CFITSIO
-  tiles to the exact pixels (inbound) **and** `funpack`/CFITSIO read zigfitsio's compressed
-  output back to the exact pixels (outbound).
+- `RICE_1`, `GZIP_1`/`GZIP_2`, `PLIO_1`, and `HCOMPRESS_1` — **lossless AND lossy, including
+  decode-side smoothing** — decode committed CFITSIO tiles to the exact pixels (inbound) **and**
+  `funpack`/CFITSIO read zigfitsio's compressed output back to the exact pixels (outbound).
+- **`HCOMPRESS_1` lossy is complete and CFITSIO-parity, both directions.** Decode implements
+  `hsmooth` (the `ZNAME2='SMOOTH'`/`ZVAL2` request) and reproduces `funpack` bit-for-bit on the
+  committed lossy goldens (`tile_hcompress_lossy16/lossy32/smooth` + funpack-authored
+  `*_expected` pixel files, with a non-vacuousness gate proving the smooth path changes pixels);
+  Astropy independently decodes the same bytes to the same pixels. Encode supports absolute
+  (`hcomp_scale < 0`) and noise-adaptive (`hcomp_scale > 0`, via the ported
+  `FnNoise5_int`/`quick_select` MAD estimators, bit-exact vs `fits_img_stats_int`) scaling plus
+  the SMOOTH request, records `ZVAL1` (float request)/`ZVAL2` exactly like CFITSIO, and uses
+  CFITSIO's default row-block tiling; `funpack` decodes zigfitsio's lossy output to exactly the
+  pixels zigfitsio itself decodes (`check_funpack.py`).
 - `DATASUM` recomputes to a CFITSIO-authored golden vector (`X-SUM`).
 - WCS TAN `pixel→world` agrees with Astropy reference points within tolerance.
 
 **Genuinely-remaining limits:**
 
-- **`HCOMPRESS_1` lossy** (`scale > 0`) decode smoothing (`hsmooth`) is still not implemented —
-  the **lossless** (`scale = 0`) path only (the path the goldens exercise).
 - The **byte-exact regeneration drift-guard** in the `interop` CI job assumes CFITSIO exactly
   **4.6.4** (the version the committed bytes were authored with); it runs *informationally* so a
   distro CFITSIO version skew cannot red the build — the *semantic* interop checks (funpack
   decodes to the exact pixels; Astropy opens every file) are the authoritative gate.
+- **`HCOMPRESS_1` write is integer-only** (BITPIX 8/16/32): compressing a *float* image with
+  HCOMPRESS via quantization/dithering (CFITSIO can) remains unsupported on the write path —
+  `error.UnsupportedCodec`, never a silent mis-write. (Float images compress via GZIP with
+  `SUBTRACTIVE_DITHER_1/2` as before.)
 
 ## 2. Delivery status — unmerged branch (point-in-time)
 

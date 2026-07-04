@@ -42,11 +42,13 @@
 //!     `sumall` field either way, so the container is unchanged.
 //!   * `output_nnybble`/`input_nnybble` (CFITSIO's hand-unrolled bulk-nibble I/O) are expressed
 //!     here as plain loops over `outputNybble`/`inputNybble`, which are bit-for-bit equivalent.
-//! BYTE-EXACT parity against CFITSIO 4.6.4 is a SEPARATE blocked external-toolchain golden-corpus
-//! task (no C toolchain here); this implementation is verified by lossless self round-trip
-//! (`htrans`∘`hinv` identity, and `compress`∘`decompress` over constant/gradient/checkerboard/
-//! random/negative/non-power-of-two/edge tiles, plus the `write_bdirect` path), and by a bounded
-//! lossy (`scale > 1`) error check.
+//! BYTE-EXACT parity against CFITSIO 4.6.4 is verified: the committed golden corpus
+//! (`test/golden/compress/tile_hcompress*.fits`, incl. lossy and SMOOTH variants with
+//! funpack-authored expected pixels) pins the decode paths bit-for-bit, and the `interop` CI job
+//! proves `funpack` reads this encoder's output back exactly. Additionally verified by lossless
+//! self round-trip (`htrans`∘`hinv` identity, and `compress`∘`decompress` over constant/gradient/
+//! checkerboard/random/negative/non-power-of-two/edge tiles, plus the `write_bdirect` path), and
+//! by bounded lossy (`scale > 1`, with and without smoothing) error checks.
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;

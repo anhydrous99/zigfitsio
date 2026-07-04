@@ -6,7 +6,36 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`HCOMPRESS_1` lossy is complete — the last codec gap is closed** (was: lossless-only decode,
+  no `hsmooth`). All CFITSIO-parity, verified bit-exact:
+  - **Decode smoothing (`hsmooth`):** the CFITSIO coefficient-interpolation pass now runs inside
+    the inverse H-transform when a file requests it (`ZNAME2='SMOOTH'`/`ZVAL2`), reproducing
+    `fits_hdecompress`/`funpack` bit-for-bit (verified over 10 shape/scale/pattern cases against
+    the CFITSIO 4.6.4 dylib, and pinned forever by new committed goldens:
+    `tile_hcompress_{lossy16,lossy32,smooth}.fits` + funpack-authored `*_expected` pixel files,
+    with a non-vacuousness gate). Adversarial streams keep the fail-loud contract
+    (`error.CorruptTile`, never a panic/overflow).
+  - **Lossy write:** `CompressSpec.hcomp_scale` (CFITSIO `fits_set_hcomp_scale` semantics —
+    `0` lossless default, `< 0` absolute per-tile scale, `> 0` noise-adaptive
+    `round(request × background sigma)`) and `CompressSpec.hcomp_smooth` (records the SMOOTH
+    request). The noise estimators are an exact port of CFITSIO `FnNoise5_int`/
+    `quick_select_longlong` (`src/compress/imgstats.zig`, bit-exact vs `fits_img_stats_int`,
+    quirks included and documented). `ZVAL1` is now the float request card and `ZNAME2/ZVAL2`
+    are always written for HCOMPRESS, matching CFITSIO's header layout. `funpack` decodes
+    zigfitsio's lossy output to exactly the pixels zigfitsio itself decodes
+    (`interop/check_funpack.py`), and Astropy agrees.
+  - **Bindings:** `zf_write_compressed2` (ABI-additive C entry point with the two knobs) and
+    `CompImageHDU(..., hcomp_scale=, hcomp_smooth=)` (astropy-compatible kwargs); re-emitting a
+    scanned lossy HCOMPRESS image preserves its recorded SCALE/SMOOTH request.
+
 ### Changed
+- **HCOMPRESS default tiling** now follows CFITSIO's `imcomp_init_table` row-block rule (whole
+  image ≤ 30 rows, else the 16/24/…/14→17 preference keeping the last tile ≥ 4 rows) instead of
+  row-by-row strips — the codec is inherently 2-D, and Astropy refuses 1-row HCOMPRESS tiles.
+  Explicit `tile=` specifications are unaffected.
+- Misusing the HCOMPRESS lossy knobs (non-finite scale, or either knob with a non-HCOMPRESS
+  codec) is `error.DataConstraintViolated` — never silently ignored.
 - **Python support:** dropped end-of-life CPython 3.9 and added CPython 3.14 wheels, including
   the free-threaded (no-GIL) `cp314t` build. Minimum supported Python is now 3.10. The
   `cp314t` wheel is built and shipped but its test suite is skipped in CI until free-threaded
@@ -140,5 +169,5 @@ Core-library and build fixes in the same window:
 - The HTTP(S) range-GET backend (`RMT-2`) is **done**.
 - **Byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity is now done** (`X-FIXTURES`/`X-SUM`/
   `X-XVAL`/`X-CONF`/`X-INTEROP`): the tile codecs and checksum are verified against committed CFITSIO
-  tiles both inbound and outbound. The one remaining codec limit is `HCOMPRESS_1` lossy `hsmooth`
-  (lossless only); see `CAVEATS.md §1`.
+  tiles both inbound and outbound. The then-remaining codec limit — `HCOMPRESS_1` lossy `hsmooth`
+  (lossless only at the time) — has since been closed (see `[Unreleased]`); `CAVEATS.md §1`.
