@@ -85,7 +85,7 @@ test "golden: file sha256 matches MANIFEST" {
     const parsed = try std.json.parseFromSlice(Manifest, alloc, mbytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
-    try testing.expect(parsed.value.files.len >= 13); // all goldens accounted for
+    try testing.expect(parsed.value.files.len >= 26); // all goldens accounted for
     for (parsed.value.files) |entry| {
         const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{entry.path});
         defer alloc.free(path);
@@ -199,6 +199,69 @@ test "golden: CMP-6 smoothed lossy HCOMPRESS_1 tile (ZVAL2=1) decodes exactly li
     var smoothed: [curv_n]i32 = undefined;
     try readExpectedPixels(alloc, "compress/tile_hcompress_smooth_expected.fits", &smoothed);
     try testing.expect(!std.mem.eql(i32, &plain, &smoothed));
+}
+
+// ── Quantized-float tiles: CFITSIO-quantized f32 goldens decode EXACTLY like funpack ───────
+//
+// Each `.fz` holds the 32×32 f32 noise+gradient field quantized by CFITSIO (q = 4) — HCOMPRESS
+// under SUBTRACTIVE_DITHER_1 (ZDITHER0 = 1) and NO_DITHER, and RICE under SUBTRACTIVE_DITHER_1 —
+// paired with funpack's own dequantized decode. Dequantization is deterministic arithmetic over
+// the shared 10000-entry Park–Miller table, so zigfitsio must reproduce funpack to the exact
+// f32 bit pattern: these goldens pin the inbound quantized-float path (dither offsets, per-tile
+// ZSCALE/ZZERO, and the `(stored − r + 0.5)·ZSCALE + ZZERO` reconstruction) permanently.
+
+const noise_n = 32 * 32;
+
+fn expectQuantizedTile(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u8, quantiz: []const u8) !void {
+    // funpack's decode: the authoritative dequantized pixels (primary HDU, BITPIX -32).
+    var expected: [noise_n]f32 = undefined;
+    {
+        const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{expected_rel});
+        defer alloc.free(path);
+        var f = try fits.openFile(alloc, path, .read_only, .{});
+        defer f.deinit();
+        const hdu = try f.select(1);
+        try testing.expectEqual(@as(i64, -32), try hdu.header.getValue(i64, "BITPIX"));
+        try testing.expectEqualSlices(u64, &.{ 32, 32 }, hdu.axes);
+        var v = try fits.ImageView.of(&f, hdu);
+        try v.readAll(f32, &expected, .{ .scaling = .{ .mode = .raw } });
+    }
+
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{fz_rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    const zq = try hdu.header.getString(alloc, "ZQUANTIZ");
+    defer alloc.free(zq);
+    try testing.expectEqualStrings(quantiz, std.mem.trim(u8, zq, " "));
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, noise_n), ti.elementCount());
+    var out: [noise_n]f32 = undefined;
+    try ti.readAll(f32, &out);
+    // Bit-pattern equality (stricter than `==`): the dequantization must be funpack-identical.
+    for (expected, out, 0..) |e, g, i| {
+        testing.expectEqual(@as(u32, @bitCast(e)), @as(u32, @bitCast(g))) catch |err| {
+            std.debug.print("pixel {d}: expected {e}, got {e}\n", .{ i, e, g });
+            return err;
+        };
+    }
+}
+
+test "golden: CMP-6 quantized-float HCOMPRESS_1 dithered tile decodes exactly like funpack (SUBTRACTIVE_DITHER_1, ZDITHER0=1)" {
+    try requireCorpus();
+    try expectQuantizedTile(testing.allocator, "compress/tile_hcompress_fdith.fits", "compress/tile_hcompress_fdith_expected.fits", "SUBTRACTIVE_DITHER_1");
+}
+
+test "golden: CMP-6 quantized-float HCOMPRESS_1 undithered tile decodes exactly like funpack (fpack -q0 4)" {
+    try requireCorpus();
+    try expectQuantizedTile(testing.allocator, "compress/tile_hcompress_fq0.fits", "compress/tile_hcompress_fq0_expected.fits", "NO_DITHER");
+}
+
+test "golden: CMP-4 quantized-float RICE_1 dithered tile decodes exactly like funpack (SUBTRACTIVE_DITHER_1, ZDITHER0=1)" {
+    try requireCorpus();
+    try expectQuantizedTile(testing.allocator, "compress/tile_rice_fdith.fits", "compress/tile_rice_fdith_expected.fits", "SUBTRACTIVE_DITHER_1");
 }
 
 // CMP-5: a genuine CFITSIO `fpack -p` PLIO tile decodes to the exact ramp. This golden caught a

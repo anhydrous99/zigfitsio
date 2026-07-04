@@ -145,6 +145,75 @@ static void gen_hcomp_lossy(const char *root, const char *rel, int smooth) {
     fits_close_file(in, &status);                    check(status, "hcomp_lossy close in");
 }
 
+/* ── 32x32 f32 noise+gradient source for the QUANTIZED-float tile goldens ─────────────────
+ * value[r*32+c] = 10.0 + (r + c)*0.5 + (u - 0.5)*8.0, u = LCG-uniform in [0,1). Deterministic
+ * across platforms: the LCG is pure integer math and every FP step below is EXACT in double
+ * (the sole rounding is the final cast to float), so no libm variance and no FMA-contraction
+ * hazard can change the committed bytes. The gradient gives quantization a non-trivial signal;
+ * the noise term drives CFITSIO's FnNoise5-based ZSCALE (q = 4) through a realistic code path.
+ *
+ * The +10.0 offset keeps every value strictly positive — DELIBERATE, and load-bearing for the
+ * cross-platform bit-exactness of the *expected* decodes. CFITSIO fudges ZZERO to an exact
+ * integer multiple of ZSCALE (fits_quantize_data's iqfactor), so a pixel reconstructing near
+ * zero computes fl(s*zscale) == -zzero exactly and the final `s*zscale + zzero` becomes a
+ * catastrophic cancellation whose result depends on FP contraction: an FMA-contracted CFITSIO
+ * build (e.g. Homebrew arm64 clang, -ffp-contract=on) yields a 2^-53-order residual where a
+ * non-contracted build (baseline x86-64, and zigfitsio/astropy) yields exactly 0.0 — observed
+ * empirically with this very corpus. CFITSIO is therefore not bit-stable across its own builds
+ * for near-zero reconstructions; all-positive data keeps every golden off that knife edge so
+ * every reference build decodes to identical bits. */
+
+#define NOISE_W 32
+#define NOISE_H 32
+#define NOISE_N (NOISE_W * NOISE_H)
+
+static void gen_noise_f32(const char *root, const char *rel) {
+    char path[1024];
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *f;
+    long naxes[2] = { NOISE_W, NOISE_H };
+    float data[NOISE_N];
+    unsigned int state = 12345u; /* fixed LCG seed — part of the determinism contract */
+    for (int i = 0; i < NOISE_N; i++) {
+        state = state * 1664525u + 1013904223u;
+        double u = (double)(state >> 8) / 16777216.0; /* exact: 24-bit / 2^24 */
+        int r = i / NOISE_W, c = i % NOISE_W;
+        data[i] = (float)(10.0 + (double)(r + c) * 0.5 + (u - 0.5) * 8.0);
+    }
+    fits_create_file(&f, path, &status);          check(status, "noise_f32 create");
+    fits_create_img(f, FLOAT_IMG, 2, naxes, &status); check(status, "noise_f32 img");
+    fits_write_img(f, TFLOAT, 1, NOISE_N, data, &status); check(status, "noise_f32 write");
+    fits_close_file(f, &status);                  check(status, "noise_f32 close");
+}
+
+/* compress/tile_hcompress_fdith.fits and compress/tile_rice_fdith.fits — the f32 noise source
+ * quantized with SUBTRACTIVE_DITHER_1 (q = 4, fpack's float default) under HCOMPRESS_1 / RICE_1.
+ * Authored via the API rather than `fpack -q` because fpack derives ZDITHER0 from the wall
+ * clock (verified: two runs differ), which would break the committed-byte determinism contract;
+ * fits_set_dither_seed(1) pins ZDITHER0 = 1. Default tiling (HCOMPRESS row-block rule → 32x16;
+ * RICE row strips → 32x1) so the goldens exercise the per-tile dither-seed offsets. */
+static void gen_quantized_f32(const char *root, const char *rel, int comptype) {
+    char srcpath[1024], path[1024];
+    snprintf(srcpath, sizeof srcpath, "%s/%s", root, "compress/src_f32.fits");
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *in, *out;
+    fits_open_file(&in, srcpath, READONLY, &status);       check(status, "quantized open src");
+    fits_create_file(&out, path, &status);                 check(status, "quantized create");
+    fits_set_compression_type(out, comptype, &status);     check(status, "quantized ctype");
+    fits_set_quantize_method(out, SUBTRACTIVE_DITHER_1, &status); check(status, "quantized method");
+    fits_set_quantize_level(out, 4.0f, &status);           check(status, "quantized level");
+    fits_set_dither_seed(out, 1, &status);                 check(status, "quantized seed");
+    if (comptype == HCOMPRESS_1) {
+        fits_set_hcomp_scale(out, 0.0f, &status);          check(status, "quantized hscale");
+        fits_set_hcomp_smooth(out, 0, &status);            check(status, "quantized hsmooth");
+    }
+    fits_img_compress(in, out, &status);                   check(status, "quantized compress");
+    fits_close_file(out, &status);                         check(status, "quantized close out");
+    fits_close_file(in, &status);                          check(status, "quantized close in");
+}
+
 /* ── Plain inbound images (X-INTEROP inbound) ─────────────────────────────────────────────*/
 
 /* images/img_i16.fits — 8x4 i16, value[i] = i - 8 (spans zero). */
@@ -394,6 +463,13 @@ int main(int argc, char **argv) {
     gen_curved_i32(root, "compress/src_hcompress_lossy32.fits");
     gen_hcomp_lossy(root, "compress/tile_hcompress_lossy32.fits", 0);
     gen_hcomp_lossy(root, "compress/tile_hcompress_smooth.fits", 1);
+
+    /* quantized-float tiles: the dithered pair is authored HERE (pinned ZDITHER0=1 — fpack's
+     * clock-derived seed is non-deterministic); the NO_DITHER variant is fpacked (-q0 4) by
+     * the Makefile from the same src_f32 source. */
+    gen_noise_f32(root, "compress/src_f32.fits");
+    gen_quantized_f32(root, "compress/tile_hcompress_fdith.fits", HCOMPRESS_1);
+    gen_quantized_f32(root, "compress/tile_rice_fdith.fits", RICE_1);
 
     /* plain inbound */
     gen_img_i16(root);

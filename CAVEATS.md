@@ -137,13 +137,20 @@ that work — each is *fail-loud* (a clear error), never silent data loss.
   *write* helpers build a fixed-format 8-char card (`Card.buildValue`) and cannot construct a
   HIERARCH card, so updating a HIERARCH keyword's value in place is unsupported. Rebuild the card via
   the HIERARCH builder (`src/header/hierarch.zig`) instead.
-- **Dithered/quantized-float compression interop is verified but not yet golden-committed.** The
-  fix was validated against real `fpack`/`funpack` (zigfitsio decodes an `fpack SUBTRACTIVE_DITHER_1`
-  file bit-for-bit identically to `funpack` — max pixel diff 0) and is covered by hermetic
-  round-trip unit tests (`NO_DITHER`, `SUBTRACTIVE_DITHER_2`, lossless-fallback/±Inf tiles, ZBLANK).
-  A CFITSIO-authored dithered `.fz` **golden fixture** under `test/golden/` plus an `fpack`
-  cross-check wired into the toolchain-gated `interop` CI job is a follow-up (the §1 golden corpus
-  is integer-tile only).
+- **Dithered/quantized-float compression interop is golden-committed** (closing the earlier
+  follow-up note here): CFITSIO-authored quantized-float `.fz` goldens now live under
+  `test/golden/compress/` — HCOMPRESS `SUBTRACTIVE_DITHER_1` (pinned `ZDITHER0=1`; fpack's
+  clock-derived seed is non-deterministic, so the C generator authors it), HCOMPRESS `NO_DITHER`
+  (`fpack -q0 4`), and RICE `SUBTRACTIVE_DITHER_1` — each paired with funpack's own decode, which
+  zigfitsio, Astropy (`interop/xval.py`), and the Python bindings must reproduce to the exact f32
+  bit pattern. One honest boundary discovered while authoring them: CFITSIO itself is **not
+  bit-stable across its own builds** for pixels that reconstruct near zero (`ZZERO` is fudged to
+  an exact multiple of `ZSCALE`, so `s·ZSCALE + ZZERO` cancels catastrophically and the result
+  depends on the compiler's FMA contraction — an arm64 Homebrew funpack yields a `2⁻⁵³` residual
+  where baseline-x86-64 CFITSIO, Astropy, and zigfitsio all yield exactly `0.0`). The committed
+  goldens use an all-positive field so every reference build agrees on every bit; the hermetic
+  round-trip unit tests (`NO_DITHER`, `SUBTRACTIVE_DITHER_2`, lossless-fallback/±Inf tiles,
+  ZBLANK) still cover zero-crossing data semantically.
 - **ASCII-table float TFORM is reconstructed heuristically on copy.** When a *modified* ASCII table
   is re-serialized, a float column's `Ew.d` precision is derived as `E{w}.{w-7}` from the column
   width, because the C ABI's `ZfColInfo` exposes width and typecode but not the original `TDISP`/
