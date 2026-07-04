@@ -2935,6 +2935,25 @@ test "writeCompressed HCOMPRESS_1 noise-adaptive scale (request > 0) matches the
     for (src, out) |o, g| {
         try testing.expect(@abs(@as(i64, o) - @as(i64, g)) <= 64 * expect_scale);
     }
+
+    // Drift pin: the CFITSIO-dylib-derived literal for this exact field. The re-derivation
+    // above is self-consistent (it would move if the estimator chain drifted); this literal —
+    // authored by calling the real fits_img_stats_int over the same data and applying
+    // (int)(float(4 × sigma) + 0.5) — cannot. It pins the FULL noise → f32-cast → NINT chain,
+    // FP knife edges included, against any future regression.
+    try testing.expectEqual(@as(i64, 39478), expect_scale);
+}
+
+test "hcompressTileScale: absolute-mode rounding boundaries pin the (int)(x + 0.5) truncation" {
+    const alloc = testing.allocator;
+    const vals = [_]i32{ 0, 1, 2, 3 }; // noise path unused for request <= 0
+    // request < 0 ⇒ |request|, then trunc(x + 0.5): half-integers round AWAY from zero (2.5→3,
+    // 0.5→1 — a round-to-nearest-even port would give 2 and 0), and the largest f32 below 0.5
+    // (0x3EFFFFFF ≈ 0.49999997) truncates to 0 — the f64 sum 0.99999997… does NOT round up.
+    try testing.expectEqual(@as(i32, 3), try hcompressTileScale(alloc, &vals, 2, 2, -2.5));
+    try testing.expectEqual(@as(i32, 1), try hcompressTileScale(alloc, &vals, 2, 2, -0.5));
+    try testing.expectEqual(@as(i32, 0), try hcompressTileScale(alloc, &vals, 2, 2, -@as(f32, @bitCast(@as(u32, 0x3EFFFFFF)))));
+    try testing.expectEqual(@as(i32, 0), try hcompressTileScale(alloc, &vals, 2, 2, 0.0));
 }
 
 test "writeCompressed HCOMPRESS_1 default tiling follows CFITSIO's row-block rule" {

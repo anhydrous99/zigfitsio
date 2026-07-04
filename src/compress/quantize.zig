@@ -765,6 +765,24 @@ test "quantizeTile: CFITSIO 4.6.4 fits_quantize_float/_double bit-exact referenc
     try Field.check(vecs[5], r.quantized, idata[0..96]);
 }
 
+test "quantizeTile: half-integer rounding boundaries pin NINT (half away from zero, not banker's)" {
+    // Absolute step 0.25 with data whose minimum is exactly 0: the iqfactor fudge yields
+    // zeropt = 0 exactly (trunc(0/0.25 + 0.5) = 0), so each stored value is NINT(v/0.25) with
+    // no offset — pinning the exact rounding rule on real quantizer arithmetic. x = 0.5, 1.5,
+    // 2.5, 3.5 must round to 1, 2, 3, 4 (truncation after +0.5 = half AWAY from zero); a
+    // round-to-nearest-EVEN implementation would produce 0, 2, 2, 4 and a plain-round port
+    // could diverge at double-rounding knife edges (see the dedicated NINT test).
+    const alloc = testing.allocator;
+    const data = [_]f32{ 0.0, 0.125, 0.375, 0.625, 0.875, 1.0, 2.0, 3.0 };
+    var idata: [8]i32 = undefined;
+    const r = try quantizeTile(f32, alloc, &data, 8, 1, -0.25, .none, null, 1, 0, &idata);
+    const p = r.quantized;
+    try testing.expectEqual(@as(f64, 0.25), p.bscale);
+    try testing.expectEqual(@as(f64, 0.0), p.bzero); // iqfactor fudge landed exactly on zero
+    const expected = [_]i32{ 0, 1, 2, 3, 4, 4, 8, 12 };
+    try testing.expectEqualSlices(i32, &expected, &idata);
+}
+
 test "quickSelect: lower-middle median convention across lengths (float)" {
     var a1 = [_]f32{ 5, 1, 4, 2, 3 };
     try testing.expectEqual(@as(f32, 3), quickSelect(f32, &a1));
