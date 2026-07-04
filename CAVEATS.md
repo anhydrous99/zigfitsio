@@ -76,6 +76,13 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   **4.6.4** (the version the committed bytes were authored with); it runs *informationally* so a
   distro CFITSIO version skew cannot red the build — the *semantic* interop checks (funpack
   decodes to the exact pixels; Astropy opens every file) are the authoritative gate.
+- **`zig build fuzz --fuzz` (engine mode) is broken in the Zig 0.16.0 toolchain itself** —
+  `compiler/test_runner.zig` fails to compile under `-ffuzz` (a `StackTrace` type mismatch,
+  reproduced on an unmodified tree). The *seeded* `zig build fuzz` mode — which CI's
+  `fuzz-smoke` job runs, and which executes every harness (headers, tables, all tile codecs,
+  the compressed-HDU byte-mutation target) over its deterministic corpus — is unaffected.
+  Coverage-guided exploration resumes when the upstream toolchain bug is fixed; nothing in
+  this repo blocks it.
 - **Explicit HCOMPRESS tile shapes are more permissive than CFITSIO's author.** CFITSIO's
   `imcomp_init_table` rejects HCOMPRESS tiles/images with any dimension under 4 pixels;
   zigfitsio deliberately accepts them (the repo's own fixtures use 4×3 tiles, and every tested
@@ -93,6 +100,17 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
 - **Quantized-float write gates fail loud where CFITSIO degrades silently** (see the verified
   section above): HCOMPRESS + `SUBTRACTIVE_DITHER_2`, float + integer codec without
   quantization, PLIO + floats, and ±Inf tiles (stored losslessly, not quantized to garbage).
+- **The legacy dithered-GZIP scheme (kept when `quantize_level` is unset) quantizes f64 pixels
+  through an f32 cast** and uses its fixed `(max−min)/100000` step — both pre-existing behavior,
+  preserved so existing callers' bytes are unchanged. The CFITSIO-parity path (any explicit
+  `quantize_level`, `NO_DITHER`, or an integer codec) quantizes f64 natively via
+  `fits_quantize_double` semantics. Set `quantize_level` to opt in on GZIP.
+- **Lossless-float compressed writes omit `ZQUANTIZ`** where CFITSIO writes `ZQUANTIZ='NONE'`;
+  both readers treat the absent keyword as "no quantization", so this is cosmetic (kept to
+  avoid churning existing output bytes; the reader also accepts `'NONE'`).
+- **`iqfactor` saturates where CFITSIO's cast is UB** (`quantize.zig`): the ZZERO fudge's
+  `(LONGLONG)` cast of an out-of-i64-range double is undefined behavior in C; zigfitsio uses a
+  saturating cast, diverging only on pathological data where CFITSIO has no defined answer.
 - **Near-zero dequantized pixels are FP-contraction knife edges in CFITSIO's own builds**
   (discovered authoring the quantized-float goldens; `interop/c/gen_sources.c`): `ZZERO` is an
   exact multiple of `ZSCALE`, so `s·ZSCALE + ZZERO` cancels catastrophically for values near 0
@@ -143,6 +161,13 @@ both directions against Astropy and the committed golden corpus. Honest limits a
 - **Toolchain for wheels.** The `ziglang` PyPI package can lag the 0.16 toolchain this project
   targets, so wheel builds use a real Zig 0.16 (CI `setup-zig` / the in-container installer); the
   hatch build hook falls back to a system `zig` when `ziglang` is absent.
+- **`writeto()` of a *scanned* quantized-float compressed image re-quantizes with default
+  knobs.** The FITS header records the method (`ZQUANTIZ`) but not the quantization *level*
+  (CFITSIO stores `q` only in a free-text `HISTORY` card), and the Python re-emit path writes
+  `ZDITHER0 = 1` rather than reusing the source seed — so re-emitting decodes the pixels and
+  quantizes them *again* (a second, bounded lossy pass at the default level; the codec, tiling
+  and method are preserved, and the result is a fully valid file). Integer-codec and lossless
+  copies are unaffected; copying compressed HDUs verbatim (no re-quantization) is a follow-up.
 
 None of these require ABI changes to address — they are extension points, not design constraints.
 
