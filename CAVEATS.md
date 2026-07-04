@@ -1,9 +1,11 @@
 # Caveats & Known Limitations
 
 Honest caveats for the FITS-conformance hardening work (originally delivered on branch
-`finish-fits-conformance`, since merged). The library builds clean and passes **539/539 Zig
-tests** (including the C-ABI suite; plus 110 Python binding tests), `zig build wasm-check`,
-`zig build fuzz`, and `zig build bench`, with **zero `@cImport`** (pure Zig std, `GC-1`/`GC-2`).
+`finish-fits-conformance`, since merged). The library builds clean and passes **564/564 Zig
+tests** (plus the 25-test C-ABI suite and 117 Python binding tests), `zig build wasm-check`,
+`zig build fuzz` (headers, tables, AND the tile codecs — direct decoder targets plus a
+compressed-HDU byte-mutation target), and `zig build bench`, with **zero `@cImport`** (pure
+Zig std, `GC-1`/`GC-2`).
 
 The cross-tool interoperability previously listed here as *unconfirmed* is now **verified
 against CFITSIO 4.6.4 + Astropy** (§1); the genuinely-remaining limits are stated plainly below.
@@ -80,6 +82,24 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   decoder — zigfitsio, CFITSIO/funpack — reads them exactly). The *default* tiling follows
   CFITSIO's row-block rule, so this only applies to explicit `tile=` choices; note Astropy
   refuses HCOMPRESS tiles that squeeze to one dimension (e.g. `{N, 1}`).
+
+**Deliberate code-level divergences (conforming files unaffected; documented at the code):**
+
+- **`SMOOTH` is looked up by `ZNAMEn` name, not positionally** (`tiled.zig` decode): differs
+  from CFITSIO only on a hand-crafted header whose `ZNAME2` is mislabeled.
+- **Single `i64` HCOMPRESS decode path** vs CFITSIO's int32/int64 split (`hcompress.zig` module
+  doc): identical results on all valid data; on an adversarial overflow-inducing stream where
+  CFITSIO's int32 variant would silently wrap, zigfitsio errors `CorruptTile` instead.
+- **Quantized-float write gates fail loud where CFITSIO degrades silently** (see the verified
+  section above): HCOMPRESS + `SUBTRACTIVE_DITHER_2`, float + integer codec without
+  quantization, PLIO + floats, and ±Inf tiles (stored losslessly, not quantized to garbage).
+- **Near-zero dequantized pixels are FP-contraction knife edges in CFITSIO's own builds**
+  (discovered authoring the quantized-float goldens; `interop/c/gen_sources.c`): `ZZERO` is an
+  exact multiple of `ZSCALE`, so `s·ZSCALE + ZZERO` cancels catastrophically for values near 0
+  and the last bit depends on the compiler's FMA contraction — an arm64 Homebrew funpack
+  yields a `2⁻⁵³` residual where baseline-x86-64 CFITSIO, Astropy, and zigfitsio all yield
+  exactly `0.0`. Not a zigfitsio divergence per se (CFITSIO disagrees with *itself* across
+  builds); the committed goldens use all-positive fields so every reference build agrees.
 
 ## 2. Delivery status — unmerged branch (point-in-time)
 
