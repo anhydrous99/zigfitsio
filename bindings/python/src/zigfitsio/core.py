@@ -505,11 +505,18 @@ class CompImageHDU(ImageHDU):
 
     _kind_name = "CompImageHDU"
 
-    def __init__(self, data=None, header=None, name=None, compression="RICE_1", tile=None, quantize=None):
+    def __init__(self, data=None, header=None, name=None, compression="RICE_1", tile=None, quantize=None,
+                 hcomp_scale=0.0, hcomp_smooth=False):
         super().__init__(data=data, header=header, name=name)
         self._comp = compression
         self._tile = tile
         self._quantize = quantize
+        # HCOMPRESS_1 lossy knobs (astropy-compatible names; CFITSIO fits_set_hcomp_scale/
+        # fits_set_hcomp_smooth semantics): scale 0 = lossless, > 0 = noise-adaptive
+        # (per-tile round(scale x background sigma)), < 0 = |scale| absolute; smooth records
+        # the ZNAME2='SMOOTH' decode-side smoothing request.
+        self._hcomp_scale = float(hcomp_scale)
+        self._hcomp_smooth = bool(hcomp_smooth)
 
     def _write_to(self, handle, primary: bool):
         if self.data is None:  # lazily materializes attached data (so a copy keeps its pixels)
@@ -518,6 +525,7 @@ class CompImageHDU(ImageHDU):
         bitpix = dt.dtype_to_bitpix(data.dtype)
         axes = list(reversed(data.shape))
         comp, tile_spec, quant = self._comp, self._tile, self._quantize
+        hscale, hsmooth = self._hcomp_scale, self._hcomp_smooth
         if self._hdulist is not None:
             # A scanned compressed image: reuse its own ZCMPTYPE/ZTILEn/ZQUANTIZ so re-emitting does
             # not silently change the codec (or fail outright for a float image that was GZIP-stored
@@ -532,9 +540,22 @@ class CompImageHDU(ImageHDU):
                 i += 1
             if tiles:
                 tile_spec = tiles  # ZTILEn and axes are both fastest-axis-first
+            # Likewise reuse the recorded HCOMPRESS lossy request (ZNAMEn='SCALE'/'SMOOTH'):
+            # re-emitting a lossy file must not silently recompress it as lossless (or drop the
+            # readers' smoothing request).
+            if comp.strip().upper() == "HCOMPRESS_1":
+                i = 1
+                while hdr.get(f"ZNAME{i}") is not None:
+                    zname = str(hdr.get(f"ZNAME{i}")).strip().upper()
+                    zval = hdr.get(f"ZVAL{i}")
+                    if zname == "SCALE" and zval is not None:
+                        hscale = float(zval)
+                    elif zname == "SMOOTH" and zval is not None:
+                        hsmooth = bool(int(zval))
+                    i += 1
         tile = _carr(tile_spec) if tile_spec else None
         q = _enc(quant) if quant else None
-        ll.check(ll.lib.zf_write_compressed(handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(comp), q, 1, _ptr(data), int(data.size)))
+        ll.check(ll.lib.zf_write_compressed2(handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(comp), q, 1, hscale, int(hsmooth), _ptr(data), int(data.size)))
         # Preserve EXTNAME (the general image path writes it via _apply_user_keys, which this
         # override does not call because the scanned header carries the compression machinery).
         nm = self.name

@@ -1395,10 +1395,8 @@ fn writeCompressedDispatch(ty: ZfType, h: *Handle, spec: fits.CompressSpec, ptr:
     };
 }
 
-/// Append a tile-compressed image HDU. `codec`/`quantize` are NUL-terminated names
-/// (`"GZIP_1"`, `"RICE_1"`, `"SUBTRACTIVE_DITHER_1"`, ...). `tile` (or null) overrides the
-/// default row-strip tiling.
-pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, pixels: *const anyopaque, nelem: c_longlong) c_int {
+// Shared body of `zf_write_compressed`/`zf_write_compressed2`.
+fn writeCompressedImpl(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, hcomp_scale: f32, hcomp_smooth: bool, pixels: *const anyopaque, nelem: c_longlong) c_int {
     const h = h_opt orelse return abi.failNull();
     if (nelem < 0 or naxis <= 0) return abi.fail(&h.diag, error.BadDimensions);
     var axbuf: [999]u64 = undefined;
@@ -1409,6 +1407,8 @@ pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, 
         .bitpix = @intCast(bitpix),
         .axes = axbuf[0..nax],
         .zdither0 = @intCast(zdither0),
+        .hcomp_scale = hcomp_scale,
+        .hcomp_smooth = hcomp_smooth,
     };
     // `Codec`/`Quantize` are not re-exported at the package root; reach their `fromName` through
     // the `CompressSpec` field types so the shim needs no extra exports.
@@ -1420,4 +1420,21 @@ pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, 
     if (quantize) |q| spec.quantize = @TypeOf(spec.quantize).fromName(std.mem.span(q));
     writeCompressedDispatch(@enumFromInt(dtype), h, spec, pixels, @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     return 0;
+}
+
+/// Append a tile-compressed image HDU. `codec`/`quantize` are NUL-terminated names
+/// (`"GZIP_1"`, `"RICE_1"`, `"SUBTRACTIVE_DITHER_1"`, ...). `tile` (or null) overrides the
+/// default row-strip tiling.
+pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, pixels: *const anyopaque, nelem: c_longlong) c_int {
+    return writeCompressedImpl(h_opt, dtype, bitpix, naxis, axes, tile, codec, quantize, zdither0, 0, false, pixels, nelem);
+}
+
+/// `zf_write_compressed` plus the HCOMPRESS_1 lossy knobs (CFITSIO `fits_set_hcomp_scale`/
+/// `fits_set_hcomp_smooth` semantics): `hcomp_scale` 0 = lossless, > 0 = per-tile
+/// `round(scale × background-noise sigma)`, < 0 = `|scale|` absolute; `hcomp_smooth` non-zero
+/// records the `ZNAME2='SMOOTH'` decode-side smoothing request. Setting either knob with a
+/// non-HCOMPRESS codec fails (`DataConstraintViolated`) rather than being silently ignored.
+/// ABI-additive: existing `zf_write_compressed` callers are unaffected.
+pub export fn zf_write_compressed2(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, hcomp_scale: f32, hcomp_smooth: c_int, pixels: *const anyopaque, nelem: c_longlong) c_int {
+    return writeCompressedImpl(h_opt, dtype, bitpix, naxis, axes, tile, codec, quantize, zdither0, hcomp_scale, hcomp_smooth != 0, pixels, nelem);
 }

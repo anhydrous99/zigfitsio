@@ -1086,6 +1086,25 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     } else {
         tile[0] = spec.axes[0];
         for (1..znaxis) |i| tile[i] = 1;
+        if (spec.codec == .hcompress_1) {
+            // CFITSIO's HCOMPRESS default tiling (`imcomp_init_table`): the codec is inherently
+            // 2-D, so row-by-row strips (which Astropy even refuses to decode) are replaced by
+            // row *blocks* — the whole image when it has ≤ 30 rows, otherwise the first block
+            // height in CFITSIO's preference order whose last tile keeps at least 4 rows
+            // (divides evenly or leaves a remainder > 3), falling back to 17.
+            const nrows = spec.axes[1]; // znaxis ≥ 2 was validated above for HCOMPRESS
+            if (nrows <= 30) {
+                tile[1] = nrows;
+            } else {
+                tile[1] = 17;
+                for ([_]u64{ 16, 24, 20, 30, 28, 26, 22, 18, 14 }) |cand| {
+                    if (nrows % cand == 0 or nrows % cand > 3) {
+                        tile[1] = cand;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     const ntiles = try alloc.alloc(u64, znaxis);
@@ -2778,6 +2797,33 @@ test "writeCompressed HCOMPRESS_1 noise-adaptive scale (request > 0) matches the
     try ti.readAll(i32, &out);
     for (src, out) |o, g| {
         try testing.expect(@abs(@as(i64, o) - @as(i64, g)) <= 64 * expect_scale);
+    }
+}
+
+test "writeCompressed HCOMPRESS_1 default tiling follows CFITSIO's row-block rule" {
+    const alloc = testing.allocator;
+    // ≤ 30 rows ⇒ whole image (24 → 24); > 30 ⇒ CFITSIO's preference order: 64 % 16 == 0 ⇒ 16,
+    // and 37 % 16 == 5 > 3 (last tile keeps ≥ 4 rows) ⇒ 16. Asserted through the written
+    // header (ZTILEn) — the authoritative record — plus an exact lossless round-trip.
+    inline for (.{ .{ 24, 24 }, .{ 64, 16 }, .{ 37, 16 } }) |tc| {
+        const rows = tc[0];
+        const want: i64 = tc[1];
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        var src: [8 * rows]i32 = undefined;
+        for (&src, 0..) |*v, i| v.* = @intCast(i % 97);
+        const hdu = try writeCompressed(i32, &fx.f, .{
+            .bitpix = 32,
+            .axes = &.{ 8, rows },
+            .codec = .hcompress_1, // no .tile: the default rule applies
+        }, &src);
+        try testing.expectEqual(@as(i64, 8), try hdu.header.getValue(i64, "ZTILE1"));
+        try testing.expectEqual(want, try hdu.header.getValue(i64, "ZTILE2"));
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [8 * rows]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, &src, &out);
     }
 }
 
