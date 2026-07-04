@@ -126,6 +126,8 @@ pub const rice = @import("compress/rice.zig");
 pub const plio = @import("compress/plio.zig");
 /// HCOMPRESS_1 codec (FR-CMP-3, §10.4.4).
 pub const hcompress = @import("compress/hcompress.zig");
+/// GZIP_1/GZIP_2 tile codecs (FR-CMP-2, §10.4.2).
+pub const gzip = @import("compress/gzip.zig");
 /// Subtractive dithering + the FITS random generator (FR-CMP-4, §10.2).
 pub const dither = @import("compress/dither.zig");
 
