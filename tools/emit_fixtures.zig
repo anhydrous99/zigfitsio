@@ -34,11 +34,12 @@ pub fn main(init: std.process.Init) !void {
     try emitCompressed(alloc, outdir, "compress_rice.fits", .rice_1);
     try emitCompressed(alloc, outdir, "compress_plio.fits", .plio_1);
     try emitCompressed(alloc, outdir, "compress_hcompress.fits", .hcompress_1);
+    try emitLossyHcompress(alloc, outdir);
     try emitChecksumImage(alloc, outdir, "image_checksum.fits");
     try emitBinTable(alloc, outdir, "bintable.fits");
     try emitAsciiTable(alloc, outdir, "ascii.fits");
 
-    std.debug.print("emit-fixtures: wrote 7 files to {s}\n", .{outdir});
+    std.debug.print("emit-fixtures: wrote 13 files to {s}\n", .{outdir});
 }
 
 fn joinPath(alloc: Allocator, outdir: []const u8, name: []const u8) ![]u8 {
@@ -64,6 +65,64 @@ fn emitCompressed(alloc: Allocator, outdir: []const u8, name: []const u8, codec:
         .codec = codec,
     }, &ramp);
     try f.flush();
+}
+
+// ── Lossy HCOMPRESS outbound trio: absolute scale, absolute+smooth, noise-adaptive ────────────
+//
+// Each `.fits` is paired with a raw little-endian-i32 `.pix` sidecar holding zigfitsio's OWN
+// decode of the file it just wrote. `check_funpack.py` asserts CFITSIO `funpack` reproduces the
+// sidecar pixels EXACTLY (outbound lossy parity: two independent decoders agree on
+// zigfitsio-authored lossy bytes) and that the curved fixtures stay within the scale bound.
+
+fn emitLossyHcompress(alloc: Allocator, outdir: []const u8) !void {
+    // The curved 32×32 surface (same family as the inbound goldens: curvature everywhere, so
+    // the smooth variant is non-vacuous)…
+    var curved: [1024]i32 = undefined;
+    for (0..32) |r| {
+        for (0..32) |c| curved[r * 32 + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    // …and a deterministic noisy field for the noise-adaptive (request > 0) scale path.
+    var noisy: [1024]i32 = undefined;
+    var seed: u64 = 0x5DEECE66D2026F00;
+    for (&noisy) |*v| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        v.* = @rem(@as(i32, @bitCast(@as(u32, @truncate(seed >> 32)))), 20000);
+    }
+
+    try emitLossyOne(alloc, outdir, "compress_hcompress_lossy", &curved, -16.0, false);
+    try emitLossyOne(alloc, outdir, "compress_hcompress_smooth", &curved, -16.0, true);
+    try emitLossyOne(alloc, outdir, "compress_hcompress_noise", &noisy, 4.0, false);
+}
+
+fn emitLossyOne(alloc: Allocator, outdir: []const u8, base: []const u8, pixels: *const [1024]i32, scale: f32, smooth: bool) !void {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}.fits", .{ outdir, base });
+    var f = try fits.createFile(alloc, path, .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // empty primary (fpack layout)
+    const hdu = try fits.writeCompressed(i32, &f, .{
+        .bitpix = 32,
+        .axes = &.{ 32, 32 },
+        .tile = &.{ 32, 16 }, // two tiles (mirrors the inbound goldens' tiling)
+        .codec = .hcompress_1,
+        .hcomp_scale = scale,
+        .hcomp_smooth = smooth,
+    }, pixels);
+    try f.flush();
+
+    // Sidecar: zigfitsio's own decode of what it just wrote — the funpack parity expectation.
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    var out: [1024]i32 = undefined;
+    try ti.readAll(i32, &out);
+    var raw: [1024 * 4]u8 = undefined;
+    for (out, 0..) |v, i| std.mem.writeInt(i32, raw[i * 4 ..][0..4], v, .little);
+
+    const pix_path = try std.fmt.allocPrint(alloc, "{s}/{s}.pix", .{ outdir, base });
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var pf = try std.Io.Dir.cwd().createFile(io, pix_path, .{});
+    defer pf.close(io);
+    try pf.writePositionalAll(io, &raw, 0);
 }
 
 // ── Uncompressed image with CHECKSUM/DATASUM written on flush (checksum_on_close) ─────────────
