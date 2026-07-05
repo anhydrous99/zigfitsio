@@ -115,9 +115,30 @@ jobs:
       - name: Bun lane (bun:ffi)
         run: bun test tests
         working-directory: bindings/typescript
-      # TEMP DIAGNOSTIC (windows Debug crash): run each file in its own vitest
-      # process with verbose test names, so the crashing test is the one after
-      # the last printed line and the remaining files still report.
+      # TEMP DIAGNOSTIC 2: plain node (no vitest) doing a file-device write/read
+      # through koffi, with the true NTSTATUS exit code. Crashing suites all do
+      # file I/O; the surviving ones are memory-only.
+      - name: probe file I/O via plain node
+        if: always()
+        shell: pwsh
+        working-directory: bindings/typescript
+        run: |
+          npm run build
+          node --input-type=module -e @"
+          import * as zf from './dist/index.js';
+          console.log('version', zf.VERSION);
+          const path = process.env.RUNNER_TEMP + '\\probe.fits';
+          console.log('memory roundtrip first...');
+          const raw = new zf.HDUList([new zf.PrimaryHDU({ data: Float32Array.from([1,2,3,4]) })]).toBytes();
+          console.log('toBytes OK', raw.length);
+          console.log('writeTo', path);
+          zf.writeTo(path, new zf.FitsArray(Float32Array.from([1,2,3,4]), [2,2]), { overwrite: true });
+          console.log('writeTo OK');
+          const d = zf.getData(path);
+          console.log('read OK', JSON.stringify(d.shape));
+          "@
+          Write-Host "node exit code: $LASTEXITCODE (0x$([Convert]::ToString($LASTEXITCODE, 16)))"
+          exit 0
       - name: Node lane (koffi)
         shell: bash
         working-directory: bindings/typescript
