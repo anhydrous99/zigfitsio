@@ -45,9 +45,27 @@ function koffiTypeOf(koffi: any, t: NativeType): unknown {
   }
 }
 
+let stackConfigured = false;
+
 export function openKoffiLibrary(libPath: string, protos: readonly Proto[]): NativeLibrary {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const koffi: any = requireModule("koffi");
+  // koffi runs synchronous calls on its own preallocated stack (default 1 MiB
+  // — `koffi.config().sync_stack_size`), not the JS thread's ~8 MiB one. The
+  // library's file-device paths overflow that in Debug builds on Windows
+  // (fat Debug frames; the process dies with no JS error). Give the sync
+  // stack normal thread-stack headroom; bun:ffi calls on the real thread
+  // stack and needs nothing. Config is process-global and locked at the
+  // first koffi.load — set it once, and tolerate a host app that already
+  // loaded another koffi library (its configuration governs then).
+  if (!stackConfigured) {
+    try {
+      koffi.config({ sync_stack_size: 8 * 1024 * 1024 });
+    } catch {
+      /* koffi already in use by the host application */
+    }
+    stackConfigured = true;
+  }
   const lib = koffi.load(libPath);
 
   const convertArg = (kind: NativeType, v: NativeArg): unknown => {
