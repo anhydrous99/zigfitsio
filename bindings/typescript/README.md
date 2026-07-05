@@ -7,7 +7,7 @@ top (`open`, `HDUList`, HDU classes, `Header`, `Column`, `verify`).
 
 **Runtimes:** Bun ≥1.1 (via `bun:ffi`) and Node ≥18 (via [koffi](https://koffi.dev/)).
 The right backend is picked automatically; Bun never loads koffi. The prebuilt shared
-library ships in `@zigfitsio/<platform>` packages installed automatically as
+library ships in `zigfitsio-<platform>` packages installed automatically as
 optionalDependencies (linux x64/arm64 glibc+musl, macOS x64/arm64, Windows x64).
 
 ```sh
@@ -165,7 +165,7 @@ ll.lib.zf_close(out[0]);
 
 ## Bundlers / Electron
 
-Mark `zigfitsio`, `koffi`, and `@zigfitsio/*` as external — the platform packages and
+Mark `zigfitsio`, `koffi`, and `zigfitsio-*` as external — the platform packages and
 koffi's addon must stay on disk, and `bun:ffi` is required lazily (never bundle it into
 a Node build).
 
@@ -181,7 +181,7 @@ npm run build           # tsc -> dist/
 node scripts/build-native.mjs --target=darwin-arm64   # generate a platform package
 ```
 
-The loader searches `ZIGFITSIO_LIBRARY` → the installed `@zigfitsio/<platform>` package
+The loader searches `ZIGFITSIO_LIBRARY` → the installed `zigfitsio-<platform>` package
 → a `zig-out/{lib,bin}` dev build found by walking parent directories.
 
 Note: bun:ffi ≤1.3.14 mislays stack-passed arguments on macOS arm64 (Apple's ABI packs
@@ -200,7 +200,7 @@ either way.
 - `writeTo()` of a *scanned* quantized-float compressed image re-quantizes at the
   default level (the FITS header does not record the level).
 - Signed-byte (`i1`) images are not mapped to the BZERO=-128 convention yet (typed error).
-- On **Alpine/musl**, prefer Bun: the `@zigfitsio/*-musl` library packages are published,
+- On **Alpine/musl**, prefer Bun: the `zigfitsio-*-musl` library packages are published,
   but koffi ships no musl prebuilds, so the Node path falls back to a source build that
   needs a C++ toolchain.
 

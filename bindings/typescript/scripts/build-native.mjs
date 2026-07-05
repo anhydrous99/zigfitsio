@@ -61,7 +61,7 @@ for (const key of keys) {
   copyFileSync(join(prefix, t.sub, t.file), join(pkgDir, t.file));
 
   const pkg = {
-    name: `@zigfitsio/${key}`,
+    name: `zigfitsio-${key}`,
     version,
     description: `zigfitsio prebuilt shared library for ${key}${t.libc ? ` (${t.libc})` : ""}`,
     main: "index.cjs",
@@ -81,7 +81,7 @@ for (const key of keys) {
   );
   writeFileSync(
     join(pkgDir, "README.md"),
-    `# @zigfitsio/${key}\n\nPrebuilt \`zigfitsio_capi\` shared library for ${key}. ` +
+    `# zigfitsio-${key}\n\nPrebuilt \`zigfitsio_capi\` shared library for ${key}. ` +
       `This is a platform package of [zigfitsio](https://www.npmjs.com/package/zigfitsio); ` +
       `install \`zigfitsio\` instead of depending on this directly.\n`,
   );

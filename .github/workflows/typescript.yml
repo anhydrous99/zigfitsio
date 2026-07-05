@@ -4,7 +4,7 @@ name: TypeScript bindings & npm release
 # Node via koffi — across the OS matrix, in Debug AND ReleaseFast (the wheel lane taught us
 # release-mode codegen bugs hide behind Debug-only CI), plus a TS<->Python interop cross-check.
 #
-# Release automation: pushing a tag `vX.Y.Z` cross-compiles the 7 @zigfitsio/* platform
+# Release automation: pushing a tag `vX.Y.Z` cross-compiles the 7 `zigfitsio-*` platform
 # packages from one runner and publishes them + the main `zigfitsio` package to npm via
 # trusted publishing (OIDC, npm >= 11.5). npm trusted publishing is bound to THIS FILENAME
 # (typescript.yml) and the `npm` environment — renaming either breaks publishing until the

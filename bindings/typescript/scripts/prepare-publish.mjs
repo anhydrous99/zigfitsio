@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Inject the @zigfitsio/* platform packages as exact-version
+ * Inject the zigfitsio-* platform packages as exact-version
  * optionalDependencies into package.json. Run ONLY right before `npm publish`
  * (CI publish job, or a manual bootstrap release): the committed package.json
  * deliberately omits them so `npm install` works before the platform packages
@@ -29,6 +29,6 @@ function platformList() {
 const path = join(PKG_ROOT, "package.json");
 const pkg = JSON.parse(readFileSync(path, "utf8"));
 const platforms = platformList();
-pkg.optionalDependencies = Object.fromEntries(platforms.map((p) => [`@zigfitsio/${p}`, pkg.version]));
+pkg.optionalDependencies = Object.fromEntries(platforms.map((p) => [`zigfitsio-${p}`, pkg.version]));
 writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
 console.log(`injected ${platforms.length} optionalDependencies at ${pkg.version}: ${platforms.join(", ")}`);

@@ -61,7 +61,7 @@ and are layered:
   TypedArray data, plus a TS-native surface layered on top (discriminated HDU `kind` with typed
   `image()`/`table<T>()` accessors, a columnar-plus-row `TableData`, Map-style `Header`,
   `tableFromArrays`/`imageFromArray` factories, and strided `ImageHDU.section()` cutouts) so
-  idiomatic callers avoid `as` casts. Prebuilt libraries ship as `@zigfitsio/<platform>`
+  idiomatic callers avoid `as` casts. Prebuilt libraries ship as `zigfitsio-<platform>`
   packages; a TS↔Python interop cross-check runs in CI.
 
 ```python
