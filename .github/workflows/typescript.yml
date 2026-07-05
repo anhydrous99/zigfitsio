@@ -115,9 +115,19 @@ jobs:
       - name: Bun lane (bun:ffi)
         run: bun test tests
         working-directory: bindings/typescript
+      # TEMP DIAGNOSTIC (windows Debug crash): run each file in its own vitest
+      # process with verbose test names, so the crashing test is the one after
+      # the last printed line and the remaining files still report.
       - name: Node lane (koffi)
-        run: npx vitest run
+        shell: bash
         working-directory: bindings/typescript
+        run: |
+          rc=0
+          for f in tests/*.test.ts; do
+            echo "===== $f"
+            npx vitest run --reporter=verbose "$f" || { echo "FAILED: $f (exit $?)"; rc=1; }
+          done
+          exit $rc
 
   # TS writes -> Python reads, Python writes -> TS reads, against one shared capi build.
   interop:
