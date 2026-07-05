@@ -136,13 +136,16 @@ merged, or reset at batch granularity:
 This section is a snapshot of the delivery state and becomes moot once the branch is
 merged.
 
-## 3. Language bindings (Python / C ABI) — scope & known gaps
+## 3. Language bindings (Python / TypeScript / C ABI) — scope & known gaps
 
 The bindings under `bindings/` are **additive**: a `zf_*` C-ABI shim (`bindings/capi/`, built by
-`zig build capi`) over the public Zig module, a low-level `ctypes` binding, and a high-level
-NumPy/Astropy-style API. `src/` is unchanged and contains **no C** (the `.h` contract lives under
-`bindings/c/`, outside the `GC-1` guard's `src tools test` scope). Interoperability is verified
-both directions against Astropy and the committed golden corpus. Honest limits as delivered:
+`zig build capi`) over the public Zig module, a low-level `ctypes` binding, a high-level
+NumPy/Astropy-style API, and a TypeScript package (`bindings/typescript/`) mirroring the same two
+layers (Bun `bun:ffi` / Node koffi under an astropy-style TypedArray API). `src/` is unchanged
+and contains **no C** (the `.h` contract lives under `bindings/c/`, outside the `GC-1` guard's
+`src tools test` scope). Interoperability is verified both directions against Astropy and the
+committed golden corpus, plus a TS↔Python cross-check in CI. Honest limits as delivered (they
+apply to both language bindings unless noted; TypeScript-specific ones are listed at the end):
 
 - **Not a CFITSIO drop-in.** The exported symbols are `zf_*`, not `fits_*`/`ff*`; the ABI is
   purpose-built for bindings (opaque handles + runtime datatype codes), not a CFITSIO replacement.
@@ -168,6 +171,16 @@ both directions against Astropy and the committed golden corpus. Honest limits a
   quantizes them *again* (a second, bounded lossy pass at the default level; the codec, tiling
   and method are preserved, and the result is a fully valid file). Integer-codec and lossless
   copies are unaffected; copying compressed HDUs verbatim (no re-quantization) is a follow-up.
+- **TypeScript-specific.** 64-bit integer data uses `BigInt64Array`/`BigUint64Array` (`bigint`
+  values); complex values are interleaved float pairs (no complex array type in JS); header
+  integers parse to `number` when exactly double-representable, else `bigint`;
+  `KeywordNotFound` is not also a `KeyError` (no such JS class); handles need an explicit
+  `close()` (or `using` on runtimes with `Symbol.dispose`) — there is no GC-based freeing.
+  bun:ffi ≤1.3.14 mislays stack-passed arguments on darwin-arm64 (Apple packs them at natural
+  alignment; bun uses 8-byte slots — hit by `zf_write_compressed3`'s two adjacent `int` stack
+  args); the bun backend fuses such pairs into one `u64` transparently
+  (`bindings/typescript/src/ffi/bun.ts`), which stays byte-identical on a fixed bun. Do not
+  remove the workaround.
 
 None of these require ABI changes to address — they are extension points, not design constraints.
 
