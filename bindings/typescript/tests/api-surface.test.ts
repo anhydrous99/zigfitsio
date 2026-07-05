@@ -166,7 +166,11 @@ describe("Header surface", () => {
 
     expect(h.get("A")).toBe(1);
     expect(h.get("NOSUCH", "fallback")).toBe("fallback");
-    expect([...h]).toEqual(["A", "B"]);
+    expect([...h]).toEqual([
+      ["A", 1],
+      ["B", "two"],
+    ]);
+    expect(h.keys()).toEqual(["A", "B"]);
     expect(h.length).toBe(2);
     expect(h.entries()).toEqual([
       ["A", 1],

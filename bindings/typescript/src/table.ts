@@ -9,6 +9,7 @@ import { FitsError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupport
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import { BaseHDU, writeConventionOffset, type HDUOptions } from "./hdu.js";
+import type { ElementOf } from "./fitsarray.js";
 import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
 
 // ════════════════════════════════════════════════════════════════════════
@@ -17,16 +18,80 @@ import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
 
 export type ColumnKind = "numeric" | "string" | "complex" | "vla";
 
-export interface ColumnData {
-  kind: ColumnKind;
-  /** Element dtype (c8/c16 for complex — interleaved float pairs). */
+/** A fixed-width or scaled numeric column: a flat `nrows*repeat` TypedArray. */
+export interface NumericColumn {
+  kind: "numeric";
   dtype: dt.Dtype;
-  /** Elements per row (string columns: the field width in characters). */
   repeat: number;
-  values: dt.TypedArray | string[] | dt.TypedArray[];
+  values: dt.TypedArray;
 }
 
-export class TableData {
+/** A complex column: interleaved re/im float pairs (2 floats per element). */
+export interface ComplexColumn {
+  kind: "complex";
+  /** `c8` (Float32) or `c16` (Float64). */
+  dtype: dt.Dtype;
+  repeat: number;
+  values: Float32Array | Float64Array;
+}
+
+/** A character column: one fixed-width string per row. */
+export interface StringColumn {
+  kind: "string";
+  dtype: dt.Dtype;
+  /** The field width in characters. */
+  repeat: number;
+  values: string[];
+}
+
+/** A variable-length-array column: one TypedArray cell per row. */
+export interface VlaColumn {
+  kind: "vla";
+  dtype: dt.Dtype;
+  repeat: number;
+  values: dt.TypedArray[];
+}
+
+/**
+ * One materialized table column. Discriminated on `kind`, so a
+ * `switch (col.kind)` narrows `values` to the exact array type.
+ */
+export type ColumnData = NumericColumn | ComplexColumn | StringColumn | VlaColumn;
+
+/** The value array a column exposes, by kind. */
+export type ColumnValues = dt.TypedArray | string[] | dt.TypedArray[];
+
+/**
+ * A column-name → value-array shape, used as the optional type parameter of
+ * `TableData<T>` (and `HDUList.table<T>()`) for typed column/row reads. This
+ * is a compile-time contract only — the runtime never checks it.
+ */
+export type ColumnShape = Record<string, ColumnValues>;
+
+/**
+ * The element yielded for one column cell in a `Row<T>` (see `TableData.row`).
+ * A numeric column resolves to `ElementOf<V> | V` — a scalar for a repeat-1
+ * column, or a (zero-copy) slice of the same TypedArray type for a vector
+ * column — a runtime distinction TypeScript cannot see, so both are offered.
+ */
+export type RowCell<V> = V extends string[]
+  ? string
+  : V extends (infer E extends dt.TypedArray)[]
+    ? E
+    : V extends dt.TypedArray
+      ? ElementOf<V> | V
+      : never;
+
+/**
+ * One row as a plain object keyed by column name. Numeric cells are a scalar
+ * when the column's repeat is 1, else a (zero-copy) TypedArray slice — a
+ * runtime distinction TypeScript cannot see, hence the `ElementOf<V> | V`
+ * union. For a statically known shape, prefer the column accessors
+ * (`numeric`/`strings`/`vla`/`complex`).
+ */
+export type Row<T extends ColumnShape = ColumnShape> = { [K in keyof T]: RowCell<T[K]> };
+
+export class TableData<T extends ColumnShape = ColumnShape> implements Iterable<Row<T>> {
   readonly names: readonly string[];
   readonly columns: ReadonlyMap<string, ColumnData>;
   readonly nrows: number;
@@ -37,15 +102,95 @@ export class TableData {
     this.nrows = nrows;
   }
 
+  /** Row count (alias of `nrows`, matching Arrow's `Table.numRows`). */
+  get numRows(): number {
+    return this.nrows;
+  }
+
+  /** Column count (matching Arrow's `Table.numCols`). */
+  get numCols(): number {
+    return this.names.length;
+  }
+
   column(name: string): ColumnData {
     const c = this.columns.get(name);
     if (c === undefined) throw new FitsTableError(302, `no such column: ${name}`);
     return c;
   }
 
-  /** The raw values of one column. */
-  get(name: string): dt.TypedArray | string[] | dt.TypedArray[] {
+  /** The raw values of one column (typed by the column shape `T` when known). */
+  get<K extends keyof T & string>(name: K): T[K];
+  get(name: string): ColumnValues;
+  get(name: string): ColumnValues {
     return this.column(name).values;
+  }
+
+  private _typed<C extends ColumnData>(name: string, kind: C["kind"], expected: string): C["values"] {
+    const c = this.column(name);
+    if (c.kind !== kind) {
+      throw new FitsTypeError(410, `column ${name} is ${c.kind}, expected ${expected}`);
+    }
+    return (c as C).values;
+  }
+
+  /** A fixed-width/scaled numeric column's flat TypedArray (throws otherwise). */
+  numeric(name: string): dt.TypedArray {
+    return this._typed<NumericColumn>(name, "numeric", "numeric");
+  }
+
+  /** A character column's per-row strings (throws otherwise). */
+  strings(name: string): string[] {
+    return this._typed<StringColumn>(name, "string", "string");
+  }
+
+  /** A variable-length-array column's per-row TypedArrays (throws otherwise). */
+  vla(name: string): dt.TypedArray[] {
+    return this._typed<VlaColumn>(name, "vla", "vla");
+  }
+
+  /** A complex column's interleaved re/im floats (throws otherwise). */
+  complex(name: string): Float32Array | Float64Array {
+    return this._typed<ComplexColumn>(name, "complex", "complex");
+  }
+
+  /** One cell of a column for a 0-based row (scalar, slice, string, or VLA). */
+  private _cell(cd: ColumnData, r: number): number | bigint | string | dt.TypedArray {
+    if (cd.kind === "string") return cd.values[r];
+    if (cd.kind === "vla") return cd.values[r];
+    if (cd.kind === "complex") {
+      const w = cd.repeat * 2; // 2 floats per complex element
+      return cd.values.subarray(r * w, (r + 1) * w);
+    }
+    // numeric: scalar when repeat === 1, else a zero-copy row slice.
+    if (cd.repeat === 1) return cd.values[r];
+    return cd.values.subarray(r * cd.repeat, (r + 1) * cd.repeat) as dt.TypedArray;
+  }
+
+  /**
+   * One row as a plain object keyed by column name (0-based). Numeric cells
+   * are scalars for repeat-1 columns and (zero-copy) TypedArray slices
+   * otherwise; mutating a returned slice mutates the column.
+   */
+  row(i: number): Row<T> {
+    if (i < 0 || i >= this.nrows) throw new RangeError(`row ${i} out of range (${this.nrows} rows)`);
+    const out: Record<string, unknown> = {};
+    for (const name of this.names) out[name] = this._cell(this.column(name), i);
+    return out as Row<T>;
+  }
+
+  /** Lazily yield every row as a plain object (see `row`). */
+  *rows(): IterableIterator<Row<T>> {
+    for (let i = 0; i < this.nrows; i++) yield this.row(i);
+  }
+
+  /** Iterating a `TableData` yields rows (matching Arrow's `Table`). */
+  [Symbol.iterator](): IterableIterator<Row<T>> {
+    return this.rows();
+  }
+
+  /** Every row as an array of plain objects. */
+  toArray(): Row<T>[] {
+    return [...this.rows()];
   }
 }
 
@@ -282,18 +427,24 @@ export interface FromColumnsOptions {
   name?: string;
 }
 
-export abstract class TableHDU extends BaseHDU {
+export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends BaseHDU {
+  // Abstract + widened to the table subtree: every concrete subclass must
+  // supply its own narrower literal (no silently-wrong default), while callers
+  // can still discriminate on the union (TS override-variance requirement).
+  abstract override readonly kind: "bintable" | "asciitable";
   /** @internal */ abstract readonly _tableType: number;
 
+  // Stored untyped (default shape); the column-shape `T` is a compile-time
+  // contract surfaced only at the public `data` boundary.
   /** @internal */ _data: TableData | null = null;
   /** @internal */ _columns: Column[] = [];
   /** @internal */ _nrows = 0;
   /** @internal Per-column baselines for update-mode in-place write-back. */
   _colFingerprints: Map<string, bigint> | null = null;
 
-  get data(): TableData | null {
+  get data(): TableData<T> | null {
     if (this._hdulist !== null && this._data === null) this._data = this._readTable();
-    return this._data;
+    return this._data as TableData<T> | null;
   }
 
   /**
@@ -302,8 +453,8 @@ export abstract class TableHDU extends BaseHDU {
    * a row-count change fails loud. If the table was never read, there is no
    * per-column baseline, so every column counts as changed on the next flush.
    */
-  set data(value: TableData | null) {
-    this._data = value;
+  set data(value: TableData<T> | null) {
+    this._data = value as TableData | null;
     if (this._data !== null && this._colFingerprints === null) this._colFingerprints = new Map();
     this._markDirty();
   }
@@ -329,6 +480,17 @@ export abstract class TableHDU extends BaseHDU {
       const nrowsOut = ll.outI64();
       ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
       const nrows = Number(nrowsOut[0]);
+      // Resolve each column to its slot in the FILE, not its position in this
+      // (possibly reordered) TableData — writing by iteration index would put a
+      // changed column's values into the wrong on-disk column. First card wins,
+      // matching TableData.column()/get().
+      const ncolsOut = ll.outI32();
+      ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+      const fileIndex = new Map<string, number>();
+      for (let j = 0; j < ncolsOut[0]; j++) {
+        const nm = colName(t, j) || `col${j + 1}`;
+        if (!fileIndex.has(nm)) fileIndex.set(nm, j);
+      }
       for (let i = 0; i < rec.names.length; i++) {
         const name = rec.names[i];
         const newFp = colFp(rec.column(name));
@@ -339,7 +501,14 @@ export abstract class TableHDU extends BaseHDU {
             "in-place table update cannot change the row count; use writeTo() to a new file",
           );
         }
-        const info = readColInfo(t, i);
+        const j = fileIndex.get(name);
+        if (j === undefined) {
+          throw new NotSupportedError(
+            410,
+            `in-place update cannot add column '${name}' (not present in the file); use writeTo() to a new file`,
+          );
+        }
+        const info = readColInfo(t, j);
         if (info.isVla) {
           throw new NotSupportedError(
             410,
@@ -353,7 +522,7 @@ export abstract class TableHDU extends BaseHDU {
           );
         }
         const fmt = this._tableType === ll.ASCII_TBL ? asciiTformOf(info) : tformOf(info);
-        writeColumn(t, i, new Column(name, fmt, { array: rec.get(name) as ColumnArray }), nrows);
+        writeColumn(t, j, new Column(name, fmt, { array: rec.get(name) as ColumnArray }), nrows);
         this._colFingerprints!.set(name, newFp);
       }
     });
@@ -473,7 +642,8 @@ export abstract class TableHDU extends BaseHDU {
     const repeat = Math.max(info.repeat, 0);
     if (isComplex) {
       const cdtype: dt.Dtype = binElem === "f4" ? "c8" : "c16";
-      const flat = dt.allocDtype(cdtype, nrows * repeat); // 2 floats per element
+      // c8/c16 allocate a Float32Array/Float64Array (2 floats per element).
+      const flat = dt.allocDtype(cdtype, nrows * repeat) as Float32Array | Float64Array;
       if (flat.length > 0) {
         ll.check(ll.lib.zf_read_col(t, dt.zfCode(binElem), col, 1n, BigInt(nrows * repeat * 2), null, flat));
       }
@@ -555,7 +725,7 @@ export abstract class TableHDU extends BaseHDU {
     });
   }
 
-  static fromColumnsInto<T extends TableHDU>(hdu: T, columns: readonly Column[], options: FromColumnsOptions = {}): T {
+  static fromColumnsInto<H extends TableHDU<ColumnShape>>(hdu: H, columns: readonly Column[], options: FromColumnsOptions = {}): H {
     hdu._columns = [...columns];
     hdu._name = options.name ?? hdu._name;
     const present = columns.filter((c) => c.array !== null).map((c) => colRowCount(c));
@@ -655,19 +825,27 @@ function writeVlaColumn(t: bigint, i: number, col: Column, nrows: number): void 
 // Concrete table HDUs
 // ════════════════════════════════════════════════════════════════════════
 
-export class BinTableHDU extends TableHDU {
+export class BinTableHDU<T extends ColumnShape = ColumnShape> extends TableHDU<T> {
+  override readonly kind = "bintable" as const;
   readonly _tableType = ll.BINARY_TBL;
 
-  static fromColumns(columns: readonly Column[], options: FromColumnsOptions = {}): BinTableHDU {
-    return TableHDU.fromColumnsInto(new BinTableHDU(), columns, options);
+  static fromColumns<T extends ColumnShape = ColumnShape>(
+    columns: readonly Column[],
+    options: FromColumnsOptions = {},
+  ): BinTableHDU<T> {
+    return TableHDU.fromColumnsInto(new BinTableHDU<T>(), columns, options);
   }
 }
 
-export class AsciiTableHDU extends TableHDU {
+export class AsciiTableHDU<T extends ColumnShape = ColumnShape> extends TableHDU<T> {
+  override readonly kind = "asciitable" as const;
   readonly _tableType = ll.ASCII_TBL;
 
-  static fromColumns(columns: readonly Column[], options: FromColumnsOptions = {}): AsciiTableHDU {
-    return TableHDU.fromColumnsInto(new AsciiTableHDU(), columns, options);
+  static fromColumns<T extends ColumnShape = ColumnShape>(
+    columns: readonly Column[],
+    options: FromColumnsOptions = {},
+  ): AsciiTableHDU<T> {
+    return TableHDU.fromColumnsInto(new AsciiTableHDU<T>(), columns, options);
   }
 }
 

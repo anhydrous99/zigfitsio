@@ -97,7 +97,10 @@ describe("Header", () => {
     expect(h.commentOf("Beta")).toBe("second");
     expect(h.keys()).toEqual(["ALPHA", "BETA"]);
     expect(h.length).toBe(2);
-    expect([...h]).toEqual(["ALPHA", "BETA"]);
+    expect([...h]).toEqual([
+      ["ALPHA", 1],
+      ["BETA", "two"],
+    ]);
     h.set("alpha", 5); // updates in place, keeps position
     expect(h.get("ALPHA")).toBe(5);
     expect(h.keys()).toEqual(["ALPHA", "BETA"]);

@@ -5,6 +5,9 @@
  */
 import { dtypeOf, type Dtype, type TypedArray } from "./dtypes.js";
 
+/** The scalar element type a TypedArray holds: `bigint` for 64-bit int arrays, else `number`. */
+export type ElementOf<T extends TypedArray> = T extends BigInt64Array | BigUint64Array ? bigint : number;
+
 export class FitsArray<T extends TypedArray = TypedArray> {
   readonly data: T;
   readonly shape: readonly number[];
@@ -44,11 +47,11 @@ export class FitsArray<T extends TypedArray = TypedArray> {
     return off;
   }
 
-  get(...idx: number[]): number | bigint {
-    return this.data[this.offset(...idx)];
+  get(...idx: number[]): ElementOf<T> {
+    return this.data[this.offset(...idx)] as ElementOf<T>;
   }
 
-  set(value: number | bigint, ...idx: number[]): void {
+  set(value: ElementOf<T>, ...idx: number[]): void {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (this.data as any)[this.offset(...idx)] = value;
   }

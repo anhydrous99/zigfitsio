@@ -112,6 +112,9 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit -p tsconfig.json
         working-directory: bindings/typescript
+      - name: Typecheck tests (public generics)
+        run: npm run typecheck:tests
+        working-directory: bindings/typescript
       - name: Bun lane (bun:ffi)
         run: bun test tests
         working-directory: bindings/typescript

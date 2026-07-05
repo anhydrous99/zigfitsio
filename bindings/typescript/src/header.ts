@@ -163,7 +163,7 @@ export function parseCards(raws: readonly (Uint8Array | string)[]): CardRec[] {
 }
 
 /** An ordered, case-insensitive collection of FITS keyword records. */
-export class Header implements Iterable<string> {
+export class Header implements Iterable<[string, HeaderValue]> {
   private _cards: CardRec[] = [];
   /** @internal Persist-first write hook (attached writable headers). */
   _persist: ((key: string, value: HeaderValue, comment: string | null) => void) | null = null;
@@ -235,8 +235,17 @@ export class Header implements Iterable<string> {
     if (this._delete === null && this._dirtyCb !== null) this._dirtyCb();
   }
 
-  *[Symbol.iterator](): Iterator<string> {
-    for (const c of this._cards) if (!c.commentary) yield c.keyword;
+  /**
+   * Iterating a `Header` yields `[keyword, value]` entries, like a JS `Map`.
+   * Commentary cards (COMMENT/HISTORY/blank) are excluded; use
+   * `.comments`/`.history` for those, and `.keys()` for the keyword strings.
+   *
+   * A parsed header may contain the same keyword on more than one card;
+   * iteration yields every such card, while `get()` returns the first and
+   * `size` counts them all.
+   */
+  *[Symbol.iterator](): Iterator<[string, HeaderValue]> {
+    for (const c of this._cards) if (!c.commentary) yield [c.keyword, c.value];
   }
 
   get length(): number {
@@ -245,8 +254,20 @@ export class Header implements Iterable<string> {
     return n;
   }
 
+  /** Alias of `length`, matching JS `Map.size`. */
+  get size(): number {
+    return this.length;
+  }
+
   keys(): string[] {
-    return [...this];
+    const out: string[] = [];
+    for (const c of this._cards) if (!c.commentary) out.push(c.keyword);
+    return out;
+  }
+
+  /** Call `cb` for each keyword/value entry, in order (like `Map.forEach`). */
+  forEach(cb: (value: HeaderValue, key: string, header: Header) => void, thisArg?: unknown): void {
+    for (const c of this._cards) if (!c.commentary) cb.call(thisArg, c.value, c.keyword, this);
   }
 
   entries(): [string, HeaderValue][] {

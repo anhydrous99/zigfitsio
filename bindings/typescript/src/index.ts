@@ -14,6 +14,7 @@ export {
   PrimaryHDU,
   CompImageHDU,
   type CompImageHDUOptions,
+  type HDUKind,
   type HDUOptions,
   type ImageHDUOptions,
 } from "./hdu.js";
@@ -27,10 +28,25 @@ export {
   type ColumnKind,
   type ColumnArray,
   type ColumnOptions,
+  type ColumnShape,
+  type ColumnValues,
+  type ComplexColumn,
   type FromColumnsOptions,
+  type NumericColumn,
+  type Row,
+  type RowCell,
+  type StringColumn,
+  type VlaColumn,
 } from "./table.js";
 export { Header, parseCard, parseCards, parseValueComment, type CardRec, type HeaderValue } from "./header.js";
-export { FitsArray, asFitsArray } from "./fitsarray.js";
+export { FitsArray, asFitsArray, type ElementOf } from "./fitsarray.js";
+export {
+  tableFromArrays,
+  imageFromArray,
+  inferTform,
+  type TableFromArraysOptions,
+  type ImageFromArrayOptions,
+} from "./factories.js";
 export {
   FitsError,
   FitsIOError,

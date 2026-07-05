@@ -149,7 +149,23 @@ export interface HDUOptions {
   name?: string;
 }
 
+/**
+ * The concrete HDU flavor, as a string-literal discriminant. Narrow `AnyHDU`
+ * on `hdu.kind` (or use the typed `HDUList.image()`/`table()` accessors) to
+ * avoid `as` casts when reaching for `.data`.
+ *
+ * Narrowing precision, because `PrimaryHDU`/`CompImageHDU` extend `ImageHDU`
+ * (and both table classes extend `TableHDU`): `"image"`, `"bintable"`, and
+ * `"asciitable"` narrow `AnyHDU` to exactly one class; `"primary"` narrows to
+ * `PrimaryHDU | ImageHDU` and `"compimage"` to `CompImageHDU | ImageHDU`. That
+ * imprecision is harmless — every image kind shares the same `FitsArray | null`
+ * `.data` — and the typed `HDUList.image()`/`table()` accessors sidestep it.
+ */
+export type HDUKind = "primary" | "image" | "compimage" | "bintable" | "asciitable";
+
 export abstract class BaseHDU {
+  /** The concrete HDU flavor (discriminant for narrowing `AnyHDU`). */
+  abstract readonly kind: HDUKind;
   readonly isImage: boolean = false;
 
   /** @internal */ _hdulist: HDUList | null = null;
@@ -291,6 +307,9 @@ export interface ImageHDUOptions extends HDUOptions {
 }
 
 export class ImageHDU extends BaseHDU {
+  // Widened to the whole image subtree so `PrimaryHDU`/`CompImageHDU` can
+  // override with a narrower literal (TS override-variance requirement).
+  readonly kind: "image" | "primary" | "compimage" = "image";
   override readonly isImage: boolean = true;
 
   /** @internal */ _data: FitsArray | null = null;
@@ -366,6 +385,90 @@ export class ImageHDU extends BaseHDU {
     // never goes through the data setter and so never sets `_dirty`.
     this._dataFingerprint = fnv1a64(viewBytes(buf));
     return arr;
+  }
+
+  /**
+   * Read a rectangular sub-region (a "cutout") without materializing the whole
+   * image — a strided read over the C ABI (`fits_read_subset`-style), the
+   * geotiff.js `readRasters({ window })` shape.
+   *
+   * `window` is one `[start, stop)` pair per axis in **C order** (`[NAXIS2,
+   * NAXIS1]` for a 2-D image — same axis order as `.shape`/`.data`): 0-based and
+   * half-open, but (unlike `Array.slice`) negative indices are rejected, bounds
+   * are not clamped, and an empty window (`start >= stop`) throws. `step` is an
+   * optional per-axis stride (default 1). Scaling/unsigned/NaN handling matches
+   * a full `.data` read.
+   *
+   * In update mode, pending in-place `.data` edits are flushed to the file
+   * first, so a section is always consistent with `.data`. In read-only mode
+   * the file is read as it was opened — unflushed in-memory edits are not
+   * visible. Only valid on an image HDU opened from a file/bytes.
+   */
+  section(options: { window: readonly (readonly [number, number])[]; step?: readonly number[] }): FitsArray {
+    if (this._hdulist === null) {
+      throw new FitsIOError(104, "section() requires an image HDU opened from a file or bytes");
+    }
+    if (this.kind === "compimage") {
+      // The strided subset path reads a plain image data unit; a tile-
+      // compressed image stores a BINTABLE, so there is no subset to read.
+      throw new NotSupportedError(
+        410,
+        "section() is not supported on a tile-compressed image; read the whole array with .data",
+      );
+    }
+    // section() reads the file bytes; persist any pending in-place edit first
+    // (mirrors HDUList._sourceBytes) so it never returns data staler than .data.
+    if (this._writable() && this._dataChanged()) this._flushData();
+    const { bitpix, axes } = this._imgParam(); // axes: FITS order (fastest first)
+    const ndim = axes.length;
+    if (ndim === 0) throw new FitsIOError(104, "cannot read a section of a data-less image");
+    const cShapeFull = [...axes].reverse(); // C-order axis lengths
+    const window = options.window;
+    const step = options.step ?? new Array(ndim).fill(1);
+    if (window.length !== ndim) {
+      throw new RangeError(`window has ${window.length} axes; image has ${ndim}`);
+    }
+    if (step.length !== ndim) {
+      throw new RangeError(`step has ${step.length} axes; image has ${ndim}`);
+    }
+
+    // Per C-order axis: validate, then compute output length and the FITS
+    // 1-based-inclusive lower/upper/inc for that axis.
+    const outShape: number[] = []; // C order
+    const lowerC: number[] = [];
+    const upperC: number[] = [];
+    const incC: number[] = [];
+    for (let d = 0; d < ndim; d++) {
+      const [start, stop] = window[d];
+      const s = step[d];
+      const len = cShapeFull[d];
+      if (!Number.isInteger(start) || !Number.isInteger(stop) || start < 0 || stop > len || start >= stop) {
+        throw new RangeError(`window[${d}] = [${start}, ${stop}) out of bounds for axis length ${len}`);
+      }
+      if (!Number.isInteger(s) || s < 1) throw new RangeError(`step[${d}] = ${s} must be a positive integer`);
+      const nOut = Math.ceil((stop - start) / s);
+      const last0 = start + (nOut - 1) * s; // last index actually read
+      outShape.push(nOut);
+      // zf_read_subset uses 0-based, inclusive lower/upper bounds.
+      lowerC.push(start);
+      upperC.push(last0);
+      incC.push(s);
+    }
+
+    const outDtype = this._outputDtype(this.header, bitpix);
+    const nelem = outShape.reduce((a, b) => a * b, 1);
+    const buf = dt.allocDtype(outDtype, nelem);
+    // The ABI wants fastest-axis-first (FITS) order: reverse the C-order arrays.
+    const lower = ll.longArray([...lowerC].reverse());
+    const upper = ll.longArray([...upperC].reverse());
+    const inc = ll.longArray([...incC].reverse());
+    const h = this._select();
+    ll.check(
+      ll.lib.zf_read_subset(h, dt.zfCode(outDtype), ndim, lower, upper, inc, BigInt(nelem), null, null, buf),
+    );
+    // The returned flat buffer is fastest-first == C-order for `outShape`
+    // (the standard FITS↔numpy reinterpretation; no transpose needed).
+    return new FitsArray(buf, outShape);
   }
 
   // ── WCS celestial transforms (1-based pixel coords, FITS CRPIX convention) ──
@@ -446,7 +549,9 @@ export class ImageHDU extends BaseHDU {
   }
 }
 
-export class PrimaryHDU extends ImageHDU {}
+export class PrimaryHDU extends ImageHDU {
+  override readonly kind = "primary" as const;
+}
 
 // ════════════════════════════════════════════════════════════════════════
 // Tile-compressed images
@@ -477,6 +582,7 @@ export interface CompImageHDUOptions extends ImageHDUOptions {
 }
 
 export class CompImageHDU extends ImageHDU {
+  override readonly kind = "compimage" as const;
   /** @internal */ _comp: string;
   /** @internal */ _tile: readonly number[] | null;
   /** @internal */ _quantize: string | null;

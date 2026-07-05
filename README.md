@@ -75,7 +75,8 @@ import * as zf from "zigfitsio";
 zf.writeTo("img.fits", new zf.FitsArray(Float32Array.from({ length: 12 }, (_, i) => i), [3, 4]), { overwrite: true });
 const hdul = zf.open("img.fits");
 try {
-  console.log(hdul.get(0).data, hdul.get(0).header.get("NAXIS1"));
+  // `image()`/`table()` assert the HDU flavor, so `.data` is typed (no cast).
+  console.log(hdul.image(0).data, hdul.image(0).header.get("NAXIS1"));
 } finally {
   hdul.close(); // or `using hdul = zf.open(...)` on TypeScript / Bun / Node ≥24
 }

@@ -18,19 +18,22 @@ zf.writeTo(imgPath, data, { overwrite: true });
 {
   const hdul = zf.open(imgPath);
   try {
-    const img = hdul.get(0).data as zf.FitsArray;
+    const img = hdul.image(0).data!; // typed FitsArray — no cast
     console.log("image:", img.shape, img.dtype, "->", img.get(2, 3));
-    console.log("BITPIX =", hdul.get(0).header.get("BITPIX"));
+    console.log("BITPIX =", hdul.image(0).header.get("BITPIX"));
+    // Strided cutout (rows 1..2, cols 2..4) without reading the whole image.
+    const cut = hdul.image(0).section({ window: [[1, 3], [2, 5]] });
+    console.log("section:", cut.shape, "->", Array.from(cut.data));
   } finally {
     hdul.close();
   }
 }
 
-// ── headers ──
+// ── headers (iterate like a Map) ──
 {
   const hdul = zf.open(imgPath, "update");
   try {
-    hdul.get(0).header.set("OBSERVER", "Hubble", "who observed");
+    hdul.image(0).header.set("OBSERVER", "Hubble", "who observed");
   } finally {
     hdul.close();
   }
@@ -53,8 +56,25 @@ new zf.HDUList([new zf.PrimaryHDU(), table]).writeTo(tblPath, { overwrite: true 
 {
   const hdul = zf.open(tblPath);
   try {
-    const rec = hdul.get("EVENTS").data as zf.TableData;
-    console.log("table:", rec.names, `${rec.nrows} rows; FLUX =`, Array.from(rec.get("FLUX") as Float32Array));
+    const rec = hdul.table("EVENTS").data!; // typed TableData — no cast
+    console.log("table:", rec.names, `${rec.numRows} rows; FLUX =`, Array.from(rec.numeric("FLUX")));
+    // Rows as plain objects.
+    for (const row of rec) console.log("  row:", String(row.NAME).trim(), row.FLUX);
+  } finally {
+    hdul.close();
+  }
+}
+
+// ── factory: tableFromArrays infers each TFORM ──
+const tbl2Path = join(dir, "table2.fits");
+new zf.HDUList([
+  new zf.PrimaryHDU(),
+  zf.tableFromArrays({ ID: Int32Array.from([1, 2]), TAG: ["a", "bb"] }, { name: "T2" }),
+]).writeTo(tbl2Path, { overwrite: true });
+{
+  const hdul = zf.open(tbl2Path);
+  try {
+    console.log("tableFromArrays:", hdul.table("T2").data!.strings("TAG"));
   } finally {
     hdul.close();
   }
@@ -69,7 +89,7 @@ new zf.HDUList([new zf.PrimaryHDU(), new zf.CompImageHDU({ data: ramp, compressi
 {
   const hdul = zf.open(compPath);
   try {
-    const got = hdul.get(1).data as zf.FitsArray; // transparent decode
+    const got = hdul.image(1).data!; // transparent decode
     console.log("compressed roundtrip ok:", got.get(15, 15) === 255);
   } finally {
     hdul.close();

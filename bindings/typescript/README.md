@@ -20,18 +20,32 @@ npm install zigfitsio     # or: bun add zigfitsio
 import * as zf from "zigfitsio";
 
 // Write an image (shape is C-order, [NAXIS2, NAXIS1] — same layout as numpy/astropy).
-const data = new zf.FitsArray(Float32Array.from({ length: 24 }, (_, i) => i * 0.25), [4, 6]);
-zf.writeTo("image.fits", data, { overwrite: true });
+const pixels = new zf.FitsArray(Float32Array.from({ length: 24 }, (_, i) => i * 0.25), [4, 6]);
+zf.writeTo("image.fits", pixels, { overwrite: true });
 
 // Read it back. `using` closes the handle at scope exit (or call hdul.close()).
+// `image()`/`table()` assert the HDU flavor, so `.data` is typed — no `as` cast.
 {
   using hdul = zf.open("image.fits");
-  const img = hdul.get(0).data as zf.FitsArray; // lazy read
-  console.log(img.shape, img.dtype, img.get(2, 3));
-  console.log(hdul.get(0).header.get("BITPIX"));
+  const img = hdul.image(0).data; // FitsArray | null (lazy read)
+  console.log(img?.shape, img?.dtype, img?.get(2, 3));
+  console.log(hdul.image(0).header.get("BITPIX"));
+
+  // Read just a strided sub-region (a cutout) without materializing the whole image.
+  const cut = hdul.image(0).section({ window: [[1, 3], [2, 5]], step: [1, 1] });
+  console.log(cut.shape); // [2, 3]
 }
 
-// A binary table with typed, string, and variable-length columns.
+// A binary table — `tableFromArrays` infers each TFORM from the array type.
+zf.tableFromArrays(
+  {
+    INDEX: Int32Array.from([10, 20, 30]),
+    FLUX: Float32Array.from([1.5, 2.5, 3.5]),
+    NAME: ["alpha", "beta", "gamma"],
+  },
+  { name: "EVENTS", units: { FLUX: "Jy" } },
+);
+// Or spell out formats (complex/VLA/hand-tuned widths) with the Column builder:
 const table = zf.BinTableHDU.fromColumns(
   [
     new zf.Column("INDEX", "J", { array: Int32Array.from([10, 20, 30]) }),
@@ -45,8 +59,11 @@ new zf.HDUList([new zf.PrimaryHDU(), table]).writeTo("table.fits", { overwrite: 
 
 {
   using hdul = zf.open("table.fits");
-  const rec = hdul.get("EVENTS").data as zf.TableData;
-  console.log(rec.names, rec.nrows, rec.get("FLUX"));
+  const rec = hdul.table("EVENTS").data; // TableData | null (columnar)
+  // Columnar reads are typed by kind: numeric(), strings(), vla(), complex().
+  console.log(rec?.names, rec?.numRows, rec?.numeric("FLUX"));
+  // …or iterate rows as plain objects.
+  for (const row of rec ?? []) console.log(row.NAME, row.FLUX);
 }
 
 // Tile compression (RICE/GZIP/PLIO/HCOMPRESS incl. lossy + quantized floats).
@@ -55,11 +72,35 @@ new zf.HDUList([new zf.PrimaryHDU(), new zf.CompImageHDU({ data: ramp, compressi
   .writeTo("compressed.fits", { overwrite: true });
 
 // Structural validation + checksums.
-zf.writeTo("check.fits", data, { overwrite: true, checksum: true });
+zf.writeTo("check.fits", new zf.FitsArray(new Float32Array(24), [4, 6]), { overwrite: true, checksum: true });
 console.log(zf.verify("check.fits")); // [] when clean
 
 // WCS (1-based FITS pixel convention).
-// const [lon, lat] = (hdul.get(0) as zf.ImageHDU).pix2world(40.0, 30.0);
+// const [lon, lat] = hdul.image(0).pix2world(40.0, 30.0);
+```
+
+### Typed HDU access, without casts
+
+`HDUList.get()` returns the `AnyHDU` union, so `.data` is `FitsArray | TableData | null`.
+Reach for typed data three ways:
+
+```ts
+using hdul = zf.open("file.fits");
+
+// 1) Typed accessors assert the flavor and throw FitsTypeError on a mismatch.
+const img = hdul.image(0).data; //  FitsArray | null
+const rec = hdul.table("EVENTS").data; //  TableData | null
+
+// 2) Narrow the union on the `kind` discriminant.
+for (const hdu of hdul) {
+  if (hdu.kind === "bintable" || hdu.kind === "asciitable") hdu.data?.numRows;
+  else hdu.data?.shape; // image kinds
+}
+
+// 3) Name the column shape for fully-typed column/row reads.
+const t = hdul.table<{ INDEX: Int32Array; NAME: string[] }>("EVENTS").data!;
+const idx = t.get("INDEX"); // Int32Array
+const first = t.row(0); // { INDEX: …, NAME: string }
 ```
 
 ## Conventions
@@ -81,6 +122,32 @@ console.log(zf.verify("check.fits")); // [] when clean
 - **Errors are typed**: `FitsError` subclasses carrying the CFITSIO-compatible `status`
   (e.g. `KeywordNotFound` status 202, `FitsOverflowError` 412). Unlike Python,
   `KeywordNotFound` is not also a `KeyError` — catch the class.
+- **`Header` iterates like a `Map`.** `for (const [key, value] of header)` yields entries;
+  `header.keys()` returns the keyword strings, and `.forEach`/`.size`/`.entries()` mirror `Map`.
+  (Commentary `COMMENT`/`HISTORY` cards are excluded from iteration — see `.comments`/`.history`.)
+  FITS files may repeat a keyword across cards; iteration yields every card, `get()` returns
+  the first, and `size` counts them all — so `new Map([...header]).size` can be smaller.
+- **`TableData` iterates rows.** `for (const row of rec)` (and `rec.rows()`/`rec.toArray()`)
+  yields a plain object per row; columns stay available via `rec.numeric(name)` etc. Numeric
+  cells are scalars for repeat-1 columns and zero-copy TypedArray slices otherwise.
+
+## Performance & the event loop
+
+The FFI calls are **synchronous and blocking** — a deliberate choice, like
+[`better-sqlite3`](https://github.com/WiseLibs/better-sqlite3): for CPU-bound, serialized work a
+sync API is simpler and faster than paying async overhead per call. The tradeoff is that a large
+read/write **blocks the event loop** for its duration.
+
+Guidance:
+
+- **Read only what you need.** `ImageHDU.section({ window, step })` streams a strided cutout over
+  the C ABI instead of materializing the whole array with `.data` — bounded memory, bounded time.
+  (Not available on tile-compressed images: those decode whole-array via `.data`.)
+- **Offload big jobs to a worker.** For multi-hundred-MB files, run the read on a
+  `node:worker_threads` / Bun `Worker` and transfer the resulting `TypedArray`'s `ArrayBuffer`
+  back — the main thread stays responsive and the pixel buffer moves zero-copy.
+- **`using` frees promptly.** There is no GC-based cleanup; `using hdul = zf.open(...)` (or
+  `hdul.close()`) releases the native handle at scope exit.
 
 ## Low-level escape hatch
 

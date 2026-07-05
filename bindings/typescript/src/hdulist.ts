@@ -4,10 +4,11 @@
  * path + reconstruction), `toBytes`, and the flush-on-close lifecycle.
  */
 import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { FitsIOError } from "./errors.js";
+import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import { BaseHDU, CompImageHDU, ImageHDU, PrimaryHDU } from "./hdu.js";
 import { AsciiTableHDU, BinTableHDU, TableHDU } from "./table.js";
+import type { ColumnShape } from "./table.js";
 import { enc, fnv1a64, viewBytes } from "./util.js";
 import { NotSupportedError } from "./errors.js";
 
@@ -107,6 +108,35 @@ export class HDUList implements Iterable<AnyHDU> {
 
   at(i: number): AnyHDU | undefined {
     return this.hdus.at(i);
+  }
+
+  /**
+   * The HDU at `key`, asserted to be an image HDU (`ImageHDU`, `PrimaryHDU`,
+   * or `CompImageHDU`) so `.data` narrows to `FitsArray | null` with no cast.
+   * `key` defaults to `0` (the primary HDU is always an image); `table()` has
+   * no default because HDU 0 is never a table. Throws `FitsTypeError` if the
+   * HDU is a table.
+   */
+  image(key: number | string = 0): ImageHDU {
+    const hdu = this.get(key);
+    if (!(hdu instanceof ImageHDU)) {
+      throw new FitsTypeError(410, `HDU ${JSON.stringify(key)} is a ${hdu.kind} HDU, not an image HDU`);
+    }
+    return hdu;
+  }
+
+  /**
+   * The HDU at `key`, asserted to be a table HDU (`BinTableHDU` or
+   * `AsciiTableHDU`) so `.data` narrows to `TableData<T> | null` with no cast.
+   * The optional type parameter `T` names the column shape for typed reads
+   * (compile-time only). Throws `FitsTypeError` if the HDU is an image.
+   */
+  table<T extends ColumnShape = ColumnShape>(key: number | string): TableHDU<T> {
+    const hdu = this.get(key);
+    if (!(hdu instanceof TableHDU)) {
+      throw new FitsTypeError(410, `HDU ${JSON.stringify(key)} is a ${hdu.kind} HDU, not a table HDU`);
+    }
+    return hdu as unknown as TableHDU<T>;
   }
 
   append(hdu: AnyHDU): void {
