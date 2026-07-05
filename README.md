@@ -58,8 +58,11 @@ and are layered:
 - **TypeScript/JavaScript** ([`bindings/typescript/`](./bindings/typescript), npm `zigfitsio`):
   the same two layers over the same shared library — a 1:1 FFI mapping (`zigfitsio/lowlevel`,
   Bun `bun:ffi` / Node [koffi](https://koffi.dev/)) and the astropy-style high-level API with
-  TypedArray data. Prebuilt libraries ship as `@zigfitsio/<platform>` packages; a TS↔Python
-  interop cross-check runs in CI.
+  TypedArray data, plus a TS-native surface layered on top (discriminated HDU `kind` with typed
+  `image()`/`table<T>()` accessors, a columnar-plus-row `TableData`, Map-style `Header`,
+  `tableFromArrays`/`imageFromArray` factories, and strided `ImageHDU.section()` cutouts) so
+  idiomatic callers avoid `as` casts. Prebuilt libraries ship as `@zigfitsio/<platform>`
+  packages; a TS↔Python interop cross-check runs in CI.
 
 ```python
 import numpy as np, zigfitsio as zf
