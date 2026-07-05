@@ -3,7 +3,7 @@
  * `_loader.py`). Search order:
  *
  *   1. `ZIGFITSIO_LIBRARY` env var (an explicit path to the shared library).
- *   2. The bundled `@zigfitsio/<platform>` npm package.
+ *   2. The bundled `zigfitsio-<platform>` npm package.
  *   3. A development build under `<repo>/zig-out/{lib|bin}` discovered by
  *      walking parents of this file and of the working directory.
  */
@@ -51,7 +51,7 @@ export function candidatePaths(): string[] {
   // needs no exports map for the library file itself.
   try {
     const req = createRequire(import.meta.url);
-    const pkgJson = req.resolve(`@zigfitsio/${platformKey()}/package.json`);
+    const pkgJson = req.resolve(`zigfitsio-${platformKey()}/package.json`);
     candidates.push(join(dirname(pkgJson), name));
   } catch {
     /* platform package not installed */

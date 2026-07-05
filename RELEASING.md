@@ -5,7 +5,7 @@ which gates on version consistency and the core Zig suite, builds wheels + sdist
 them to PyPI via [trusted publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no
 API tokens anywhere), and then creates a GitHub Release with the tag's CHANGELOG section as
 notes and all artifacts attached. The same tag also runs
-`.github/workflows/typescript.yml`, which cross-compiles the 7 `@zigfitsio/*` platform
+`.github/workflows/typescript.yml`, which cross-compiles the 7 `zigfitsio-*` platform
 packages and publishes them + the main `zigfitsio` npm package via npm trusted publishing.
 
 ```
@@ -53,10 +53,9 @@ Done once per index/repo; nothing here stores a secret.
 
 4. **npm** — trusted publishing is configured **per existing package** (npm has no
    PyPI-style pending publishers), so the first release of all 8 packages must be
-   bootstrapped by hand:
-   - Create the npm org **`zigfitsio`** (owns the `@zigfitsio/*` platform-package scope)
-     and confirm the unscoped name `zigfitsio` is still free — like PyPI, it stays
-     claimable until the first publish, so do this promptly.
+   bootstrapped by hand. All 8 are unscoped — `zigfitsio` (main) and
+   `zigfitsio-<platform>` (the 7 platform packages) — first-come-first-served like PyPI,
+   so confirm none of the 8 names are already taken and do this promptly.
    - Bootstrap once from a logged-in machine (or a short-lived granular automation token,
      deleted afterwards):
 
