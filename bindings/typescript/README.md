@@ -203,3 +203,20 @@ either way.
 - On **Alpine/musl**, prefer Bun: the `@zigfitsio/*-musl` library packages are published,
   but koffi ships no musl prebuilds, so the Node path falls back to a source build that
   needs a C++ toolchain.
+
+### TS-native surface (see CAVEATS.md §3 for the full list)
+
+- **`table<T>()`/`TableData<T>` shapes are compile-time only** — never validated at runtime;
+  the runtime-checked reads are `numeric()/strings()/vla()/complex()` (throw on kind mismatch).
+- **`kind` narrowing** is exact for `"image"`/`"bintable"`/`"asciitable"`; `"primary"` and
+  `"compimage"` narrow to `… | ImageHDU` (same `.data` type — harmless).
+- **Row cells are zero-copy** views over the column buffer; a numeric cell is a scalar *or* a
+  slice (`ElementOf<V> | V`) — mutating one mutates the column.
+- **`section()` is image-data only**: fail-loud on tile-compressed images (read `.data`); it
+  flushes pending edits in update mode and reads the file as-opened in read-only mode.
+- **In-place table write-back matches columns by name** and cannot add columns (fail-loud).
+- **`Header` iterates `[key, value]` entries**; duplicate keywords yield every card, `get()`
+  returns the first, `size` counts all (so `new Map([...header]).size` can be smaller).
+- **`tableFromArrays` inference** rejects `Int8Array`, can't infer complex, and maps empty cells
+  to a VLA; arbitrary `BSCALE`/`BZERO` isn't expressible via the high-level image writer — use
+  `Column`/`lowlevel` for those.
