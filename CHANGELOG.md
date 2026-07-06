@@ -6,6 +6,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.2] - 2026-07-05
+
 ### Added
 - **TypeScript/JavaScript bindings** (`bindings/typescript/`, npm package `zigfitsio`):
   full parity with the Python bindings over the same `zf_*` C ABI, mirroring the two-layer
