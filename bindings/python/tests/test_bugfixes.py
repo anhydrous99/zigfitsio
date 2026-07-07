@@ -432,3 +432,181 @@ def test_table_data_setter_replaces_rows(tmp_fits):
             h[1].data = h[1].data[:3]
     with zf.open(r) as chk:
         assert len(chk[1].data) == 5
+
+
+def _abc_table(p):
+    """Write a 3-column i8 binary table A/B/C for the column-identity tests."""
+    cols = [zf.Column("A", "1K", array=np.array([1, 2, 3], dtype="i8")),
+            zf.Column("B", "1K", array=np.array([10, 20, 30], dtype="i8")),
+            zf.Column("C", "1K", array=np.array([100, 200, 300], dtype="i8"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(p, overwrite=True)
+
+
+def test_update_mode_table_reorder_writes_to_named_columns(tmp_fits):
+    # BUGHUNT-2026-07-06 #2: in-place table write-back must match columns to the file by name, not by
+    # the recarray's positional order. Reassigning a reordered recarray must write each column back
+    # to its OWN cells (pre-fix, a changed column's values landed in whatever column sat at index 0).
+    p = tmp_fits("reorder.fits")
+    _abc_table(p)
+    with zf.open(p, mode="update") as h:
+        reordered = h[1].data[["C", "B", "A"]].copy()  # same column set, reversed order
+        reordered["C"][:] = [111, 222, 333]
+        h[1].data = reordered
+    with zf.open(p) as chk:
+        np.testing.assert_array_equal(chk[1].data["C"], [111, 222, 333])
+        np.testing.assert_array_equal(chk[1].data["A"], [1, 2, 3])
+        np.testing.assert_array_equal(chk[1].data["B"], [10, 20, 30])
+
+
+def test_update_mode_table_column_set_change_fails_loud(tmp_fits):
+    # BUGHUNT-2026-07-06 #2: reassigning a recarray whose column SET differs (here only "C") to a
+    # 3-column file must fail loud and leave the file intact — not silently write "C"'s values into
+    # column "A". This is the exact reported trigger.
+    p = tmp_fits("colset.fits")
+    _abc_table(p)
+    with pytest.raises(NotImplementedError):
+        with zf.open(p, mode="update") as h:
+            _ = h[1].data
+            h[1].data = np.array([(111,), (222,), (333,)], dtype=[("C", "i8")])
+    with zf.open(p) as chk:  # nothing was written
+        np.testing.assert_array_equal(chk[1].data["A"], [1, 2, 3])
+        np.testing.assert_array_equal(chk[1].data["C"], [100, 200, 300])
+
+
+def test_writeto_reassigned_widened_dtype_not_truncated(tmp_fits):
+    # BUGHUNT-2026-07-06 #3: after reassigning a column with a wider dtype, writeto must synthesize a
+    # matching TFORM instead of reusing the old (narrow) one by index and truncating the values.
+    src, out = tmp_fits("wsrc.fits"), tmp_fits("wout.fits")
+    col = zf.Column("V", "1I", array=np.array([1, 2, 3], dtype="i2"))  # int16 on disk
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = np.array([(40000,), (50000,), (60000,)], dtype=[("V", "i8")])  # exceed int16 range
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[1].data["V"], [40000, 50000, 60000])
+
+
+def test_writeto_reassigned_reorder_keeps_column_types(tmp_fits):
+    # BUGHUNT-2026-07-06 #3: a reordered recarray must reconstruct each column with its OWN format;
+    # pre-fix the float column was emitted under the int column's TFORM (by position) and corrupted.
+    src, out = tmp_fits("rsrc.fits"), tmp_fits("rout.fits")
+    cols = [zf.Column("I", "1J", array=np.array([1, 2, 3], dtype="i4")),
+            zf.Column("F", "1D", array=np.array([1.5, 2.5, 3.5], dtype="f8"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = h[1].data[["F", "I"]].copy()  # reversed field order
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[1].data["F"], [1.5, 2.5, 3.5])
+        np.testing.assert_array_equal(chk[1].data["I"], [1, 2, 3])
+
+
+def test_writeto_reassigned_added_column_synthesizes_tform(tmp_fits):
+    # BUGHUNT-2026-07-06 #3: a field with no matching file column synthesizes its TFORM from the
+    # numpy dtype (there is no stale format to reuse).
+    src, out = tmp_fits("asrc.fits"), tmp_fits("aout.fits")
+    col = zf.Column("A", "1J", array=np.array([1, 2, 3], dtype="i4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    grown = np.empty(3, dtype=[("A", "i4"), ("Z", "f8")])
+    grown["A"] = h[1].data["A"]
+    grown["Z"] = [0.25, 0.5, 0.75]
+    h[1].data = grown
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        assert set(chk[1].columns) == {"A", "Z"}
+        np.testing.assert_array_equal(chk[1].data["A"], [1, 2, 3])
+        np.testing.assert_array_equal(chk[1].data["Z"], [0.25, 0.5, 0.75])
+
+
+def test_writeto_logical_column_keeps_l_tform(tmp_fits):
+    # PR #28 review #1: a logical (L) column reads back as u1, but a reconstructing writeto must keep
+    # TFORM 'L' -- not flatten it to the generic 'B'. Values survive either way, so assert the TFORM
+    # letter, not just the values.
+    src, out = tmp_fits("lsrc.fits"), tmp_fits("lout.fits")
+    col = zf.Column("FLAG", "1L", array=np.array([True, False, True]))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = h[1].data.copy()  # dirty the list -> writeto reconstructs via _emit_columns
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        assert chk[1].header["TFORM1"].strip() == "1L"
+        np.testing.assert_array_equal(chk[1].data["FLAG"].astype(bool), [True, False, True])
+
+
+def test_writeto_bit_column_keeps_x_tform(tmp_fits):
+    # PR #28 review #1 (bit variant): an X column also reads back as u1 and must keep TFORM 'X'.
+    src, out = tmp_fits("xsrc.fits"), tmp_fits("xout.fits")
+    col = zf.Column("BITS", "1X", array=np.array([1, 0, 1], dtype="u1"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = h[1].data.copy()
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        assert chk[1].header["TFORM1"].strip() == "1X"
+        np.testing.assert_array_equal(chk[1].data["BITS"], [1, 0, 1])
+
+
+def test_update_mode_unnamed_column_roundtrips(tmp_fits):
+    # PR #28 review #2: a column lacking TTYPE reads back as "col1". The update-mode column-set guard
+    # must use that same synthetic name, so (a) a clean read+close does NOT falsely raise, and (b) an
+    # in-place edit persists (matched by the synthetic name), not corrupts or crashes.
+    p = tmp_fits("unnamed.fits")
+    col = zf.Column("", "1J", array=np.array([1, 2, 3], dtype="i4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(p, overwrite=True)
+    with zf.open(p) as chk:
+        assert chk[1].data.dtype.names == ("col1",)  # unnamed -> synthetic name
+
+    with zf.open(p, mode="update") as h:  # clean no-op close must not raise
+        _ = h[1].data
+    with zf.open(p) as chk:
+        np.testing.assert_array_equal(chk[1].data["col1"], [1, 2, 3])
+
+    with zf.open(p, mode="update") as h:  # in-place edit persists by synthetic name
+        h[1].data["col1"][:] = [10, 20, 30]
+    with zf.open(p) as chk:
+        np.testing.assert_array_equal(chk[1].data["col1"], [10, 20, 30])
+
+
+def test_writeto_unnamed_column_reconstruction_roundtrips(tmp_fits):
+    # PR #28 review #2 (emit mirror): reconstructing writeto must key file columns by the same
+    # synthetic name so an unnamed column reuses its file format rather than collapsing under "".
+    # The VLA column is the genuine guard: pre-fix it collapses to the "" key, has no counterpart to
+    # reuse, and the synthesis path raises (object dtype has no TFORM) -- so writeto crashes.
+    src, out = tmp_fits("usrc.fits"), tmp_fits("uout.fits")
+    vla = np.empty(3, dtype=object)
+    vla[0] = np.array([1, 2, 3], dtype="i4"); vla[1] = np.array([4], dtype="i4"); vla[2] = np.array([], dtype="i4")
+    cols = [zf.Column("", "1J", array=np.array([10, 20, 30], dtype="i4")),
+            zf.Column("", "1PJ", array=vla)]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = h[1].data.copy()  # force reconstruction through _emit_columns
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        assert chk[1].header["TFORM1"].strip() == "1J"
+        assert chk[1].header["TFORM2"].strip() == "1PJ"  # VLA descriptor reused, not synthesized
+        np.testing.assert_array_equal(chk[1].data["col1"], [10, 20, 30])
+        got = chk[1].data["col2"]
+        assert np.array_equal(got[0], [1, 2, 3]) and np.array_equal(got[1], [4]) and got[2].size == 0
+
+
+def test_writeto_added_vla_column_fails_loud(tmp_fits):
+    # PR #28 review minor: a brand-new object/VLA field (no file counterpart) can't synthesize a
+    # TFORM, so writeto raises a clear error rather than emitting a broken column.
+    src, out = tmp_fits("vsrc.fits"), tmp_fits("vout.fits")
+    col = zf.Column("A", "1J", array=np.array([1, 2, 3], dtype="i4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    grown = np.empty(3, dtype=[("A", "i4"), ("V", object)])
+    grown["A"] = h[1].data["A"]
+    grown["V"] = [np.array([1]), np.array([2, 3]), np.array([4])]
+    h[1].data = grown
+    with pytest.raises(ll.FitsError):
+        h.writeto(out, overwrite=True)
+    h.close()
