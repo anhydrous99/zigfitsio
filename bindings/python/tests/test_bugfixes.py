@@ -432,3 +432,91 @@ def test_table_data_setter_replaces_rows(tmp_fits):
             h[1].data = h[1].data[:3]
     with zf.open(r) as chk:
         assert len(chk[1].data) == 5
+
+
+def _abc_table(p):
+    """Write a 3-column i8 binary table A/B/C for the column-identity tests."""
+    cols = [zf.Column("A", "1K", array=np.array([1, 2, 3], dtype="i8")),
+            zf.Column("B", "1K", array=np.array([10, 20, 30], dtype="i8")),
+            zf.Column("C", "1K", array=np.array([100, 200, 300], dtype="i8"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(p, overwrite=True)
+
+
+def test_update_mode_table_reorder_writes_to_named_columns(tmp_fits):
+    # BUGHUNT-2026-07-06 #2: in-place table write-back must match columns to the file by name, not by
+    # the recarray's positional order. Reassigning a reordered recarray must write each column back
+    # to its OWN cells (pre-fix, a changed column's values landed in whatever column sat at index 0).
+    p = tmp_fits("reorder.fits")
+    _abc_table(p)
+    with zf.open(p, mode="update") as h:
+        reordered = h[1].data[["C", "B", "A"]].copy()  # same column set, reversed order
+        reordered["C"][:] = [111, 222, 333]
+        h[1].data = reordered
+    with zf.open(p) as chk:
+        np.testing.assert_array_equal(chk[1].data["C"], [111, 222, 333])
+        np.testing.assert_array_equal(chk[1].data["A"], [1, 2, 3])
+        np.testing.assert_array_equal(chk[1].data["B"], [10, 20, 30])
+
+
+def test_update_mode_table_column_set_change_fails_loud(tmp_fits):
+    # BUGHUNT-2026-07-06 #2: reassigning a recarray whose column SET differs (here only "C") to a
+    # 3-column file must fail loud and leave the file intact — not silently write "C"'s values into
+    # column "A". This is the exact reported trigger.
+    p = tmp_fits("colset.fits")
+    _abc_table(p)
+    with pytest.raises(NotImplementedError):
+        with zf.open(p, mode="update") as h:
+            _ = h[1].data
+            h[1].data = np.array([(111,), (222,), (333,)], dtype=[("C", "i8")])
+    with zf.open(p) as chk:  # nothing was written
+        np.testing.assert_array_equal(chk[1].data["A"], [1, 2, 3])
+        np.testing.assert_array_equal(chk[1].data["C"], [100, 200, 300])
+
+
+def test_writeto_reassigned_widened_dtype_not_truncated(tmp_fits):
+    # BUGHUNT-2026-07-06 #3: after reassigning a column with a wider dtype, writeto must synthesize a
+    # matching TFORM instead of reusing the old (narrow) one by index and truncating the values.
+    src, out = tmp_fits("wsrc.fits"), tmp_fits("wout.fits")
+    col = zf.Column("V", "1I", array=np.array([1, 2, 3], dtype="i2"))  # int16 on disk
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = np.array([(40000,), (50000,), (60000,)], dtype=[("V", "i8")])  # exceed int16 range
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[1].data["V"], [40000, 50000, 60000])
+
+
+def test_writeto_reassigned_reorder_keeps_column_types(tmp_fits):
+    # BUGHUNT-2026-07-06 #3: a reordered recarray must reconstruct each column with its OWN format;
+    # pre-fix the float column was emitted under the int column's TFORM (by position) and corrupted.
+    src, out = tmp_fits("rsrc.fits"), tmp_fits("rout.fits")
+    cols = [zf.Column("I", "1J", array=np.array([1, 2, 3], dtype="i4")),
+            zf.Column("F", "1D", array=np.array([1.5, 2.5, 3.5], dtype="f8"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    h[1].data = h[1].data[["F", "I"]].copy()  # reversed field order
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[1].data["F"], [1.5, 2.5, 3.5])
+        np.testing.assert_array_equal(chk[1].data["I"], [1, 2, 3])
+
+
+def test_writeto_reassigned_added_column_synthesizes_tform(tmp_fits):
+    # BUGHUNT-2026-07-06 #3: a field with no matching file column synthesizes its TFORM from the
+    # numpy dtype (there is no stale format to reuse).
+    src, out = tmp_fits("asrc.fits"), tmp_fits("aout.fits")
+    col = zf.Column("A", "1J", array=np.array([1, 2, 3], dtype="i4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src, overwrite=True)
+    h = zf.open(src)
+    grown = np.empty(3, dtype=[("A", "i4"), ("Z", "f8")])
+    grown["A"] = h[1].data["A"]
+    grown["Z"] = [0.25, 0.5, 0.75]
+    h[1].data = grown
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        assert set(chk[1].columns) == {"A", "Z"}
+        np.testing.assert_array_equal(chk[1].data["A"], [1, 2, 3])
+        np.testing.assert_array_equal(chk[1].data["Z"], [0.25, 0.5, 0.75])

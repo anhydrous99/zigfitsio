@@ -74,6 +74,56 @@ def _ascii_tform_of(info) -> str:
     return f"I{w}"  # integer column of any width
 
 
+# numpy element dtype -> binary-table TFORM letter (the inverse of dtypes._TFORM_BIN). Unsigned
+# integers map to the signed letter of matching width; _write_to re-applies the TZEROn convention
+# (see _unsigned_col_tzero) so the column still round-trips as unsigned.
+_DTYPE_TO_TFORM = {
+    np.dtype("bool"): "L",
+    np.dtype("u1"): "B", np.dtype("i1"): "B",
+    np.dtype("i2"): "I", np.dtype("u2"): "I",
+    np.dtype("i4"): "J", np.dtype("u4"): "J",
+    np.dtype("i8"): "K", np.dtype("u8"): "K",
+    np.dtype("f4"): "E", np.dtype("f8"): "D",
+    np.dtype("c8"): "C", np.dtype("c16"): "M",
+}
+
+
+def _tform_from_dtype(field_dtype) -> str:
+    """Synthesize a binary-table TFORM from a numpy structured-field dtype (the inverse of
+    :func:`_dtypes.bin_elem_dtype`). Handles subarray repeat counts, fixed-width strings, complex,
+    bool, and the unsigned-integer convention. Used to format a field that has no matching file
+    column (a reassigned recarray that added or retyped a column) so its values are never truncated
+    to a stale TFORM."""
+    base = field_dtype
+    repeat = 1
+    if field_dtype.subdtype is not None:  # e.g. ('f4', (3,)) -> a length-3 vector column
+        base, shape = field_dtype.subdtype
+        repeat = int(np.prod(shape)) if shape else 1
+    base = base.newbyteorder("=")
+    if base.kind in ("S", "U"):  # fixed-width text -> character column 'wA'
+        width = base.itemsize // 4 if base.kind == "U" else base.itemsize
+        return f"{max(int(width), 1) * repeat}A"
+    letter = _DTYPE_TO_TFORM.get(base)
+    if letter is None:
+        raise ll.FitsTypeError(410, f"cannot synthesize a table TFORM for numpy dtype {field_dtype!r}")
+    return f"{repeat}{letter}"
+
+
+def _binary_tform_for(info, field) -> str:
+    """Choose a binary-table TFORM for a recarray field on write-back/copy. Reuse the same-named
+    file column's stored TFORM when it still describes the field — the only way to reproduce VLA,
+    unsigned, scaled, or exact-width string columns — otherwise synthesize one from the numpy dtype
+    so a new or retyped field is never written under a stale (truncating) format. ``info`` is the
+    matching file column (or None when the field has no counterpart)."""
+    if info is not None and (info.is_vla or field == np.dtype(object)):
+        return _tform_of(info)  # object/VLA: only the file descriptor can describe it
+    synth = _tform_from_dtype(field)
+    if info is None:
+        return synth  # added/renamed field with no file counterpart
+    have = _tform_of(info)  # a scaled column raises here (unreconstructable) — preserved as today
+    return have if have.strip().upper() == synth.strip().upper() else synth
+
+
 def _vla_elem_dtype(fmt: str):
     """(numpy element dtype, is_complex) for a VLA TFORM like '1PJ' / '1QE(max)'."""
     marker = "P" if "P" in fmt else "Q"
@@ -606,9 +656,10 @@ class _TableHDU(_HDU):
         return any(_col_fp(self._data[n]) != self._col_fingerprints.get(n) for n in self._data.dtype.names)
 
     def _flush_data(self):
-        """Write back in-place edits to a materialized table's cell values (update mode). Only
-        changed columns are rewritten; changing the row count or editing a VLA/scaled column in
-        place is not supported (use writeto() to a new file, which reconstructs)."""
+        """Write back in-place edits to a materialized table's cell values (update mode). Changed
+        columns are matched to the file by name (never by position), so a reordered recarray still
+        writes each column to its own cells. Changing the row count or column set, or editing a
+        VLA/scaled column in place, is not supported (use writeto() to a new file, which reconstructs)."""
         if self._data is None or self._col_fingerprints is None:
             return
         rec = self._data
@@ -621,7 +672,19 @@ class _TableHDU(_HDU):
             nrows_ = c.c_longlong()
             ll.check(ll.lib.zf_table_nrows(t, c.byref(nrows_)))
             nrows = int(nrows_.value)
-            for i, name in enumerate(rec.dtype.names):
+            ncols_ = c.c_int()
+            ll.check(ll.lib.zf_table_ncols(t, c.byref(ncols_)))
+            file_cols = [self._col_name(t, j) for j in range(ncols_.value)]
+            col_index = {nm: j for j, nm in enumerate(file_cols)}
+            # Address file columns by NAME, not by the recarray's positional order (a reassigned
+            # recarray may reorder its columns). A changed column set — renamed/added/dropped — can't
+            # be applied in place without rewriting the file, so fail loud (leaving the file intact)
+            # and steer to writeto(), mirroring the row-count guard below.
+            if set(rec.dtype.names) != set(file_cols):
+                raise NotImplementedError(
+                    "in-place table update cannot change the column set; use writeto() to a new file"
+                )
+            for name in rec.dtype.names:
                 new_fp = _col_fp(rec[name])
                 if new_fp == self._col_fingerprints.get(name):
                     continue  # column unchanged
@@ -629,8 +692,9 @@ class _TableHDU(_HDU):
                     raise NotImplementedError(
                         "in-place table update cannot change the row count; use writeto() to a new file"
                     )
+                j = col_index[name]
                 info = ll.ZfColInfo()
-                ll.check(ll.lib.zf_table_col_info(t, i, c.byref(info)))
+                ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
                 if info.is_vla:
                     raise NotImplementedError(
                         "in-place update of a variable-length-array column is not supported; use writeto()"
@@ -640,7 +704,7 @@ class _TableHDU(_HDU):
                         "in-place update of a scaled/unsigned (TSCAL/TZERO) column is not supported; use writeto()"
                     )
                 fmt = _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
-                _TableHDU._write_column(t, i, Column(name, fmt, array=rec[name]), nrows)
+                _TableHDU._write_column(t, j, Column(name, fmt, array=rec[name]), nrows)
                 self._col_fingerprints[name] = new_fp
         finally:
             ll.lib.zf_table_close(t)
@@ -821,11 +885,29 @@ class _TableHDU(_HDU):
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
         try:
-            cols = []
-            for i, name in enumerate(data.dtype.names):
+            ncols_ = c.c_int()
+            ll.check(ll.lib.zf_table_ncols(t, c.byref(ncols_)))
+            # Map file columns by NAME so a reassigned recarray keeps each field's true format even
+            # when reordered; a positional pairing would hand a field the wrong column's TFORM and
+            # silently truncate it. A new/retyped field synthesizes its format from the numpy dtype
+            # (see _binary_tform_for / _tform_from_dtype).
+            file_info = {}
+            for j in range(ncols_.value):
                 info = ll.ZfColInfo()
-                ll.check(ll.lib.zf_table_col_info(t, i, c.byref(info)))
-                fmt = _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
+                ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
+                file_info[self._col_name(t, j)] = info
+            cols = []
+            for name in data.dtype.names:
+                info = file_info.get(name)
+                if self._table_type == ll.ASCII_TBL:
+                    if info is None:
+                        raise NotImplementedError(
+                            "writeto() cannot add or rename an ASCII-table column from a reassigned "
+                            "recarray; rebuild the table with AsciiTableHDU.from_columns(...)"
+                        )
+                    fmt = _ascii_tform_of(info)
+                else:
+                    fmt = _binary_tform_for(info, data.dtype.fields[name][0])
                 cols.append(Column(name, fmt, array=data[name]))
             return cols, nrows
         finally:
