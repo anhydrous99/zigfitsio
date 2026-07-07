@@ -254,7 +254,9 @@ that work — each is *fail-loud* (a clear error), never silent data loss.
   `reverse()` raise `NotImplementedError` — use `writeto()`); the **same HDU object may not occupy
   two positions** (`ValueError` — insert a copy instead); an HDU adopted from *another* HDUList is
   re-serialized through the reconstruct path, which does not yet preserve a table's user keywords
-  (pre-existing `_emit` limitation, tracked in `BUGHUNT-2026-07-06.md`).
+  (pre-existing `_emit` limitation, tracked in `BUGHUNT-2026-07-06.md`). One undetected aliasing
+  edge (same as astropy): a single `Header` object shared between two different HDUs — the
+  last-flushed HDU wins the header's live-persist hook; give each HDU its own `Header`.
 - **Python: `append` and structural table edits go through the file, not a scratch copy.** Appending
   an HDU to an update-mode list serializes it to the open file on `flush()`/`close()`. The HDU-level
   reconcile above rolls back its append phase on failure; there is still no transactional rollback of

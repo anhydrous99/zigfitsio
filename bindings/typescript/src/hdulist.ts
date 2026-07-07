@@ -213,17 +213,19 @@ export class HDUList implements Iterable<AnyHDU> {
     if (prefix === this.hdus.length && prefix === this._scannedCount) {
       return; // layout already matches the file
     }
-    // ── pre-flight guards: every rejection fires BEFORE any file mutation ──
+    // ── pre-flight guards: every rejection fires BEFORE any file mutation. The type check
+    // runs first (over the whole list) so a stray object at position 0 reports what it is,
+    // not a misleading "primary must remain first". ──
+    for (const hdu of this.hdus) {
+      if (!(hdu instanceof BaseHDU)) {
+        throw new FitsTypeError(410, `HDUList contains a non-HDU object: ${String(hdu)}`);
+      }
+    }
     if (prefix === 0) {
       throw new NotSupportedError(
         410,
         "the primary HDU of an open file must remain first; use writeTo() to a new file",
       );
-    }
-    for (const hdu of this.hdus.slice(prefix)) {
-      if (!(hdu instanceof BaseHDU)) {
-        throw new FitsTypeError(410, `HDUList contains a non-HDU object: ${String(hdu)}`);
-      }
     }
     if (new Set(this.hdus).size !== this.hdus.length) {
       throw new FitsTypeError(
@@ -267,7 +269,8 @@ export class HDUList implements Iterable<AnyHDU> {
       // Count-driven so a fully-created HDU whose column/data write failed
       // halfway is removed too. A cleanup failure is swallowed: the original
       // error matters more, and the file then merely carries extra trailing
-      // HDUs (valid FITS, duplicates — never missing data).
+      // HDUs (valid FITS, duplicates — never missing data). JS catch is
+      // necessarily catch-all; the Python port swallows only Exception.
       try {
         while (this._hduCount() > diskCount) {
           ll.check(ll.lib.zf_delete_hdu(handle, diskCount + 1));

@@ -887,3 +887,49 @@ def test_writeto_of_unflushed_structural_list_leaves_source_intact(tmp_fits):
         assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
     with zf.open(p) as chk:
         assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
+
+
+def test_foreign_checksummed_hdu_drops_stale_checksum_on_flush(tmp_fits):
+    # Review follow-up (PR #29): a foreign HDU serialized through the reconstruct path must not
+    # carry its source file's CHECKSUM/DATASUM — those describe the ORIGINAL bytes and would no
+    # longer verify. (Byte-copied shifted HDUs keep theirs, which stay valid.)
+    p1, p2 = _three_hdu_file(tmp_fits, "ck1.fits"), tmp_fits("ck2.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.ImageHDU(data=np.arange(5, dtype="i4"), name="D")]).writeto(
+        p2, overwrite=True, checksum=True)
+    with zf.open(p2) as other:
+        assert other[1].header.get("CHECKSUM") is not None  # donor really is checksummed
+        with zf.open(p1, mode="update") as h:
+            h.append(other[1])
+    with zf.open(p1) as chk:
+        assert chk[3].header.get("CHECKSUM") is None  # stale card dropped, not copied
+        assert chk[3].header.get("DATASUM") is None
+    assert not [f for f in zf.verify(p1) if "sum" in str(f).lower()]
+
+
+def test_reconstruction_drops_stale_checksum_cards(tmp_fits):
+    # Same rule on the writeto reconstruct path: stale CHECKSUM/DATASUM are stripped (astropy
+    # semantics); writeto(checksum=True) regenerates fresh valid ones instead.
+    src, out, out2 = tmp_fits("cs.fits"), tmp_fits("cs_out.fits"), tmp_fits("cs_out2.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="i2"))]).writeto(src, overwrite=True, checksum=True)
+    hdul = zf.open(src)
+    hdul[0].data = hdul[0].data * 3  # dirty -> writeto reconstructs
+    hdul.writeto(out, overwrite=True)
+    hdul.writeto(out2, overwrite=True, checksum=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert chk[0].header.get("CHECKSUM") is None  # stripped, not stale
+    with zf.open(out2) as chk:
+        assert chk[0].header.get("CHECKSUM") is not None  # regenerated on request
+    assert not [f for f in zf.verify(out2) if "sum" in str(f).lower()]
+
+
+def test_non_hdu_at_primary_slot_raises_typeerror(tmp_fits):
+    # Review follow-up (PR #29): garbage at position 0 must report what it is (TypeError), not
+    # the misleading "primary must remain first" NotImplementedError.
+    p = _three_hdu_file(tmp_fits, "junk.fits")
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h[0] = "not an hdu"
+    with pytest.raises(TypeError):
+        h.close()
+    assert _file_bytes(p) == before

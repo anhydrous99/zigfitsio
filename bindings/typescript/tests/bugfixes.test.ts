@@ -1062,7 +1062,12 @@ describe("structural flush reconcile (insert/delete/reorder persist)", () => {
     hl.hdus.splice(1, 0, new zf.ImageHDU({ data: fill(new Float32Array(3), (i) => i), name: "NEW" }));
     hl.flush();
     const first = Buffer.from(hl._sourceBytes());
-    expect(names(zf.fromBytes(first))).toEqual(["PRIMARY", "NEW", "A", "B"]);
+    const parsed = zf.fromBytes(first);
+    try {
+      expect(names(parsed)).toEqual(["PRIMARY", "NEW", "A", "B"]);
+    } finally {
+      parsed.close();
+    }
     hl.flush();
     expect(Buffer.from(hl._sourceBytes()).equals(first)).toBe(true);
     hl.close();
@@ -1077,7 +1082,48 @@ describe("structural flush reconcile (insert/delete/reorder persist)", () => {
     expect(hl._isPristineAttached()).toBe(true); // handle bytes now match the list
     const out = hl.toBytes(); // ...so this is the verbatim byte-copy path
     hl.close();
-    expect(names(zf.fromBytes(out))).toEqual(["PRIMARY", "NEW", "A", "B"]);
+    const parsed = zf.fromBytes(out);
+    try {
+      expect(names(parsed)).toEqual(["PRIMARY", "NEW", "A", "B"]);
+    } finally {
+      parsed.close();
+    }
+  });
+
+  test("foreign checksummed HDU drops stale CHECKSUM on flush (reconstruct route)", () => {
+    // Review follow-up (PR #29): a foreign HDU serialized through the reconstruct
+    // path must not carry its source file's CHECKSUM/DATASUM — those describe the
+    // ORIGINAL bytes and would no longer verify. (Byte-copied shifted HDUs keep
+    // theirs, which stay valid.)
+    const p1 = threeHduFile();
+    const p2 = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      new zf.ImageHDU({ data: fill(new Int32Array(5), (i) => i), name: "D" }),
+    ]).writeTo(p2, { checksum: true });
+    const other = zf.open(p2);
+    const hl = zf.open(p1, "update");
+    try {
+      expect(other.get(1).header.get("CHECKSUM")).toBeDefined(); // donor really is checksummed
+      hl.append(other.get(1));
+      hl.close();
+    } finally {
+      other.close();
+    }
+    withOpen(p1, (chk) => {
+      expect(chk.get(3).header.get("CHECKSUM")).toBeUndefined(); // stale card dropped, not copied
+      expect(chk.get(3).header.get("DATASUM")).toBeUndefined();
+    });
+    expect(zf.verify(p1).filter((f) => f.severity === "error")).toEqual([]);
+  });
+
+  test("non-HDU at the primary slot raises FitsTypeError, not the primary-first error", () => {
+    const p = threeHduFile();
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.hdus[0] = "not an hdu" as unknown as zf.PrimaryHDU;
+    expect(() => hl.close()).toThrow(zf.FitsTypeError);
+    expect(readFileSync(p).equals(before)).toBe(true);
   });
 
   test("writeTo of an unflushed structural list leaves the source intact", () => {
