@@ -76,7 +76,9 @@ def _ascii_tform_of(info) -> str:
 
 # numpy element dtype -> binary-table TFORM letter (the inverse of dtypes._TFORM_BIN). Unsigned
 # integers map to the signed letter of matching width; _write_to re-applies the TZEROn convention
-# (see _unsigned_col_tzero) so the column still round-trips as unsigned.
+# (see _unsigned_col_tzero) so the column still round-trips as unsigned. Note the intentional
+# asymmetry: bool -> 'L' but u1 -> 'B'. A logical/bit column reads back as u1, so its synthesized
+# letter is 'B'; _tform_interchangeable keeps the file column's own 'L'/'X' on reconstruction.
 _DTYPE_TO_TFORM = {
     np.dtype("bool"): "L",
     np.dtype("u1"): "B", np.dtype("i1"): "B",
@@ -109,19 +111,45 @@ def _tform_from_dtype(field_dtype) -> str:
     return f"{repeat}{letter}"
 
 
+def _tform_repeat_letter(fmt: str):
+    """(repeat, uppercase type letter) for a scalar/vector binary TFORM like '1J' or '8A'."""
+    s = fmt.strip().upper()
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    return int(s[:i] or "1"), s[i:i + 1]
+
+
+def _tform_interchangeable(have: str, synth: str) -> bool:
+    """True when a file column's stored TFORM ``have`` still faithfully represents a field whose
+    numpy dtype synthesizes to ``synth`` — same repeat and same element dtype. Distinct letters that
+    decode to the same element dtype (L/X/B all read as u1) are interchangeable, so a logical or bit
+    column keeps its own 'L'/'X' letter instead of being flattened to the generic 'B'. Strings ('A',
+    whose width lives in the repeat) only match letter-for-letter."""
+    rh, lh = _tform_repeat_letter(have)
+    rs, ls = _tform_repeat_letter(synth)
+    if rh != rs:
+        return False
+    if lh == ls:
+        return True
+    if "A" in (lh, ls):
+        return False
+    return dt.bin_elem_dtype(ord(lh)) == dt.bin_elem_dtype(ord(ls))
+
+
 def _binary_tform_for(info, field) -> str:
     """Choose a binary-table TFORM for a recarray field on write-back/copy. Reuse the same-named
     file column's stored TFORM when it still describes the field — the only way to reproduce VLA,
-    unsigned, scaled, or exact-width string columns — otherwise synthesize one from the numpy dtype
-    so a new or retyped field is never written under a stale (truncating) format. ``info`` is the
-    matching file column (or None when the field has no counterpart)."""
+    unsigned, scaled, logical/bit, or exact-width string columns — otherwise synthesize one from the
+    numpy dtype so a new or retyped field is never written under a stale (truncating) format.
+    ``info`` is the matching file column (or None when the field has no counterpart)."""
     if info is not None and (info.is_vla or field == np.dtype(object)):
         return _tform_of(info)  # object/VLA: only the file descriptor can describe it
     synth = _tform_from_dtype(field)
     if info is None:
         return synth  # added/renamed field with no file counterpart
     have = _tform_of(info)  # a scaled column raises here (unreconstructable) — preserved as today
-    return have if have.strip().upper() == synth.strip().upper() else synth
+    return have if _tform_interchangeable(have, synth) else synth
 
 
 def _vla_elem_dtype(fmt: str):
@@ -674,7 +702,9 @@ class _TableHDU(_HDU):
             nrows = int(nrows_.value)
             ncols_ = c.c_int()
             ll.check(ll.lib.zf_table_ncols(t, c.byref(ncols_)))
-            file_cols = [self._col_name(t, j) for j in range(ncols_.value)]
+            # `or f"col{j+1}"` matches _read_table's synthetic name for a column lacking TTYPE, so a
+            # legal unnamed-column table doesn't trip the column-set guard on a clean no-op close.
+            file_cols = [self._col_name(t, j) or f"col{j + 1}" for j in range(ncols_.value)]
             col_index = {nm: j for j, nm in enumerate(file_cols)}
             # Address file columns by NAME, not by the recarray's positional order (a reassigned
             # recarray may reorder its columns). A changed column set — renamed/added/dropped — can't
@@ -895,7 +925,9 @@ class _TableHDU(_HDU):
             for j in range(ncols_.value):
                 info = ll.ZfColInfo()
                 ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
-                file_info[self._col_name(t, j)] = info
+                # `or f"col{j+1}"` matches _read_table's name for a column lacking TTYPE, so an
+                # unnamed column reuses its file format instead of collapsing under the "" key.
+                file_info[self._col_name(t, j) or f"col{j + 1}"] = info
             cols = []
             for name in data.dtype.names:
                 info = file_info.get(name)
