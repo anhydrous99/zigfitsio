@@ -214,6 +214,50 @@ def test_long_string_quote_split_across_continue():
     assert got == value
 
 
+def test_hierarch_long_string_folded_across_continue():
+    """A HIERARCH long string continued by CONTINUE must fold, not leak the CONTINUE card.
+
+    The value field of a HIERARCH card starts after ``=`` (not at column 10), so the fold must
+    locate it via ``_value_field``. Deterministic, no astropy dependency.
+    """
+    from zigfitsio.header import parse_cards
+
+    # `HIERARCH ESO LONG STR = '` is a 25-col prefix, so each fragment must fit the remaining columns.
+    part1 = "part one is here, " + "x" * 30                 # 48 chars → base card = 75 cols
+    part2 = "part two continues " + "y" * 20 + " END"        # 43 chars → cont card = 55 cols
+    value = part1 + part2
+    base = ("HIERARCH ESO LONG STR = '" + part1 + "&'").ljust(80).encode("ascii")
+    cont = ("CONTINUE  '" + part2 + "'").ljust(80).encode("ascii")
+    assert len(base) == 80 and len(cont) == 80
+
+    cards = parse_cards([base, cont])
+    got = next(c.value for c in cards if not c.commentary and c.keyword == "ESO LONG STR")
+    assert got == value
+    assert all(c.keyword != "CONTINUE" for c in cards)  # continuation consumed, not leaked
+
+
+def test_hierarch_long_string_quote_split_across_continue():
+    """A ``''`` escape pair split across a CONTINUE boundary must not truncate a HIERARCH value.
+
+    Same split-pair hazard as the standard-keyword case, exercised through the HIERARCH value-field
+    path. Deterministic, no astropy dependency.
+    """
+    from zigfitsio.header import parse_cards
+
+    value = ("abc'def&" * 12) + "END"          # 99 chars, quotes and ampersands throughout
+    escaped = value.replace("'", "''")          # FITS doubles quotes
+    cut = 49                                     # 6th block's '' pair; keeps base ≤ 80 with the prefix
+    assert escaped[cut - 1] == "'" and escaped[cut] == "'"  # sanity: split really halves a pair
+    base = ("HIERARCH ESO LSTR = '" + escaped[:cut] + "&'").ljust(80).encode("ascii")
+    cont = ("CONTINUE  '" + escaped[cut:] + "'").ljust(80).encode("ascii")
+    assert len(base) == 80 and len(cont) == 80
+
+    cards = parse_cards([base, cont])
+    got = next(c.value for c in cards if not c.commentary and c.keyword == "ESO LSTR")
+    assert got == value
+    assert all(c.keyword != "CONTINUE" for c in cards)
+
+
 def test_hierarch_keyword_accessible():
     def build(handle):
         ll.check(ll.lib.zf_create_img(handle, 8, 0, None))

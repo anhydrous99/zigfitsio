@@ -105,6 +105,24 @@ def _extract_raw_string(field: str):
     return s[start:], "", True  # unterminated (defensive)
 
 
+def _value_field(text: str) -> "str | None":
+    """Raw value field (escapes intact) for a card, or ``None`` when it has no value field.
+
+    Mirrors the value-field selection in :func:`parse_card`: a standard ``KEY = `` card's value
+    starts at column 10; a ``HIERARCH`` card's value starts after the first ``=``. The naive
+    ``find("=")`` matches ``parse_card`` exactly so the folded value never disagrees with the
+    single-card parse. Kept in sync with ``parse_card`` by construction.
+    """
+    if text[8:10] == "= ":
+        return text[10:]
+    if text[0:8].rstrip() == "HIERARCH":
+        rest = text[8:]
+        eq = rest.find("=")
+        if eq >= 0:
+            return rest[eq + 1 :]
+    return None
+
+
 def parse_card(raw: bytes) -> "_Card | None":
     """Parse one 80-byte card; return None for END."""
     text = raw.decode("ascii", "replace")
@@ -137,7 +155,8 @@ def parse_cards(raws: "list[bytes]") -> "list[_Card]":
     independently would misread the split ``'`` as a closing quote and truncate. The raw fragments
     (each ``&`` continuation sentinel dropped) are concatenated and ``''``→``'`` unescaped exactly
     once, with the comment taken from the last fragment. A lone ``&``-terminated value with no
-    following CONTINUE keeps the ``&`` literally.
+    following CONTINUE keeps the ``&`` literally. Both standard ``KEY = `` cards and ``HIERARCH``
+    long strings are folded (their value field is located by :func:`_value_field`).
     """
     cards: "list[_Card]" = []
     i = 0
@@ -148,8 +167,9 @@ def parse_cards(raws: "list[bytes]") -> "list[_Card]":
         i += 1
         if card is None:  # END
             continue
-        if not card.commentary and isinstance(card.value, str) and raws[base][8:10] == b"= ":
-            raw, comment, is_string = _extract_raw_string(raws[base][10:].decode("ascii", "replace"))
+        field = _value_field(raws[base].decode("ascii", "replace")) if not card.commentary else None
+        if isinstance(card.value, str) and field is not None:
+            raw, comment, is_string = _extract_raw_string(field)
             if (
                 is_string
                 and raw.endswith("&")
