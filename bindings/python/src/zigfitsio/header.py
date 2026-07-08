@@ -72,6 +72,39 @@ def _parse_value_comment(field: str):
         return token, comment
 
 
+def _extract_raw_string(field: str):
+    """Locate a quoted string in a value field without unescaping ``''`` pairs.
+
+    Returns ``(raw_escaped, comment, is_string)`` where ``raw_escaped`` is the substring between
+    the opening and closing quotes with escapes left intact. The closing quote is the first ``'``
+    that is not part of a ``''`` pair and is followed only by spaces then end-of-field or a ``/``
+    comment; a lone ``'`` followed by anything else is content (astropy splits ``''`` escape pairs
+    across ``CONTINUE`` cards, leaving a lone ``'&`` at a card boundary). Returns
+    ``(None, "", False)`` when the field does not hold a string value.
+    """
+    s = field
+    i = 0
+    while i < len(s) and s[i] == " ":
+        i += 1
+    if i >= len(s) or s[i] != "'":
+        return None, "", False
+    i += 1
+    start = i
+    while i < len(s):
+        if s[i] == "'":
+            if i + 1 < len(s) and s[i + 1] == "'":
+                i += 2  # escaped quote → content
+                continue
+            stripped = s[i + 1 :].lstrip(" ")
+            if stripped == "" or stripped[0] == "/":
+                comment = stripped[1:].strip() if stripped[:1] == "/" else ""
+                return s[start:i], comment, True
+            i += 1  # lone quote, not a terminator → content
+        else:
+            i += 1
+    return s[start:], "", True  # unterminated (defensive)
+
+
 def parse_card(raw: bytes) -> "_Card | None":
     """Parse one 80-byte card; return None for END."""
     text = raw.decode("ascii", "replace")
@@ -99,41 +132,44 @@ def parse_card(raw: bytes) -> "_Card | None":
 def parse_cards(raws: "list[bytes]") -> "list[_Card]":
     """Parse a sequence of physical 80-byte cards, folding CONTINUE long-string continuations.
 
-    A string value whose text ends in ``&`` is continued by the following ``CONTINUE`` cards; the
-    fragments are concatenated (each ``&`` sentinel dropped) and the comment taken from the last
-    fragment. A lone ``&``-terminated value with no following CONTINUE keeps the ``&`` literally.
+    Continuation is folded on the *raw* escaped text before unescaping: astropy splits the escaped
+    representation and can cut a ``''`` escape pair across a card boundary, so unescaping each card
+    independently would misread the split ``'`` as a closing quote and truncate. The raw fragments
+    (each ``&`` continuation sentinel dropped) are concatenated and ``''``→``'`` unescaped exactly
+    once, with the comment taken from the last fragment. A lone ``&``-terminated value with no
+    following CONTINUE keeps the ``&`` literally.
     """
     cards: "list[_Card]" = []
     i = 0
     n = len(raws)
     while i < n:
         card = parse_card(raws[i])
+        base = i
         i += 1
         if card is None:  # END
             continue
-        if (
-            not card.commentary
-            and isinstance(card.value, str)
-            and card.value.endswith("&")
-            and i < n
-            and raws[i][0:8].rstrip() == b"CONTINUE"
-        ):
-            parts = [card.value[:-1]]
-            comment = card.comment
-            while i < n and raws[i][0:8].rstrip() == b"CONTINUE":
-                text = raws[i].decode("ascii", "replace")
-                frag, cont_comment = _parse_value_comment(text[8:])
-                i += 1
-                if cont_comment:
-                    comment = cont_comment
-                frag = frag if isinstance(frag, str) else ""
-                if frag.endswith("&"):
-                    parts.append(frag[:-1])
-                else:
-                    parts.append(frag)
-                    break
-            card.value = "".join(parts)
-            card.comment = comment
+        if not card.commentary and isinstance(card.value, str) and raws[base][8:10] == b"= ":
+            raw, comment, is_string = _extract_raw_string(raws[base][10:].decode("ascii", "replace"))
+            if (
+                is_string
+                and raw.endswith("&")
+                and i < n
+                and raws[i][0:8].rstrip() == b"CONTINUE"
+            ):
+                parts = [raw[:-1]]
+                while i < n and raws[i][0:8].rstrip() == b"CONTINUE":
+                    frag, cont_comment, _ = _extract_raw_string(raws[i][8:].decode("ascii", "replace"))
+                    i += 1
+                    if cont_comment:
+                        comment = cont_comment
+                    frag = frag if isinstance(frag, str) else ""
+                    if frag.endswith("&"):
+                        parts.append(frag[:-1])
+                    else:
+                        parts.append(frag)
+                        break
+                card.value = "".join(parts).replace("''", "'").rstrip()
+                card.comment = comment
         cards.append(card)
     return cards
 

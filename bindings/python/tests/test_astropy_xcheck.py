@@ -66,6 +66,26 @@ def test_astropy_decodes_zigfitsio_rice(tmp_fits):
         t.close()
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        ("abc'def&" * 12) + "END",   # quotes and ampersands straddling CONTINUE boundaries
+        "A" * 200,                    # spans several CONTINUE cards
+        ("it's a path/to/x&" * 6) + "end",
+        "no-continuation short'value",
+    ],
+)
+def test_zigfitsio_reads_astropy_long_string(tmp_fits, value):
+    hdr = afits.Header()
+    hdr["LSTR"] = (value, "provenance")
+    p = tmp_fits()
+    afits.PrimaryHDU(header=hdr).writeto(p, overwrite=True)
+    assert afits.getheader(p)["LSTR"] == value  # astropy reads its own file
+    with zf.open(p) as hdul:
+        assert hdul[0].header["LSTR"] == value   # so must zigfitsio
+        assert hdul[0].header.comment_of("LSTR") == "provenance"
+
+
 def test_wcs_matches_astropy(tmp_fits):
     WCS = pytest.importorskip("astropy.wcs").WCS
     data = np.zeros((64, 64), dtype="f4")

@@ -192,6 +192,28 @@ def test_long_string_reassembled():
     assert hh["LONGKEY"] == "X" * 120
 
 
+def test_long_string_quote_split_across_continue():
+    """A '' escape pair split across a CONTINUE boundary (as astropy writes) must not truncate.
+
+    astropy splits the *escaped* representation and can cut a ``''`` pair in half at a card
+    boundary, so the base card ends with a lone ``'`` before the ``&`` sentinel and the CONTINUE
+    starts with the pair's second ``'``. Deterministic, no astropy dependency.
+    """
+    from zigfitsio.header import parse_cards
+
+    value = ("abc'def&" * 12) + "END"          # 99 chars, quotes and ampersands throughout
+    escaped = value.replace("'", "''")          # FITS doubles quotes
+    cut = 67                                     # cuts the 8th block's '' pair after its first '
+    assert escaped[cut - 1] == "'" and escaped[cut] == "'"  # sanity: split really halves a pair
+    base = ("LSTR    = '" + escaped[:cut] + "&'").ljust(80).encode("ascii")
+    cont = ("CONTINUE  '" + escaped[cut:] + "'").ljust(80).encode("ascii")
+    assert len(base) == 80 and len(cont) == 80
+
+    cards = parse_cards([base, cont])
+    got = next(c.value for c in cards if not c.commentary and c.keyword == "LSTR")
+    assert got == value
+
+
 def test_hierarch_keyword_accessible():
     def build(handle):
         ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
