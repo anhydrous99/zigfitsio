@@ -6,7 +6,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **Python**: reading an astropy-written CONTINUE long string containing a single quote no
+  longer silently truncates the value — continuation is folded on the raw escaped text and
+  `''` unescaped exactly once, matching astropy's read path; `HIERARCH` long strings
+  continued across `CONTINUE` cards fold too (both standard `KEY = ` and `HIERARCH` bases).
 
 ## [0.1.2] - 2026-07-05
 
