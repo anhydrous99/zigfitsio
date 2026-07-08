@@ -520,6 +520,83 @@ def test_commentary_preserved_through_reconstruction(tmp_fits):
         assert any("provenance" in cc for cc in chk[0].header.comments)
 
 
+def test_commentary_accumulates_detached(tmp_fits):
+    """BUGHUNT #6: repeated header['COMMENT']/['HISTORY'] must ACCUMULATE, not overwrite."""
+    h = zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2"))
+    h.header["COMMENT"] = "first note"
+    h.header["COMMENT"] = "second note"
+    h.header["HISTORY"] = "step 1"
+    h.header["HISTORY"] = "step 2"
+    # In-memory: both cards present, and commentary is NOT counted as a keyword.
+    assert h.header.comments == ["first note", "second note"]
+    assert h.header.history == ["step 1", "step 2"]
+    assert "COMMENT" not in h.header.keys()
+    assert "HISTORY" not in h.header.keys()
+    assert "COMMENT" in h.header and "HISTORY" in h.header
+    # And they survive a round trip.
+    out = tmp_fits("acc.fits")
+    zf.HDUList([h]).writeto(out, overwrite=True)
+    with zf.open(out) as chk:
+        assert chk[0].header.comments == ["first note", "second note"]
+        assert chk[0].header.history == ["step 1", "step 2"]
+
+
+def test_commentary_accumulates_update_mode(tmp_fits):
+    """Eager (update-mode) commentary writes accumulate through the C ABI and persist on close."""
+    p = tmp_fits()
+    zf.writeto(p, np.zeros((3, 3), dtype="f4"))
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["COMMENT"] = "a"
+        hdul[0].header["COMMENT"] = "b"
+        hdul[0].header.add_history("h1")
+        hdul[0].header.add_history("h2")
+    with zf.open(p) as hdul:
+        assert hdul[0].header.comments == ["a", "b"]
+        assert hdul[0].header.history == ["h1", "h2"]
+    # The malformed valued form (COMMENT = 'text') must never be written.
+    with open(p, "rb") as fh:
+        assert b"COMMENT = '" not in fh.read()
+
+
+def test_commentary_long_text_wraps(tmp_fits):
+    """Text longer than the 72-char free-text field splits across cards instead of truncating."""
+    long_text = "".join(str(i % 10) for i in range(100))  # 100 chars
+    h = zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2"))
+    h.header["COMMENT"] = long_text
+    assert h.header.comments == [long_text[:72], long_text[72:]]  # in-memory, already split
+    out = tmp_fits("wrap.fits")
+    zf.HDUList([h]).writeto(out, overwrite=True)
+    with zf.open(out) as chk:
+        chunks = chk[0].header.comments
+        assert all(len(c) <= 72 for c in chunks)
+        assert "".join(chunks) == long_text
+
+
+def test_commentary_mutable_view_and_replace(tmp_fits):
+    """header['COMMENT'] is a mutable, astropy-like view: index, assign, replace-all, delete."""
+    p = tmp_fits()
+    zf.writeto(p, np.zeros((3, 3), dtype="f4"))
+    with zf.open(p, mode="update") as hdul:
+        hdr = hdul[0].header
+        hdr.add_comment("one")
+        hdr.add_comment("two")
+        view = hdr["COMMENT"]
+        assert len(view) == 2 and view[0] == "one" and list(view) == ["one", "two"]
+        assert view == ["one", "two"]
+        view[0] = "ONE"  # in-place edit persists
+    with zf.open(p) as hdul:
+        assert hdul[0].header.comments == ["ONE", "two"]
+    # Replace-all via list assignment, then delete-all.
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["COMMENT"] = ["x", "y", "z"]
+    with zf.open(p) as hdul:
+        assert hdul[0].header.comments == ["x", "y", "z"]
+    with zf.open(p, mode="update") as hdul:
+        del hdul[0].header["COMMENT"]
+    with zf.open(p) as hdul:
+        assert hdul[0].header.comments == []
+
+
 def test_unknown_open_mode_raises(tmp_fits):
     p = tmp_fits("m.fits")
     zf.HDUList([zf.PrimaryHDU(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)
