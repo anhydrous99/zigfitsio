@@ -381,7 +381,9 @@ export abstract class BaseHDU {
    * @internal Rewrite every commentary card of `keyword` in the open handle to `texts`: delete all
    * by name, then re-append (before END) as raw records. Used for in-place commentary edits,
    * deletions, and array replace-all, where a single append cannot express the new state. Same
-   * delete-then-write-records idiom as the HIERARCH replacement path in `_writeKey`.
+   * delete-then-write-records idiom as the HIERARCH replacement path in `_writeKey`. For the blank
+   * keyword this also rewrites blank separator cards (they share the empty name), so an in-place
+   * edit/delete of blank commentary reorders every blank card — same as astropy.
    */
   _resyncCommentary(keyword: string, texts: HeaderValue[]): void {
     const h = this._select();

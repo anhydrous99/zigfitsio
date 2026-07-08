@@ -597,6 +597,47 @@ def test_commentary_mutable_view_and_replace(tmp_fits):
         assert hdul[0].header.comments == []
 
 
+def test_commentary_blank_keyword_persists(tmp_fits):
+    """Blank-keyword ('') commentary append/edit/delete persist in update mode, consistently (finding 1)."""
+    p = tmp_fits()
+    zf.writeto(p, np.zeros((3, 3), dtype="f4"))
+    blanks = lambda hdr: [c.value for c in hdr._cards if c.commentary and c.keyword == ""]
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header[""] = "blank one"
+        hdul[0].header[""] = "blank two"
+    with zf.open(p) as hdul:
+        assert blanks(hdul[0].header) == ["blank one", "blank two"]
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header[""][0] = "EDITED"  # in-place edit routes through the resync path
+    with zf.open(p) as hdul:
+        assert blanks(hdul[0].header) == ["EDITED", "blank two"]
+    with zf.open(p, mode="update") as hdul:
+        del hdul[0].header[""]  # removes every blank-name card
+    with zf.open(p) as hdul:
+        assert blanks(hdul[0].header) == []
+
+
+def test_commentary_tuple_is_value_comment_not_replace():
+    """A 2-tuple on a commentary key is (text, comment) — one card, not two (finding 2)."""
+    h = zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2")).header
+    h["COMMENT"] = ("the note", "ignored comment")
+    assert h.comments == ["the note"]
+    h["COMMENT"] = ["x", "y"]  # a list still replaces all
+    assert h.comments == ["x", "y"]
+
+
+def test_commentary_view_slice_assignment_raises():
+    """Slice assignment/deletion on the commentary view gives a clear TypeError (finding 3)."""
+    h = zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2")).header
+    h.add_comment("a")
+    h.add_comment("b")
+    assert h["COMMENT"][0:2] == ["a", "b"]  # read-slicing still works
+    with pytest.raises(TypeError):
+        h["COMMENT"][0:1] = ["z"]
+    with pytest.raises(TypeError):
+        del h["COMMENT"][0:1]
+
+
 def test_unknown_open_mode_raises(tmp_fits):
     p = tmp_fits("m.fits")
     zf.HDUList([zf.PrimaryHDU(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)

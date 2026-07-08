@@ -478,7 +478,9 @@ class _HDU:
         by name, then re-append (before END) as raw records. Used for in-place commentary edits,
         deletions, and list replace-all, where a single append cannot express the new state. Same
         delete-then-write-records idiom as the HIERARCH replacement path in ``_write_key``. Rewritten
-        cards migrate to the header end (spec-legal); exact placement holds via reconstruction."""
+        cards migrate to the header end (spec-legal); exact placement holds via reconstruction. For
+        the blank keyword this also rewrites blank *separator* cards (they share the empty name), so
+        an in-place edit/delete of blank commentary reorders every blank card — same as astropy."""
         h = self._select()
         kb = _enc(keyword)
         while True:

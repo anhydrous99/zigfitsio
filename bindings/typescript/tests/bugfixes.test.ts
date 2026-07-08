@@ -1375,4 +1375,20 @@ describe("commentary cards accumulate and persist (BUGHUNT #6)", () => {
     update(p, (hl) => hl.get(0).header.delete("COMMENT"));
     read(p, (hl) => expect(hl.get(0).header.comments).toEqual([]));
   });
+
+  test("blank-keyword ('') commentary append/edit/delete persist in update mode (finding 1)", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(9), [3, 3]));
+    const blanks = (hdr: zf.Header): zf.HeaderValue[] =>
+      hdr.cards().filter(([kw]) => kw === "").map(([, v]) => v);
+    update(p, (hl) => {
+      hl.get(0).header.set("", "blank one");
+      hl.get(0).header.set("", "blank two");
+    });
+    read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual(["blank one", "blank two"]));
+    update(p, (hl) => hl.get(0).header.commentary("").setAt(0, "EDITED"));
+    read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual(["EDITED", "blank two"]));
+    update(p, (hl) => hl.get(0).header.delete(""));
+    read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual([]));
+  });
 });

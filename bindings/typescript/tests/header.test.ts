@@ -1,7 +1,7 @@
 /** Pure card-parser and Header unit tests (no native library needed). */
 import { describe, expect, test } from "./_harness/index.js";
 import { Header, parseCard, parseCards, parseValueComment } from "../src/header.js";
-import { KeywordNotFound } from "../src/errors.js";
+import { FitsTypeError, KeywordNotFound } from "../src/errors.js";
 
 const pad80 = (s: string): string => s.padEnd(80);
 
@@ -263,5 +263,11 @@ describe("commentary cards (BUGHUNT #6)", () => {
     };
     h.set("COMMENT", "hello");
     expect(calls).toEqual([["COMMENT", "hello"]]); // scalar chunk flows through as commentary text
+  });
+
+  test("array value on a valued keyword throws instead of stamping a malformed card", () => {
+    const h = new Header();
+    expect(() => h.set("BITPIX", [1, 2] as unknown as number)).toThrow(FitsTypeError);
+    expect(h.has("BITPIX")).toBe(false);
   });
 });

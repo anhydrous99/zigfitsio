@@ -13,7 +13,7 @@
  * stays a `number` and the unsigned-convention detection ports 1:1, while
  * larger-than-2^53 odd values stay exact as `bigint`.
  */
-import { KeywordNotFound } from "./errors.js";
+import { FitsTypeError, KeywordNotFound } from "./errors.js";
 
 export type HeaderValue = string | number | bigint | boolean | null;
 
@@ -318,7 +318,11 @@ export class Header implements Iterable<[string, HeaderValue]> {
       this._setCommentary(key.toUpperCase(), value);
       return;
     }
-    const v = value as HeaderValue; // arrays are only meaningful for commentary keywords
+    if (Array.isArray(value)) {
+      // An array is a commentary replace-all; for a valued keyword it would stamp a malformed card.
+      throw new FitsTypeError(410, `array values are only valid for commentary keywords, not '${key}'`);
+    }
+    const v = value as HeaderValue;
     const i = this._find(key);
     const resolvedComment = comment !== undefined ? comment : i >= 0 ? this._cards[i].comment : "";
     // Persist FIRST: a rejected edit (a structural keyword, or a read-only
@@ -365,6 +369,9 @@ export class Header implements Iterable<[string, HeaderValue]> {
   /**
    * A mutable, list-like view over the COMMENT/HISTORY/blank cards of `keyword` (astropy's
    * `header['COMMENT']`). Absent keyword → an empty view. Mutations persist to an attached file.
+   *
+   * `append` is O(1); a single `setAt`/`removeAt` rewrites all k cards of the keyword to persist,
+   * so replacing many at once via `set(keyword, [...])` is cheaper than a loop of per-index edits.
    */
   commentary(keyword: string): CommentaryView {
     const kw = keyword.toUpperCase();

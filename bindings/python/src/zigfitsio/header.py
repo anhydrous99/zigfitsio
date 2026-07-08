@@ -305,13 +305,16 @@ class Header:
 
     # ── commentary (COMMENT / HISTORY / blank) ────────────────────────────────────────────
     def _set_commentary(self, keyword: str, value: Any) -> None:
-        """Append (scalar) or replace-all (list/tuple) commentary cards for ``keyword``.
+        """Append (scalar) or replace-all (``list``) commentary cards for ``keyword``.
 
-        Each logical entry is split into ≤72-char physical cards. Appending persists eagerly one
-        card at a time (O(1) per card — cheap for long HISTORY chains); replace-all rewrites every
-        card of the keyword through ``_resync``.
+        A ``list`` replaces every card of the keyword; anything else appends. A 2-tuple is read as
+        the valued-keyword ``(value, comment)`` form and only its text is kept (commentary cards
+        have no comment field) — so ``header['COMMENT'] = ('note', 'ignored')`` adds one card, not
+        two. Each logical entry is split into ≤72-char physical cards. Appending persists eagerly
+        one card at a time (O(1) per card — cheap for long HISTORY chains); replace-all rewrites
+        every card of the keyword through ``_resync``.
         """
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list):
             self._cards[:] = [
                 c for c in self._cards if not (c.commentary and c.keyword.upper() == keyword)
             ]
@@ -320,6 +323,8 @@ class Header:
                     self._cards.append(_Card(keyword, chunk, "", commentary=True))
             self._resync_keyword(keyword)
             return
+        if isinstance(value, tuple) and len(value) == 2:
+            value = value[0]  # (text, comment): keep the text, drop the meaningless comment
         for chunk in _wrap_commentary(value):
             # Persist FIRST so a rejected write leaves no bogus in-memory card (mirrors valued keys).
             if self._persist is not None:
@@ -394,7 +399,12 @@ class Header:
 class _CommentaryCards:
     """A mutable, list-like view over one keyword's COMMENT/HISTORY/blank cards, mirroring the
     object astropy returns from ``header['COMMENT']``. Indexing, assignment, deletion, and
-    ``append`` mutate the owning :class:`Header` and persist to an attached writable file."""
+    ``append`` mutate the owning :class:`Header` and persist to an attached writable file.
+
+    ``append`` is O(1). A single-card ``view[i] = x`` / ``del view[i]`` rewrites all *k* cards of
+    the keyword (O(k)) to persist, so replacing many at once is cheaper as one assignment,
+    ``header['COMMENT'] = [...]``, than as a loop of per-index edits.
+    """
 
     __slots__ = ("_header", "_keyword")
 
@@ -421,6 +431,8 @@ class _CommentaryCards:
         return cards[idxs[index]].value
 
     def __setitem__(self, index: int, text: Any) -> None:
+        if not isinstance(index, int):
+            raise TypeError("commentary index must be an integer (slice assignment is not supported)")
         cards = self._header._cards
         pos = self._indices()[index]  # raises IndexError like a list for a bad index
         chunks = _wrap_commentary(text)
@@ -430,6 +442,8 @@ class _CommentaryCards:
         self._header._resync_keyword(self._keyword)
 
     def __delitem__(self, index: int) -> None:
+        if not isinstance(index, int):
+            raise TypeError("commentary index must be an integer (slice deletion is not supported)")
         pos = self._indices()[index]
         del self._header._cards[pos]
         self._header._resync_keyword(self._keyword)
