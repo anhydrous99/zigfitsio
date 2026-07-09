@@ -237,7 +237,7 @@ pub const Celestial = struct {
         const cos_dp = std.math.cos(self.delta_p);
         const theta = std.math.asin(clamp(sin_d * sin_dp + cos_d * cos_dp * std.math.cos(dra), -1, 1));
         const phi = self.phi_p + std.math.atan2(-cos_d * std.math.sin(dra), sin_d * cos_dp - cos_d * sin_dp * std.math.cos(dra));
-        // atan2 lands phi in (φ_p−π, φ_p+π]; wrap to (−π, π] as WCSLIB's sphs2x does. Harmless
+        // atan2 lands phi in (φ_p−π, φ_p+π]; wrap to [−π, π) as WCSLIB's sphs2x does. Harmless
         // for zenithal projections (phi enters project() only via sin/cos) but required for the
         // linear x = φ·RAD2DEG of cylindricals: with LONPOLE=180 (the default whenever
         // CRVAL2 < θ0) an unwrapped phi aliases every CAR world→pixel result by 360°/CDELT.
@@ -320,7 +320,7 @@ fn computePole(proj: Projection, crval: [2]f64, lonpole: ?f64, latpole: ?f64) Po
     return .{ .phi_p = phi_p, .alpha_p = alpha_p, .delta_p = delta_p };
 }
 
-/// Wrap an angle (radians) into `(−π, π]`.
+/// Wrap an angle (radians) into `[−π, π)` — exactly +π maps to −π.
 fn wrapPi(a: f64) f64 {
     const two_pi = 2.0 * std.math.pi;
     var x = @mod(a + std.math.pi, two_pi);
@@ -546,6 +546,12 @@ test "CAR with southern CRVAL (default LONPOLE=180): world→pixel is not aliase
         try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
         try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
     }
+    // Absolute anchor (astropy all_world2pix agrees to <1e-12 px): the round-trips above
+    // cannot detect a bug that cancels between the two directions; this can. Pre-fix this
+    // world coordinate returned pixel −7010.
+    const abs_pix = try c.worldToPixel(.{ 114.560877987292329, -34.393240424766510 });
+    try testing.expect(@abs(abs_pix[0] - 190.0) < 1e-6);
+    try testing.expect(@abs(abs_pix[1] - 10.0) < 1e-6);
 }
 
 test "CAR with explicit LONPOLE far from 0 round-trips world→pixel" {
