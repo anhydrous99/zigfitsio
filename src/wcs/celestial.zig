@@ -237,7 +237,11 @@ pub const Celestial = struct {
         const cos_dp = std.math.cos(self.delta_p);
         const theta = std.math.asin(clamp(sin_d * sin_dp + cos_d * cos_dp * std.math.cos(dra), -1, 1));
         const phi = self.phi_p + std.math.atan2(-cos_d * std.math.sin(dra), sin_d * cos_dp - cos_d * sin_dp * std.math.cos(dra));
-        return .{ .phi = phi, .theta = theta };
+        // atan2 lands phi in (φ_p−π, φ_p+π]; wrap to (−π, π] as WCSLIB's sphs2x does. Harmless
+        // for zenithal projections (phi enters project() only via sin/cos) but required for the
+        // linear x = φ·RAD2DEG of cylindricals: with LONPOLE=180 (the default whenever
+        // CRVAL2 < θ0) an unwrapped phi aliases every CAR world→pixel result by 360°/CDELT.
+        return .{ .phi = wrapPi(phi), .theta = theta };
     }
 };
 
@@ -505,6 +509,67 @@ test "CAR with off-equator CRVAL: reference pixel maps to CRVAL and round-trips"
     try testing.expect(@abs(w_up[0] - 120.0) < 1e-7); // longitude unchanged on the central meridian
     try testing.expect(@abs(w_up[1] - 30.5) < 1e-7); // +10 px · 0.05 deg
     for ([_][2]f64{ .{ 10, 20 }, .{ 80, 95 }, .{ 50, 1 } }) |pt| {
+        const world = try c.pixelToWorld(pt);
+        const back = try c.worldToPixel(world);
+        try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
+        try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
+    }
+}
+
+test "CAR with southern CRVAL (default LONPOLE=180): world→pixel is not aliased by 360°/CDELT (regression)" {
+    // CRVAL2 = −30 < θ0 = 0 defaults LONPOLE to 180°, so celestialToNative's
+    // phi = φ_p + atan2(...) lands in (0°, 360°]. Unwrapped, CAR's linear x = φ·RAD2DEG put
+    // every world→pixel result off by 360°/CDELT (pixel 190 came back as −7010).
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    2",
+        "CTYPE1  = 'RA---CAR'",
+        "CTYPE2  = 'DEC--CAR'",
+        "CRPIX1  =                100.0",
+        "CRPIX2  =                100.0",
+        "CRVAL1  =                120.0",
+        "CRVAL2  =                -30.0",
+        "CDELT1  =                -0.05",
+        "CDELT2  =                 0.05",
+    });
+    defer cleanup(testing.allocator, p);
+    var c = try Celestial.fromWcs(&p.w);
+    const ref = try c.pixelToWorld(.{ 100.0, 100.0 });
+    try testing.expect(@abs(ref[0] - 120.0) < 1e-9);
+    try testing.expect(@abs(ref[1] - (-30.0)) < 1e-9);
+    const ref_back = try c.worldToPixel(ref);
+    try testing.expect(@abs(ref_back[0] - 100.0) < 1e-6);
+    try testing.expect(@abs(ref_back[1] - 100.0) < 1e-6);
+    // Pixels on both sides of the reference meridian: {190,10} is the reported case.
+    for ([_][2]f64{ .{ 190, 10 }, .{ 20, 150 }, .{ 100, 1 } }) |pt| {
+        const world = try c.pixelToWorld(pt);
+        const back = try c.worldToPixel(world);
+        try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
+        try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
+    }
+}
+
+test "CAR with explicit LONPOLE far from 0 round-trips world→pixel" {
+    // LONPOLE=150 (pole solves to δ_p≈54.74°) puts phi = φ_p + atan2(...) in (−30°, 330°]:
+    // any pixel whose native longitude is below −30° (here px > 700) aliased pre-fix.
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    2",
+        "CTYPE1  = 'RA---CAR'",
+        "CTYPE2  = 'DEC--CAR'",
+        "CRPIX1  =                100.0",
+        "CRPIX2  =                100.0",
+        "CRVAL1  =                120.0",
+        "CRVAL2  =                -30.0",
+        "CDELT1  =                -0.05",
+        "CDELT2  =                 0.05",
+        "LONPOLE =                150.0",
+    });
+    defer cleanup(testing.allocator, p);
+    var c = try Celestial.fromWcs(&p.w);
+    const ref = try c.pixelToWorld(.{ 100.0, 100.0 });
+    try testing.expect(@abs(ref[0] - 120.0) < 1e-9);
+    try testing.expect(@abs(ref[1] - (-30.0)) < 1e-9);
+    // {800,10} (native φ = −35°) came back as pixel −6400 before the wrap.
+    for ([_][2]f64{ .{ 800, 10 }, .{ 20, 150 }, .{ 100, 1 } }) |pt| {
         const world = try c.pixelToWorld(pt);
         const back = try c.worldToPixel(world);
         try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
