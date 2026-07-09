@@ -455,7 +455,10 @@ class _HDU:
         kb = _enc(key)
         cb = _enc(comment) if comment else None
         cl = len(cb) if cb else 0
-        if isinstance(value, bool):
+        if value is None:
+            # An undefined-value card (blank value field), never the literal string 'None'.
+            ll.check(ll.lib.zf_write_key_undef(h, kb, len(kb), cb, cl))
+        elif isinstance(value, bool):
             ll.check(ll.lib.zf_write_key_log(h, kb, len(kb), 1 if value else 0, cb, cl))
         elif isinstance(value, int):
             ll.check(ll.lib.zf_write_key_lng(h, kb, len(kb), value, cb, cl))
@@ -679,7 +682,10 @@ class ImageHDU(_HDU):
                 ll.check(ll.lib.zf_write_key_lng(handle, kb, len(kb), value, cb, cl))
             elif isinstance(value, float):
                 ll.check(ll.lib.zf_write_key_dbl(handle, kb, len(kb), value, cb, cl))
-            elif value is not None:
+            elif value is None:
+                # Undefined-value card: reconstruct it instead of silently dropping it.
+                ll.check(ll.lib.zf_write_key_undef(handle, kb, len(kb), cb, cl))
+            else:
                 vb = _enc(str(value))
                 if len(vb) <= 68:
                     ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), vb, len(vb), cb, cl))

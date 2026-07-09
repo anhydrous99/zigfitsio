@@ -166,3 +166,26 @@ def test_wcs_matches_astropy(tmp_fits):
     with zf.open(p) as hdul:
         lon, lat = hdul[0].pix2world(40.0, 30.0)  # 1-based
     np.testing.assert_allclose([lon, lat], ap, atol=1e-6)
+
+
+def test_undefined_card_matches_astropy(tmp_fits):
+    # Finding 13: an undefined-value card written by zigfitsio is byte-identical to astropy's
+    # and reads back as None in both libraries (both directions).
+    p = tmp_fits("undef_zf.fits")
+    hdu = zf.PrimaryHDU()
+    hdu.header["UNDEF"] = (None, "no value")
+    zf.HDUList([hdu]).writeto(p, overwrite=True)
+    with afits.open(p) as t:
+        assert t[0].header["UNDEF"] is None
+        assert t[0].header.comments["UNDEF"] == "no value"
+    with open(p, "rb") as f:
+        raw = f.read()
+    assert afits.Card("UNDEF", None, "no value").image.encode("ascii") in raw
+
+    p2 = tmp_fits("undef_ap.fits")
+    ahdu = afits.PrimaryHDU()
+    ahdu.header["BLANKVAL"] = (None, "from astropy")
+    ahdu.writeto(p2, overwrite=True)
+    with zf.open(p2) as hl:
+        assert hl[0].header["BLANKVAL"] is None
+        assert hl[0].header.comment_of("BLANKVAL") == "from astropy"

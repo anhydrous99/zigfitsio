@@ -1317,3 +1317,37 @@ def test_out_of_range_znaxis_raises():
     hl = zf.from_bytes(_zimage_bytes(ZBITPIX=16, ZNAXIS=5000))
     with pytest.raises(ll.FitsCompressError):
         _ = hl[1].shape
+
+
+# ── 2026-07 findings 13-15: None header values, data=None clears, table data validation ──────
+def test_none_header_value_round_trips_as_undefined_card(tmp_fits):
+    # Finding 13: header['KEY'] = None must write a FITS *undefined* card (blank value field),
+    # not the literal string 'None' — and reconstruction (writeto/to_bytes) must preserve it
+    # instead of silently dropping the card.
+    hdu = zf.PrimaryHDU()
+    hdu.header["UNDEF"] = (None, "no value")
+    blob = zf.HDUList([hdu]).to_bytes()
+    assert b"'None'" not in blob
+    hh = zf.from_bytes(blob)[0].header
+    assert hh["UNDEF"] is None
+    assert hh.comment_of("UNDEF") == "no value"
+
+    # Attached update-mode set goes through the C ABI write path.
+    p = tmp_fits("undef.fits")
+    zf.writeto(p, np.zeros((2, 2), dtype="i4"), overwrite=True)
+    with zf.open(p, mode="update") as hl:
+        hl[0].header["UNDEF2"] = (None, "cleared")
+    assert b"'None'" not in _file_bytes(p)
+    with zf.open(p) as hl:
+        assert hl[0].header["UNDEF2"] is None
+        assert hl[0].header.comment_of("UNDEF2") == "cleared"
+
+    # Reconstruction: a read-only header edit forces writeto to rebuild every card via
+    # _apply_user_keys, which used to skip value-None cards entirely.
+    out = tmp_fits("undef_recon.fits")
+    with zf.open(p) as hl:
+        hl[0].header["OTHER"] = 1
+        hl.writeto(out, overwrite=True)
+    with zf.open(out) as hl:
+        assert hl[0].header["UNDEF2"] is None
+        assert hl[0].header.comment_of("UNDEF2") == "cleared"

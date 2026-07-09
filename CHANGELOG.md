@@ -7,6 +7,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Python & TypeScript**: assigning `None`/`null` to a header keyword now writes a FITS
+  *undefined* card (blank value field, byte-identical to astropy's compact form) instead of
+  the literal string `'None'` (Python) or throwing `FitsTypeError` (TypeScript), and
+  `writeto`/`to_bytes` reconstruction preserves existing undefined-value cards instead of
+  silently dropping them — header provenance survives a round-trip in both directions.
+  New C-ABI export `zf_write_key_undef` (update-in-place, comment-preserving).
 - **Core**: lossy `HCOMPRESS_1` integer images whose reconstruction overshoots the
   `ZBITPIX` range — a documented, expected artifact of `fpack -h -s N` near the type
   boundary — are now readable: out-of-range decoded values **clamp to the type range**

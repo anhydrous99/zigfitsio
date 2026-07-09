@@ -156,6 +156,7 @@ int  zf_write_key_dbl(ZfFits* h, const uint8_t* name, size_t name_len, double va
 int  zf_write_key_log(ZfFits* h, const uint8_t* name, size_t name_len, int value, const uint8_t* comment, size_t comment_len);
 int  zf_write_key_str(ZfFits* h, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len, const uint8_t* comment, size_t comment_len);
 int  zf_write_key_longstr(ZfFits* h, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len, const uint8_t* comment, size_t comment_len);
+int  zf_write_key_undef(ZfFits* h, const uint8_t* name, size_t name_len, const uint8_t* comment, size_t comment_len);
 int  zf_delete_key(ZfFits* h, const uint8_t* name, size_t name_len);
 int  zf_rename_key(ZfFits* h, const uint8_t* old, size_t old_len, const uint8_t* neu, size_t neu_len);
 int  zf_write_record(ZfFits* h, const uint8_t* card80);

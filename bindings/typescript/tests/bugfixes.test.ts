@@ -1756,3 +1756,49 @@ describe("zf_img_param hostile Z* geometry (finding 47)", () => {
     expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsError);
   });
 });
+
+describe("undefined header values (finding 13)", () => {
+  test("null value writes an undefined card and round-trips", () => {
+    const h = new zf.Header();
+    h.set("UNDEF", null, "no value");
+    const raw = new zf.HDUList([new zf.PrimaryHDU({ header: h })]).toBytes();
+    // astropy's compact undefined form: blank value field, then `/ comment`.
+    expect(new TextDecoder().decode(raw)).toContain("UNDEF   =  / no value");
+    const hl = zf.fromBytes(raw);
+    try {
+      const hh = hl.get(0).header;
+      expect(hh.get("UNDEF")).toBeNull();
+      expect(hh.commentOf("UNDEF")).toBe("no value");
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("update-mode set and reconstruction preserve the undefined card", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([1, 2, 3, 4]), [2, 2]));
+    const hl = zf.open(p, "update");
+    try {
+      hl.get(0).header.set("UNDEF2", null, "cleared");
+    } finally {
+      hl.close();
+    }
+    const hl2 = zf.open(p);
+    let copy: Uint8Array;
+    try {
+      expect(hl2.get(0).header.get("UNDEF2")).toBeNull();
+      expect(hl2.get(0).header.commentOf("UNDEF2")).toBe("cleared");
+      hl2.get(0).header.set("OTHER", 1); // read-only edit → writeTo reconstructs every card
+      copy = hl2.toBytes();
+    } finally {
+      hl2.close();
+    }
+    const hl3 = zf.fromBytes(copy);
+    try {
+      expect(hl3.get(0).header.get("UNDEF2")).toBeNull();
+      expect(hl3.get(0).header.commentOf("UNDEF2")).toBe("cleared");
+    } finally {
+      hl3.close();
+    }
+  });
+});

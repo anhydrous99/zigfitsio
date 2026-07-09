@@ -200,7 +200,12 @@ export function writeKeyValue(handle: bigint, key: string, value: HeaderValue, c
     }
     return;
   }
-  throw new FitsTypeError(410, `cannot write a null/undefined value for keyword ${key}`);
+  if (value === null) {
+    // An undefined-value card (blank value field) — the FITS way to say "no value".
+    ll.check(ll.lib.zf_write_key_undef(handle, kb, kb.length, cb, cl));
+    return;
+  }
+  throw new FitsTypeError(410, `cannot write an undefined value for keyword ${key}`);
 }
 
 /**
@@ -448,8 +453,8 @@ export abstract class BaseHDU {
         }
         continue;
       }
-      if (value === null || value === undefined) continue;
-      writeKeyValue(handle, kw, value, comment || null);
+      if (value === undefined) continue;
+      writeKeyValue(handle, kw, value, comment || null); // null → undefined-value card
     }
     if (this._name) {
       const nb = enc(this._name);

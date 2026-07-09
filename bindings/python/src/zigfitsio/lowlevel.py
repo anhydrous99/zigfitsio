@@ -265,6 +265,7 @@ _PROTOS = [
     ("zf_write_key_log", INT, [VOID, CHARP, SZ, INT, CHARP, SZ]),
     ("zf_write_key_str", INT, [VOID, CHARP, SZ, CHARP, SZ, CHARP, SZ]),
     ("zf_write_key_longstr", INT, [VOID, CHARP, SZ, CHARP, SZ, CHARP, SZ]),
+    ("zf_write_key_undef", INT, [VOID, CHARP, SZ, CHARP, SZ]),
     ("zf_delete_key", INT, [VOID, CHARP, SZ]),
     ("zf_rename_key", INT, [VOID, CHARP, SZ, CHARP, SZ]),
     ("zf_write_record", INT, [VOID, CHARP]),
