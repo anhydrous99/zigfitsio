@@ -278,6 +278,68 @@ export function asciiTformOf(info: ll.ColInfo): string {
   return `I${w}`; // integer column of any width
 }
 
+/**
+ * Synthesize a binary-table TFORM from materialized column data (port of
+ * `core.py _tform_from_dtype`, driven by the ColumnData discriminant instead
+ * of a numpy dtype). Used to format a column that has no matching file column
+ * (a reassigned TableData that added or retyped a column) so its values are
+ * never truncated to a stale TFORM.
+ */
+function tformFromColumnData(cd: ColumnData): string {
+  if (cd.kind === "string") return `${Math.max(cd.repeat, 1)}A`; // repeat is the field width
+  if (cd.kind === "complex") return `${cd.repeat}${cd.dtype === "c8" ? "C" : "M"}`;
+  const letter = dt.DTYPE_TO_TFORM[cd.dtype];
+  if (letter === undefined) throw new FitsTypeError(410, `cannot synthesize a table TFORM for dtype ${cd.dtype}`);
+  if (cd.kind === "vla") return `1P${letter}`; // a VlaColumn carries its element dtype
+  return `${cd.repeat}${letter}`;
+}
+
+/** (repeat, uppercase type letter) for a scalar/vector binary TFORM like '1J' or '8A'. */
+function tformRepeatLetter(fmt: string): [number, string] {
+  const s = fmt.trim().toUpperCase();
+  let i = 0;
+  while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+  return [parseInt(s.slice(0, i) || "1", 10), s.slice(i, i + 1)];
+}
+
+/**
+ * True when a file column's stored TFORM `have` still faithfully represents a
+ * column whose data synthesizes to `synth` — same repeat and same element
+ * dtype. Distinct letters that decode to the same element dtype (L/X/B all
+ * read as u1) are interchangeable, so a logical or bit column keeps its own
+ * 'L'/'X' letter instead of being flattened to the generic 'B'. Strings ('A',
+ * whose width lives in the repeat) only match letter-for-letter.
+ */
+function tformInterchangeable(have: string, synth: string): boolean {
+  const [rh, lh] = tformRepeatLetter(have);
+  const [rs, ls] = tformRepeatLetter(synth);
+  if (rh !== rs) return false;
+  if (lh === ls) return true;
+  if (lh === "A" || ls === "A") return false;
+  const dh = dt.binElemDtype(lh);
+  const ds = dt.binElemDtype(ls);
+  return dh.dtype === ds.dtype && dh.isComplex === ds.isComplex;
+}
+
+/**
+ * Choose a binary-table TFORM for a TableData column on write-back/copy (port
+ * of `core.py _binary_tform_for`). Reuse the same-named file column's stored
+ * TFORM when it still describes the data — the only way to reproduce VLA,
+ * unsigned, logical/bit, or exact-width string columns — otherwise synthesize
+ * one from the column data so a new or retyped column is never written under
+ * a stale (truncating) format. `info` is the matching file column (or
+ * undefined when the column has no counterpart).
+ */
+function binaryTformFor(info: ll.ColInfo | undefined, cd: ColumnData): string {
+  if (info !== undefined && (info.isVla || cd.kind === "vla")) {
+    return tformOf(info); // VLA: only the file descriptor can describe it
+  }
+  const synth = tformFromColumnData(cd);
+  if (info === undefined) return synth; // added/renamed column with no file counterpart
+  const have = tformOf(info); // a scaled column throws here (unreconstructable) — preserved as today
+  return tformInterchangeable(have, synth) ? have : synth;
+}
+
 // ── write-side array normalization ──
 
 const isTypedArray = (v: unknown): v is dt.TypedArray => ArrayBuffer.isView(v) && !(v instanceof DataView);
@@ -682,11 +744,35 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     if (data === null) return { cols: [], nrows: 0 };
     const h = this._select();
     return withTable(h, (t) => {
+      const ncolsOut = ll.outI32();
+      ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+      // Map file columns by NAME so a reassigned TableData keeps each column's
+      // true format even when reordered/filtered; a positional pairing would
+      // hand a column the wrong TFORM and silently truncate it. First card
+      // wins, and the `col${j+1}` fallback matches _readTable's name for a
+      // column lacking TTYPE.
+      const fileInfo = new Map<string, ll.ColInfo>();
+      for (let j = 0; j < ncolsOut[0]; j++) {
+        const nm = colName(t, j) || `col${j + 1}`;
+        if (!fileInfo.has(nm)) fileInfo.set(nm, readColInfo(t, j));
+      }
       const cols: Column[] = [];
-      for (let i = 0; i < data.names.length; i++) {
-        const info = readColInfo(t, i);
-        const fmt = this._tableType === ll.ASCII_TBL ? asciiTformOf(info) : tformOf(info);
-        cols.push(new Column(data.names[i], fmt, { array: data.get(data.names[i]) as ColumnArray }));
+      for (const name of data.names) {
+        const info = fileInfo.get(name);
+        let fmt: string;
+        if (this._tableType === ll.ASCII_TBL) {
+          if (info === undefined) {
+            throw new NotSupportedError(
+              410,
+              `writeTo() cannot add or rename an ASCII-table column ('${name}') from a reassigned ` +
+                "TableData; rebuild the table with AsciiTableHDU.fromColumns(...)",
+            );
+          }
+          fmt = asciiTformOf(info);
+        } else {
+          fmt = binaryTformFor(info, data.column(name));
+        }
+        cols.push(new Column(name, fmt, { array: data.get(name) as ColumnArray }));
       }
       return { cols, nrows: data.nrows };
     });

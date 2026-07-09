@@ -852,6 +852,124 @@ describe("misc parity", () => {
   });
 });
 
+// BUGHUNT-2026-07-06 HIGH #9: _emitColumns paired file-position TFORMs with
+// data-position column names, so writeTo/toBytes of a reassigned reordered or
+// filtered TableData emitted each column under whatever format sat at its
+// index in the file — silently coercing floats to ints. Columns must resolve
+// to their file counterpart by NAME, synthesizing a format for a column the
+// file does not have (mirrors core.py _emit_columns / _binary_tform_for).
+describe("writeTo reconstructs a reassigned TableData by column name", () => {
+  /** Reassign hdu 1's data via `reassign` and return the re-serialized bytes. */
+  const reassigned = (src: Uint8Array, reassign: (hdu: zf.BinTableHDU, d: zf.TableData) => void): Uint8Array => {
+    const hl = zf.fromBytes(src);
+    try {
+      const hdu = hl.get(1) as zf.BinTableHDU;
+      reassign(hdu, hdu.data as zf.TableData);
+      return hl.toBytes();
+    } finally {
+      hl.close();
+    }
+  };
+
+  const intFloatBytes = (): Uint8Array =>
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([
+        new zf.Column("A", "1J", { array: Int32Array.from([1, 2, 3]) }),
+        new zf.Column("B", "1E", { array: Float32Array.from([1.5, 2.5, 3.5]) }),
+      ]),
+    ]).toBytes();
+
+  test("reordered TableData keeps each column's own format", () => {
+    const copy = reassigned(intFloatBytes(), (hdu, d) => {
+      hdu.data = new zf.TableData(["B", "A"], d.columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      const got = chk.get(1).data as zf.TableData;
+      expect([...got.names]).toEqual(["B", "A"]);
+      expect(got.get("B")).toBeInstanceOf(Float32Array);
+      expect(asNums(got.get("B") as zf.TypedArray)).toEqual([1.5, 2.5, 3.5]);
+      expect(asNums(got.get("A") as zf.TypedArray)).toEqual([1, 2, 3]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("subset TableData emits only the kept column, format intact", () => {
+    const copy = reassigned(intFloatBytes(), (hdu, d) => {
+      hdu.data = new zf.TableData(["B"], d.columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      const got = chk.get(1).data as zf.TableData;
+      expect([...got.names]).toEqual(["B"]);
+      expect(got.get("B")).toBeInstanceOf(Float32Array);
+      expect(asNums(got.get("B") as zf.TypedArray)).toEqual([1.5, 2.5, 3.5]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("added column synthesizes its TFORM from the column data", () => {
+    const src = new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("A", "1J", { array: Int32Array.from([1, 2, 3]) })]),
+    ]).toBytes();
+    const copy = reassigned(src, (hdu, d) => {
+      const columns = new Map<string, zf.ColumnData>(d.columns);
+      columns.set("Z", { kind: "numeric", dtype: "f8", repeat: 1, values: Float64Array.from([0.25, 0.5, 0.75]) });
+      hdu.data = new zf.TableData(["A", "Z"], columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      const got = chk.get(1).data as zf.TableData;
+      expect([...got.names]).toEqual(["A", "Z"]);
+      expect(asNums(got.get("A") as zf.TypedArray)).toEqual([1, 2, 3]);
+      expect(got.get("Z")).toBeInstanceOf(Float64Array);
+      expect(asNums(got.get("Z") as zf.TypedArray)).toEqual([0.25, 0.5, 0.75]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("widened dtype is not truncated by the stale file TFORM", () => {
+    const src = new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("V", "1I", { array: Int16Array.from([1, 2, 3]) })]),
+    ]).toBytes();
+    const copy = reassigned(src, (hdu, d) => {
+      const columns = new Map<string, zf.ColumnData>();
+      columns.set("V", { kind: "numeric", dtype: "i8", repeat: 1, values: BigInt64Array.from([40000n, 50000n, 60000n]) });
+      hdu.data = new zf.TableData(["V"], columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      expect(asNums((chk.get(1).data as zf.TableData).get("V") as zf.TypedArray)).toEqual([40000, 50000, 60000]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("logical column keeps its 1L TFORM through reconstruction", () => {
+    const src = new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("FLAG", "1L", { array: [true, false, true] })]),
+    ]).toBytes();
+    // Same data, reassigned: dirties the HDU so toBytes reconstructs via _emitColumns.
+    const copy = reassigned(src, (hdu, d) => {
+      hdu.data = new zf.TableData(d.names, d.columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      expect(chk.get(1).header.get("TFORM1")).toBe("1L");
+      expect(asNums((chk.get(1).data as zf.TableData).get("FLAG") as zf.TypedArray)).toEqual([1, 0, 1]);
+    } finally {
+      chk.close();
+    }
+  });
+});
+
 // BUGHUNT-2026-07-06 CRIT #1 (table) and HIGH #7 (compressed image): the
 // reconstruction write path rebuilt the HDU via the C ABI but never re-emitted
 // the user's non-structural header cards, so every writeTo/toBytes silently
