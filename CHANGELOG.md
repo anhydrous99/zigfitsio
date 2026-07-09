@@ -29,6 +29,13 @@ All notable changes to `zigfitsio` are documented here. The format follows
   for any CAR header with a southern reference declination (`CRVAL2 < 0`). The native
   longitude from the celestial→native rotation is now wrapped into [−180°, 180°), matching
   WCSLIB's `sphs2x`; zenithal projections are unaffected. (#37)
+- **Core**: keyword names with embedded or leading blanks (`"AB CD"`, `" XKEY"`) are rejected
+  with `error.BadKeywordName` (CFITSIO status 207) on every build/edit path —
+  `appendValue`/`update`/`modify`/`rename`/`appendLongString` and the C API previously wrote
+  the spec-invalid card silently, producing files fitsverify flags as ERRORs. Spaces remain
+  valid as trailing padding and as the all-blank keyword, and **reading** such names from
+  existing files is still lenient, so malformed third-party files load and the bindings'
+  HIERARCH raw-record route is unaffected. (#41)
 
 ## [0.1.3] - 2026-07-07
 
