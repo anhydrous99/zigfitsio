@@ -13,6 +13,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
   `writeto`/`to_bytes` reconstruction preserves existing undefined-value cards instead of
   silently dropping them — header provenance survives a round-trip in both directions.
   New C-ABI export `zf_write_key_undef` (update-in-place, comment-preserving).
+- **Python & TypeScript**: `hdu.data = None`/`null` on an attached HDU now *sticks* —
+  `writeto`/`to_bytes` emit an empty (`NAXIS = 0`) HDU / empty table (astropy semantics)
+  instead of silently resurrecting the original data through the lazy getter, and an
+  update-mode `flush()`/`close()` fails loud (`NotImplementedError`/`NotSupportedError`)
+  instead of silently keeping the on-disk data. "Never read" and "explicitly cleared" are
+  now distinct states, so merely reading an empty HDU's data is still a no-op on close.
 - **Core**: lossy `HCOMPRESS_1` integer images whose reconstruction overshoots the
   `ZBITPIX` range — a documented, expected artifact of `fpack -h -s N` near the type
   boundary — are now readable: out-of-range decoded values **clamp to the type range**

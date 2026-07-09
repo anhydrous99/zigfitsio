@@ -8,7 +8,7 @@
 import { FitsError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
-import { BaseHDU, writeConventionOffset, writeKeyValue, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
+import { BaseHDU, DATA_UNSET, writeConventionOffset, writeKeyValue, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
 import type { ElementOf } from "./fitsarray.js";
 import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
 
@@ -508,15 +508,19 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
 
   // Stored untyped (default shape); the column-shape `T` is a compile-time
   // contract surfaced only at the public `data` boundary.
-  /** @internal */ _data: TableData | null = null;
+  /** @internal */ _data: TableData | null | typeof DATA_UNSET = DATA_UNSET;
   /** @internal */ _columns: Column[] = [];
   /** @internal */ _nrows = 0;
   /** @internal Per-column baselines for update-mode in-place write-back. */
   _colFingerprints: Map<string, bigint> | null = null;
 
   get data(): TableData<T> | null {
-    if (this._hdulist !== null && this._data === null) this._data = this._readTable();
-    return this._data as TableData<T> | null;
+    const d = this._data;
+    if (d !== DATA_UNSET) return d as TableData<T> | null;
+    if (this._hdulist === null) return null;
+    const rec = this._readTable();
+    this._data = rec;
+    return rec as TableData<T>;
   }
 
   /**
@@ -527,14 +531,15 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    */
   set data(value: TableData<T> | null) {
     this._data = value as TableData | null;
-    if (this._data !== null && this._colFingerprints === null) this._colFingerprints = new Map();
+    if (value !== null && this._colFingerprints === null) this._colFingerprints = new Map();
     this._markDirty();
   }
 
   override _dataChanged(): boolean {
-    if (this._data === null || this._colFingerprints === null) return false;
-    for (const name of this._data.names) {
-      if (colFp(this._data.column(name)) !== this._colFingerprints.get(name)) return true;
+    const d = this._data;
+    if (d === DATA_UNSET || d === null || this._colFingerprints === null) return false;
+    for (const name of d.names) {
+      if (colFp(d.column(name)) !== this._colFingerprints.get(name)) return true;
     }
     return false;
   }
@@ -545,7 +550,23 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    * or editing a VLA/scaled column in place is not supported.
    */
   override _flushData(): void {
-    if (this._data === null || this._colFingerprints === null) return;
+    if (this._data === DATA_UNSET) return;
+    if (this._data === null) {
+      let empty = false;
+      withTable(this._select(), (t) => {
+        const nrowsOut = ll.outI64();
+        ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
+        const ncolsOut = ll.outI32();
+        ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+        empty = Number(nrowsOut[0]) === 0 && ncolsOut[0] === 0;
+      });
+      if (empty) return; // already empty on disk; nothing to clear
+      throw new NotSupportedError(
+        410,
+        "clearing table data in update mode is not supported; use writeTo() to a new file",
+      );
+    }
+    if (this._colFingerprints === null) return;
     const rec = this._data;
     const h = this._select();
     withTable(h, (t) => {

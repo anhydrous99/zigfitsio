@@ -1351,3 +1351,66 @@ def test_none_header_value_round_trips_as_undefined_card(tmp_fits):
     with zf.open(out) as hl:
         assert hl[0].header["UNDEF2"] is None
         assert hl[0].header.comment_of("UNDEF2") == "cleared"
+
+
+def test_data_none_clears_attached_image_hdu(tmp_fits):
+    # Finding 14: hdu.data = None on an attached HDU must stick — writeto/to_bytes emit an
+    # empty (NAXIS=0) HDU like astropy — instead of being silently resurrected by the lazy
+    # getter; in update mode the clear fails loud instead of silently no-oping.
+    p = tmp_fits("full.fits")
+    zf.writeto(p, np.arange(6, dtype="i4").reshape(2, 3), overwrite=True)
+
+    out = tmp_fits("cleared.fits")
+    with zf.open(p) as hl:
+        hl[0].data = None
+        assert hl[0].data is None  # the assignment sticks; no lazy re-read
+        hl.writeto(out, overwrite=True)
+    with zf.open(out) as hl:
+        assert hl[0].data is None
+        assert hl[0].header["NAXIS"] == 0
+
+    with zf.open(p) as hl:
+        hl[0].data = None
+        blob = hl.to_bytes()
+    assert zf.from_bytes(blob)[0].data is None
+
+    # Update mode: clearing is a geometry change — fail loud, leaving the file intact.
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h[0].data = None
+    with pytest.raises(NotImplementedError):
+        h.close()
+    assert _file_bytes(p) == before
+
+    # Regression guards: reading an ALREADY-empty HDU's data (None), or clearing it, is not
+    # an update-mode error — there is nothing on disk to clear.
+    pe = tmp_fits("empty.fits")
+    zf.HDUList([zf.PrimaryHDU()]).writeto(pe, overwrite=True)
+    with zf.open(pe, mode="update") as hl:
+        assert hl[0].data is None
+    with zf.open(pe, mode="update") as hl:
+        hl[0].data = None
+
+
+def test_data_none_clears_attached_table_hdu(tmp_fits):
+    # Finding 14 (table twin): data = None on an attached table empties it on writeto and
+    # fails loud in update mode.
+    p = tmp_fits("tbl.fits")
+    cols = [zf.Column("X", "J", np.arange(4, dtype="i4"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols, name="T")]).writeto(p, overwrite=True)
+
+    out = tmp_fits("tbl_cleared.fits")
+    with zf.open(p) as hl:
+        hl[1].data = None
+        assert hl[1].data is None
+        hl.writeto(out, overwrite=True)
+    with zf.open(out) as hl:
+        assert hl[1].header["TFIELDS"] == 0
+        assert hl[1].header["NAXIS2"] == 0
+
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h[1].data = None
+    with pytest.raises(NotImplementedError):
+        h.close()
+    assert _file_bytes(p) == before

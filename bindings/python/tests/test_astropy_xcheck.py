@@ -189,3 +189,18 @@ def test_undefined_card_matches_astropy(tmp_fits):
     with zf.open(p2) as hl:
         assert hl[0].header["BLANKVAL"] is None
         assert hl[0].header.comment_of("BLANKVAL") == "from astropy"
+
+
+def test_astropy_reads_cleared_hdu(tmp_fits):
+    # Finding 14: a cleared (data = None) HDU written by zigfitsio is a proper empty primary
+    # for astropy — data None, NAXIS 0, BITPIX 8 (astropy's own empty-HDU header shape).
+    p = tmp_fits("full.fits")
+    zf.writeto(p, np.arange(6, dtype="i4").reshape(2, 3), overwrite=True)
+    out = tmp_fits("cleared.fits")
+    with zf.open(p) as hl:
+        hl[0].data = None
+        hl.writeto(out, overwrite=True)
+    with afits.open(out) as t:
+        assert t[0].data is None
+        assert t[0].header["NAXIS"] == 0
+        assert t[0].header["BITPIX"] == 8

@@ -556,13 +556,15 @@ describe("update-mode table flush (F2)", () => {
     const p = writeAB();
     const hdul = zf.open(p, "update");
     try {
+      const orig = hdul.table(1).data!; // capture before the bogus assignment
       const cols = new Map<string, zf.ColumnData>([
         ["C", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([1, 2, 3]) }],
       ]);
       hdul.table(1).data = new zf.TableData(["C"], cols, 3);
       expect(() => hdul.flush()).toThrow(zf.NotSupportedError);
-      // Clear the offending edit so close()'s implicit flush doesn't re-throw.
-      hdul.table(1).data = null;
+      // Restore the original data so close()'s implicit flush doesn't re-throw
+      // (data = null is no longer a silent no-op: it now means "clear the table").
+      hdul.table(1).data = orig;
     } finally {
       hdul.close();
     }

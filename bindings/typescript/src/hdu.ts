@@ -11,6 +11,14 @@ import { Header, parseCards, wrapCommentary, type HeaderValue } from "./header.j
 import { enc, fnv1a64, viewBytes } from "./util.js";
 import type { HDUList } from "./hdulist.js";
 
+/**
+ * @internal "Data never materialized" marker for `_data`. Distinct from `null`,
+ * which is an EXPLICIT `hdu.data = null` clear: the lazy getter re-reads only on
+ * DATA_UNSET, so a clear is never silently resurrected from the open file.
+ * Exported for table.ts/hdulist.ts only — not part of the public API surface.
+ */
+export const DATA_UNSET: unique symbol = Symbol("zigfitsio.data.unset");
+
 // Structural keywords the library derives from the data; user header edits must not overwrite them.
 const STRUCTURAL = new Set([
   "SIMPLE",
@@ -478,18 +486,23 @@ export class ImageHDU extends BaseHDU {
   readonly kind: "image" | "primary" | "compimage" = "image";
   override readonly isImage: boolean = true;
 
-  /** @internal */ _data: FitsArray | null = null;
+  /** @internal */ _data: FitsArray | null | typeof DATA_UNSET = DATA_UNSET;
   /** @internal Baseline for update-mode data write-back + the pristine gate. */
   _dataFingerprint: bigint | null = null;
 
   constructor(options: ImageHDUOptions = {}) {
     super(options);
-    this._data = options.data == null ? null : asFitsArray(options.data);
+    this._data = options.data == null ? DATA_UNSET : asFitsArray(options.data);
   }
 
   get data(): FitsArray | null {
-    if (this._hdulist !== null && this._data === null) this._data = this._readImage();
-    return this._data;
+    const d = this._data;
+    if (d !== DATA_UNSET) return d;
+    if (this._hdulist === null) return null;
+    const arr = this._readImage();
+    if (arr === null) return null; // empty (NAXIS=0) HDU: stay unset, a mere read is not a clear
+    this._data = arr;
+    return arr;
   }
 
   set data(value: FitsArray | dt.TypedArray | null) {
@@ -498,7 +511,9 @@ export class ImageHDU extends BaseHDU {
   }
 
   override _dataChanged(): boolean {
-    return this._data !== null && fnv1a64(viewBytes(this._data.data)) !== this._dataFingerprint;
+    const d = this._data;
+    if (d === DATA_UNSET || d === null) return false;
+    return fnv1a64(viewBytes(d.data)) !== this._dataFingerprint;
   }
 
   get shape(): readonly number[] | null {
@@ -701,7 +716,15 @@ export class ImageHDU extends BaseHDU {
    */
   override _flushData(): void {
     const data = this._data;
-    if (data === null) return;
+    if (data === DATA_UNSET) return;
+    if (data === null) {
+      const { axes } = this._imgParam();
+      if (axes.length === 0) return; // already empty on disk; nothing to clear
+      throw new NotSupportedError(
+        410,
+        "clearing image data in update mode is not supported; use writeTo() instead",
+      );
+    }
     const fp = fnv1a64(viewBytes(data.data));
     if (fp === this._dataFingerprint) return;
     const h = this._select();

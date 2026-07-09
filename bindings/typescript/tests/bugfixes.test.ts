@@ -1802,3 +1802,97 @@ describe("undefined header values (finding 13)", () => {
     }
   });
 });
+
+describe("data = null clears the HDU (finding 14)", () => {
+  test("image clear sticks and writeTo/toBytes emit an empty HDU", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([0, 1, 2, 3, 4, 5]), [2, 3]));
+
+    const out = tmp.path();
+    const hl = zf.open(p);
+    try {
+      hl.get(0).data = null;
+      expect(hl.get(0).data).toBeNull(); // the assignment sticks; no lazy re-read
+      hl.writeTo(out, { overwrite: true });
+    } finally {
+      hl.close();
+    }
+    const reread = zf.open(out);
+    try {
+      expect(reread.get(0).data).toBeNull();
+      expect(reread.get(0).header.get("NAXIS")).toBe(0);
+    } finally {
+      reread.close();
+    }
+
+    const hl2 = zf.open(p);
+    let blob: Uint8Array;
+    try {
+      hl2.get(0).data = null;
+      blob = hl2.toBytes();
+    } finally {
+      hl2.close();
+    }
+    const hl3 = zf.fromBytes(blob);
+    try {
+      expect(hl3.get(0).data).toBeNull();
+    } finally {
+      hl3.close();
+    }
+  });
+
+  test("update-mode clear fails loud and leaves the file intact", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([0, 1, 2, 3, 4, 5]), [2, 3]));
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.get(0).data = null;
+    expect(() => hl.close()).toThrow(zf.NotSupportedError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+
+    // Regression guards: reading an ALREADY-empty HDU's data (null), or clearing
+    // it, is not an update-mode error — there is nothing on disk to clear.
+    const pe = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU()]).writeTo(pe, { overwrite: true });
+    const h1 = zf.open(pe, "update");
+    try {
+      expect(h1.get(0).data).toBeNull();
+    } finally {
+      h1.close();
+    }
+    const h2 = zf.open(pe, "update");
+    h2.get(0).data = null;
+    h2.close(); // no throw
+  });
+
+  test("table clear empties on writeTo and fails loud in update mode", () => {
+    const p = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("X", "J", { array: Int32Array.from([1, 2, 3, 4]) })], { name: "T" }),
+    ]).writeTo(p, { overwrite: true });
+
+    const out = tmp.path();
+    const hl = zf.open(p);
+    try {
+      hl.table(1).data = null;
+      expect(hl.table(1).data).toBeNull();
+      hl.writeTo(out, { overwrite: true });
+    } finally {
+      hl.close();
+    }
+    const reread = zf.open(out);
+    try {
+      expect(reread.get(1).header.get("TFIELDS")).toBe(0);
+      expect(reread.get(1).header.get("NAXIS2")).toBe(0);
+    } finally {
+      reread.close();
+    }
+
+    const before = readFileSync(p);
+    const h = zf.open(p, "update");
+    h.table(1).data = null;
+    expect(() => h.close()).toThrow(zf.NotSupportedError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+  });
+});
