@@ -144,7 +144,8 @@ merged.
 The bindings under `bindings/` are **additive**: a `zf_*` C-ABI shim (`bindings/capi/`, built by
 `zig build capi`) over the public Zig module, a low-level `ctypes` binding, a high-level
 NumPy/Astropy-style API, and a TypeScript package (`bindings/typescript/`) mirroring the same two
-layers (Bun `bun:ffi` / Node koffi under an astropy-style TypedArray API). `src/` is unchanged
+layers (a single WebAssembly build of the same C ABI under an astropy-style TypedArray API,
+running on Node/Bun/browsers). `src/` is unchanged
 and contains **no C** (the `.h` contract lives under `bindings/c/`, outside the `GC-1` guard's
 `src tools test` scope). Interoperability is verified both directions against Astropy and the
 committed golden corpus, plus a TS↔Python cross-check in CI. Honest limits as delivered (they
@@ -179,11 +180,20 @@ apply to both language bindings unless noted; TypeScript-specific ones are liste
   integers parse to `number` when exactly double-representable, else `bigint`;
   `KeywordNotFound` is not also a `KeyError` (no such JS class); handles need an explicit
   `close()` (or `using` on runtimes with `Symbol.dispose`) — there is no GC-based freeing.
-  bun:ffi ≤1.3.14 mislays stack-passed arguments on darwin-arm64 (Apple packs them at natural
-  alignment; bun uses 8-byte slots — hit by `zf_write_compressed3`'s two adjacent `int` stack
-  args); the bun backend fuses such pairs into one `u64` transparently
-  (`bindings/typescript/src/ffi/bun.ts`), which stays byte-identical on a fixed bun. Do not
-  remove the workaround.
+  (Historical: the pre-wasm FFI backends carried a bun:ffi ≤1.3.14 darwin-arm64 stack-argument
+  workaround; the package is wasm-only now and the workaround is gone with the backends.)
+- **Signed-byte (`i1`) images (TypeScript).** The high-level image writer does not map
+  `Int8Array` data to the FITS `BZERO = -128` signed-byte convention yet — it fails with a typed
+  error rather than writing a mislabeled unsigned image. (The table-side `Int8Array` rejection in
+  `tableFromArrays` is the sibling limit, listed below.)
+- **WebAssembly execution (TypeScript).** The compute-heavy codecs (RICE/HCOMPRESS/quantize) run
+  inside wasm at roughly 1.5–3× the runtime of a native build, and large image/table transfers
+  copy through wasm linear memory. The module is single-threaded, and its heap only grows —
+  pages are never returned to the OS for the life of the instance.
+- **No filesystem inside the wasm module (TypeScript).** Path-based file I/O is a JS-side
+  convenience (`node:fs`) available on Node/Bun only; browsers use `fromBytes`/`toBytes`.
+  Writing a `.fits.gz` via the C ABI (`zf_save_gzip`) and the raw `zf_open_file`/`zf_create_file`
+  return `NotWritable` in the wasm build — the high-level `open`/`writeTo` route around them.
 
 ### TypeScript high-level ergonomics (the TS-native surface)
 
