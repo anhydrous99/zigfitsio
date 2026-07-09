@@ -1710,6 +1710,9 @@ describe("flat plain arrays on vector columns count rows by repeat (BUGHUNT 61)"
     } finally {
       hl.close();
     }
+  });
+});
+
 // ── BUGHUNT-2026-07-06 #47: hostile Z* geometry must throw, never trap the wasm module ───────
 describe("zf_img_param hostile Z* geometry (finding 47)", () => {
   /** A binary table posing as a tile-compressed image (ZIMAGE=T) with the given Z* integers. */
@@ -1740,7 +1743,12 @@ describe("zf_img_param hostile Z* geometry (finding 47)", () => {
 
   test("negative ZNAXISn throws", () => {
     const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 16n, ZNAXIS: 1n, ZNAXIS1: -5n }));
-    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsError);
+    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsCompressError);
+  });
+
+  test("out-of-range ZNAXIS throws instead of silently reporting zero axes", () => {
+    const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 16n, ZNAXIS: 5000n }));
+    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsCompressError);
   });
 
   test("ZNAXISn above the wasm32 c_long range throws (the i32 ABI cannot represent it)", () => {

@@ -1008,6 +1008,24 @@ test "zf_img_param rejects hostile Z* geometry keywords with an error, never a t
     try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
     try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
 
+    // ZNAXIS present but out of range: error like the decompression path, not a silent
+    // zero-axis report.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, -1, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 5000, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+
+    // ZNAXIS = 0 stays legal (zero-dimensional): success with zero axes reported.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 0, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled));
+    try testing.expectEqual(@as(c_int, 0), naxis);
+    try testing.expectEqual(@as(c_int, 0), filled);
+
+    // Restore a valid ZNAXIS for the wide-axis case below.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 1, null, 0));
+
     // ZNAXISn above 2^31: reported faithfully where c_long is 64-bit, an error where it is
     // 32-bit (Windows LLP64, wasm32) — the ABI cannot represent the value there.
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn1, zn1.len, 1 << 40, null, 0));

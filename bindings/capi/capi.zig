@@ -307,8 +307,9 @@ pub export fn zf_img_param(h_opt: ?*Handle, bitpix_out: *c_int, naxis_out: *c_in
             8, 16, 32, 64, -32, -64 => @intCast(zbp),
             else => return abi.fail(&h.diag, error.BadBitpix),
         };
-        const zn = hdu.header.getValue(i64, "ZNAXIS") catch 0;
-        const nax: usize = if (zn > 0 and zn <= 999) @intCast(zn) else 0;
+        const zn = hdu.header.getValue(i64, "ZNAXIS") catch 0; // missing → zero axes, like ZBITPIX's fallback
+        if (zn < 0 or zn > 999) return abi.fail(&h.diag, error.BadTiling);
+        const nax: usize = @intCast(zn);
         naxis_out.* = @intCast(nax);
         const n = @min(nax, cap);
         var name_buf: [16]u8 = undefined;

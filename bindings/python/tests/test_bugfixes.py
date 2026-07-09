@@ -1307,5 +1307,13 @@ def test_negative_znaxisn_raises():
     # #47 follow-up: a negative ZNAXISn errors on every platform (mirrors the decompression
     # path's BadTiling) instead of flowing into the geometry out-params.
     hl = zf.from_bytes(_zimage_bytes(ZBITPIX=16, ZNAXIS=1, ZNAXIS1=-5))
-    with pytest.raises(zf.FitsError):
+    with pytest.raises(ll.FitsCompressError):
+        _ = hl[1].shape
+
+
+def test_out_of_range_znaxis_raises():
+    # #47 review round: ZNAXIS present but out of range used to be treated like missing — a
+    # silent zero-axis report (shape None) for a file the decompression path rejects outright.
+    hl = zf.from_bytes(_zimage_bytes(ZBITPIX=16, ZNAXIS=5000))
+    with pytest.raises(ll.FitsCompressError):
         _ = hl[1].shape

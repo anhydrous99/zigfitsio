@@ -46,11 +46,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
 - **C ABI**: `zf_img_param` on a binary table carrying `ZIMAGE = T` no longer trusts the
   `Z*` geometry keywords: a `ZBITPIX` outside the legal set (a crafted file could abort a
   safety-checked build or silently misreport geometry in the ReleaseFast wheels) now
-  returns `BAD_BITPIX`, a negative `ZNAXISn` returns `DATA_COMPRESSION_ERR`, and an axis
-  that cannot be represented in the caller's 32-bit C `long` (Windows LLP64, wasm32 — the
-  TypeScript binding everywhere) returns `BAD_NAXES` instead of trapping. The
-  non-compressed path applies the same checked cast, so a valid image axis above 2³¹
-  errors cleanly on those ABIs too. Reachable from both bindings' standard
+  returns `BAD_BITPIX`, a negative `ZNAXISn` or an out-of-range `ZNAXIS` returns
+  `DATA_COMPRESSION_ERR` (previously an out-of-range `ZNAXIS` was silently reported as
+  zero axes), and an axis that cannot be represented in the caller's 32-bit C `long`
+  (Windows LLP64, wasm32 — the TypeScript binding everywhere) returns `BAD_NAXES` instead
+  of trapping. The non-compressed path applies the same checked cast, so a valid image
+  axis above 2³¹ errors cleanly on those ABIs too. Reachable from both bindings' standard
   `.shape`/`.data` geometry path on any untrusted file. (BUGHUNT-2026-07-06 #47)
 
 ## [0.1.3] - 2026-07-07
