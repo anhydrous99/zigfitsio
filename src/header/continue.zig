@@ -185,7 +185,7 @@ pub fn endsWithSentinel(field: []const u8) bool {
 fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: bool, comment: ?[]const u8) HeaderError!Card {
     var raw: [80]u8 = [_]u8{' '} ** 80;
     if (first.*) {
-        const nm = @import("name.zig").Name.parse(name) catch return error.BadKeywordName;
+        const nm = @import("name.zig").Name.parseStrict(name) catch return error.BadKeywordName;
         @memcpy(raw[0..8], &nm.bytes);
         raw[8] = '=';
         raw[9] = ' ';

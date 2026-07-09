@@ -395,6 +395,28 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     capi.zf_free(out_ptr, out_len);
 }
 
+test "spaced keyword names are rejected with status 207 on the write path (BUGHUNT 62)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    // BadKeywordName maps to CFITSIO 207 (BAD_KEYCHAR) across the whole write ABI.
+    const bad = "AB CD";
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_lng(hh, bad, bad.len, 5, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_last_status());
+    const longval = "x" ** 100;
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_longstr(hh, bad, bad.len, longval, longval.len, null, 0));
+
+    const good = "GOODKEY";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, good, good.len, 7, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_rename_key(hh, good, good.len, bad, bad.len));
+    var v: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(hh, good, good.len, &v));
+    try testing.expectEqual(@as(c_longlong, 7), v); // untouched by the failed rename
+}
+
 fn putRecord(hh: *Handle, text: []const u8) !void {
     var card: [80]u8 = [_]u8{' '} ** 80;
     @memcpy(card[0..text.len], text);
