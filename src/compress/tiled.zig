@@ -3276,11 +3276,17 @@ test "writeCompressed quantized f64: dequantization keeps full double precision 
     // draw's low bits, so virtually none of them sit on the f32 grid. If the read path is ever
     // funneled through f32 again, every pixel becomes f32-representable and this fails.
     var beyond_f32: usize = 0;
+    var lossy: usize = 0;
     for (src, out) |s, o| {
         try testing.expect(@abs(o - s) <= 0.125 + 1e-9);
         if (o != @as(f64, @as(f32, @floatCast(o)))) beyond_f32 += 1;
+        if (o != s) lossy += 1;
     }
     try testing.expect(beyond_f32 > 0);
+    // Guard the canary itself: the source values are not f32-representable either, so a silent
+    // lossless fallback (raw f64s stored verbatim, `out == src`) would pass the check above
+    // without the dequantization ever running. Quantization is lossy — some pixel must differ.
+    try testing.expect(lossy > 0);
 }
 
 test "writeCompressed quantized-float: NaN emits ZBLANK, ±Inf tile falls back lossless (HCOMPRESS)" {

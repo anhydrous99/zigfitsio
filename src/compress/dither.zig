@@ -138,8 +138,10 @@ pub fn quantize(value: f32, zscale: f64, zzero: f64, dither_value: f32) i32 {
 /// software fma where hardware lacks one) mirrors what CFITSIO's and astropy's C builds do on
 /// FMA hardware: clang/gcc default `-ffp-contract=on` fuses the `* scale + zero` of
 /// `unquantize_i4r8`, so a plain mul-then-add here differs from funpack/astropy by 1 ULP on
-/// ~0.5 % of double pixels. The fused form is also the correctly-rounded (single-rounding)
-/// result and is byte-deterministic across zigfitsio targets.
+/// ~0.6 % of double pixels. The fused form is also the correctly-rounded (single-rounding)
+/// result and is byte-deterministic across zigfitsio targets. That determinism costs decode
+/// speed where no hardware fma exists (notably wasm32, which lowers this to a per-pixel
+/// software fma) — accepted so every binding decodes the same file to the same bytes.
 pub fn unquantize(stored: i32, zscale: f64, zzero: f64, dither_value: f32) f64 {
     if (stored == null_value) return std.math.nan(f64);
     return @mulAdd(f64, @as(f64, @floatFromInt(stored)) - @as(f64, dither_value) + 0.5, zscale, zzero);
