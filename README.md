@@ -1,32 +1,29 @@
 # zigfitsio
 
-A pure-[Zig](https://ziglang.org) implementation of a [FITS](https://fits.gsfc.nasa.gov)
-(Flexible Image Transport System) 4.0 input/output library, with feature parity goals
-against [CFITSIO](https://heasarc.gsfc.nasa.gov/docs/software/fitsio/fitsio.html) — written
-with **no C imports and no C sources** (`GC-1`).
+[![CI](https://github.com/anhydrous99/zigfitsio/actions/workflows/ci.yml/badge.svg)](https://github.com/anhydrous99/zigfitsio/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/zigfitsio)](https://pypi.org/project/zigfitsio/)
+[![npm](https://img.shields.io/npm/v/zigfitsio)](https://www.npmjs.com/package/zigfitsio)
+[![Zig 0.16](https://img.shields.io/badge/zig-0.16-f7a41d)](https://ziglang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-- **Conformance target:** *Definition of the FITS Standard*, Version 4.0 (2018-08-13).
-- **Toolchain:** Zig **0.16.0**, standard library only (`GC-2`, `GC-3`).
-- **License:** MIT (see [`LICENSE`](./LICENSE)).
+**FITS 4.0 I/O in pure Zig — zero C dependencies — with Python and TypeScript/WebAssembly bindings.**
 
-See [`requirements.md`](./requirements.md), [`design.md`](./design.md), and
-[`tasks.md`](./tasks.md) for the full specification, architecture, and implementation
-backlog.
+zigfitsio implements the [*Definition of the FITS Standard*, Version 4.0](https://fits.gsfc.nasa.gov)
+end to end, with interoperability verified in **both directions** against CFITSIO 4.6.4 and Astropy.
 
-## Build
+## Features
 
-```sh
-zig build              # build the static library
-zig build test         # run the test suite
-zig build capi         # build the C-ABI shared library (for the Python/C bindings)
-zig build capi-test    # test the C-ABI shim
-zig build bench        # throughput benchmarks
-zig build fitsverify   # run the structural-validation CLI demo
-zig build fuzz         # fuzz the header/table parsers
-zig build wasm-check   # compile the core for wasm32-freestanding
-```
+- **Images** — all six `BITPIX` types, `BSCALE`/`BZERO` scaling, null handling, strided sections.
+- **Tables** — ASCII and binary, every `TFORM` code, `TDIM`, variable-length arrays.
+- **Compression** — RICE_1, GZIP_1/2, PLIO_1, HCOMPRESS_1 (including lossy and quantized floats), read **and** write.
+- **WCS** — celestial (`TAN`/`SIN`/`ARC`/`STG`/`ZEA`/`CAR`), spectral, and time-coordinate transforms.
+- **Integrity** — `DATASUM`/`CHECKSUM` compute/update/verify, `fitsverify`-style structural validation.
+- **Backends** — file, in-memory, stream/gzip, and HTTP I/O; transparent `.fits.gz`; CFITSIO-style extended filenames.
+- **Headers** — `CONTINUE` long strings, `HIERARCH` keywords, complex-valued cards, ASCII templates.
 
-## Use as a dependency
+## Install
+
+### Zig (requires Zig 0.16)
 
 ```sh
 zig fetch --save git+https://github.com/anhydrous99/zigfitsio
@@ -38,31 +35,46 @@ const fits = b.dependency("zigfitsio", .{ .target = target, .optimize = optimize
 exe.root_module.addImport("zigfitsio", fits.module("zigfitsio"));
 ```
 
-## Language bindings (C ABI + Python + TypeScript)
+### Python
 
-A stable **C ABI**, a **Python** package, and a **TypeScript/JavaScript** package live under
-[`bindings/`](./bindings). They are additive — the pure-Zig library in `src/` is unchanged —
-and are layered:
+```sh
+pip install zigfitsio
+```
 
-- **C-ABI shim** ([`bindings/capi/`](./bindings/capi), `zig build capi`): a dynamic library
-  `zigfitsio_capi` exporting `zf_*` symbols. The comptime-generic Zig API is monomorphized behind
-  runtime datatype codes, and Zig errors are surfaced as CFITSIO-compatible status ints via
-  `errors.cfitsioStatus`. The hand-written contract is [`bindings/c/zigfitsio.h`](./bindings/c/zigfitsio.h).
-  This is **not** a CFITSIO `fits_*`/`ff*` drop-in — it is a purpose-built ABI for bindings.
-- **Low-level Python** (`zigfitsio.lowlevel`): a 1:1 `ctypes` binding over the C ABI, with a typed
-  `FitsError` hierarchy. Pure Python — no C compiler needed at install.
-- **High-level Python** (`zigfitsio`): a NumPy-first API modeled on `astropy.io.fits` — `open`,
-  `HDUList`, the HDU classes, `Column`, a dict-like `Header`, `getdata`/`getheader`/`writeto`/
-  `verify`, and celestial WCS transforms. Interoperability is verified **both directions** against
-  Astropy and the committed CFITSIO golden corpus.
-- **TypeScript/JavaScript** ([`bindings/typescript/`](./bindings/typescript), npm `zigfitsio`):
-  the same two layers over the same shared library — a 1:1 FFI mapping (`zigfitsio/lowlevel`,
-  Bun `bun:ffi` / Node [koffi](https://koffi.dev/)) and the astropy-style high-level API with
-  TypedArray data, plus a TS-native surface layered on top (discriminated HDU `kind` with typed
-  `image()`/`table<T>()` accessors, a columnar-plus-row `TableData`, Map-style `Header`,
-  `tableFromArrays`/`imageFromArray` factories, and strided `ImageHDU.section()` cutouts) so
-  idiomatic callers avoid `as` casts. Prebuilt libraries ship as `zigfitsio-<platform>`
-  packages; a TS↔Python interop cross-check runs in CI.
+See [`bindings/python/README.md`](./bindings/python/README.md).
+
+### TypeScript / JavaScript
+
+```sh
+npm install zigfitsio
+```
+
+See [`bindings/typescript/README.md`](./bindings/typescript/README.md).
+
+## Quickstart
+
+### Zig
+
+```zig
+const fits = @import("zigfitsio");
+
+// Write a 256×256 float image.
+var out = try fits.createFile(allocator, "img.fits", .{});
+defer out.deinit();
+var img = try fits.ImageView.append(&out, .{ .bitpix = -32, .axes = &.{ 256, 256 } });
+try img.writeAll(f32, pixels, .{});
+try out.flush();
+
+// Read it back — scaling applied, stored type converted, in bounded chunks.
+var in = try fits.openFile(allocator, "img.fits", .read_only, .{});
+defer in.deinit();
+var view = try fits.ImageView.of(&in, in.current());
+const buf = try allocator.alloc(f32, @intCast(view.elementCount()));
+defer allocator.free(buf);
+try view.readAll(f32, buf, .{ .null_sentinel = 0.0 });
+```
+
+### Python
 
 ```python
 import numpy as np, zigfitsio as zf
@@ -72,94 +84,51 @@ with zf.open("img.fits") as hdul:
     print(hdul[0].data, hdul[0].header["NAXIS1"])
 ```
 
+### TypeScript
+
 ```ts
 import * as zf from "zigfitsio";
 
 zf.writeTo("img.fits", new zf.FitsArray(Float32Array.from({ length: 12 }, (_, i) => i), [3, 4]), { overwrite: true });
-const hdul = zf.open("img.fits");
-try {
-  // `image()`/`table()` assert the HDU flavor, so `.data` is typed (no cast).
-  console.log(hdul.image(0).data, hdul.image(0).header.get("NAXIS1"));
-} finally {
-  hdul.close(); // or `using hdul = zf.open(...)` on TypeScript / Bun / Node ≥24
-}
+using hdul = zf.open("img.fits"); // `using` closes the handle at scope exit
+console.log(hdul.image(0).data, hdul.image(0).header.get("NAXIS1"));
 ```
 
-See [`bindings/python/README.md`](./bindings/python/README.md) and
-[`bindings/typescript/README.md`](./bindings/typescript/README.md) for install, the full APIs,
-and the packaging workflows.
+## Language bindings
 
-## Status
+The pure-Zig library in `src/` is unchanged; everything under [`bindings/`](./bindings) is additive:
 
-Feature-complete and tested (459 tests green), with cross-tool interoperability verified against
-**CFITSIO 4.6.4 + Astropy** (see below). Implemented end to end:
+- **C ABI** ([`bindings/c/zigfitsio.h`](./bindings/c/zigfitsio.h), `zig build capi`) — a shared library
+  exporting `zf_*` symbols with CFITSIO-compatible status ints. Purpose-built for bindings; **not** a
+  CFITSIO `fits_*` drop-in.
+- **Python** (PyPI `zigfitsio`) — a NumPy-first, `astropy.io.fits`-style API over a 1:1 `ctypes`
+  layer (`zigfitsio.lowlevel`). Prebuilt wheels; no C compiler needed.
+- **TypeScript/JavaScript** (npm `zigfitsio`) — the same two layers over a single bundled
+  WebAssembly module. Runs on Node ≥18, Bun, and browsers; no native addons.
 
-- **Foundation:** I/O layer (in-memory, file, stream/gzip, and HTTP backends), typed
-  error sets, big-endian access, numeric-conversion policy, resource limits.
-- **Headers:** value parsing (null/empty/undefined distinction), 80-byte cards, full
-  read + edit operations, header-space pre-allocation, `CONTINUE` long strings,
-  `HIERARCH` long names, and complex-valued cards.
-- **HDUs & data:** HDU model with navigation/mutation; `ImageView` over all six `BITPIX`
-  with scaling, nulls, and strided sections; ASCII and binary tables (all `TFORM` codes,
-  `TDIM`, scaling, nulls); variable-length arrays with a compacting heap.
-- **WCS:** keyword set parse/serialize plus celestial (`TAN`/`SIN`/`ARC`/`STG`/`ZEA`/`CAR`),
-  spectral, and time-coordinate transforms.
-- **Compression:** GZIP_1/2, RICE_1, PLIO_1, and HCOMPRESS_1 tiled read **and** write,
-  with subtractive dithering; tile-compressed-table (`ZTABLE`) reading.
-- **Integrity & validation:** `DATASUM`/`CHECKSUM` compute/update/verify; a
-  `fitsverify`-style structural pass.
-- **Convenience:** CFITSIO-style extended filenames, ASCII header templates, hierarchical
-  grouping tables, and a transparent `.fits.gz` open path.
+## Interoperability
 
-**Cross-tool interoperability is verified**, not just self-consistent: a committed
-**CFITSIO 4.6.4 + `fpack`** golden corpus (`test/golden/`, generators under `interop/`) is decoded
-hermetically by `test/golden.zig` on every CI cell (including big-endian s390x), an in-house
-full-feature round-trip (`test/e2e.zig`) mirrors CFITSIO's `testprog.c`, and a dedicated `interop`
-CI job opens every zigfitsio-written file with CFITSIO `funpack`, Astropy, and `fitsverify`.
-Authoring this corpus closed two real interop bugs that self-round-trips could not catch (the PLIO
-line-list header + `COMPRESSED_DATA` `1PB`→`1PI`, and an unregistered `checksum_on_close` hook).
-`HCOMPRESS_1` is complete including the lossy path: decode-side smoothing (`hsmooth`) reproduces
-`funpack` bit-for-bit on committed lossy/smoothed goldens, and the write path supports CFITSIO's
-absolute and noise-adaptive lossy scaling (`CompressSpec.hcomp_scale`/`.hcomp_smooth`). See
-`CAVEATS.md` and `tasks.md`.
+Cross-tool compatibility is verified, not just self-consistent: a committed **CFITSIO 4.6.4 +
+`fpack`** golden corpus ([`test/golden/`](./test/golden)) is decoded hermetically on every CI cell
+(including big-endian s390x), and a dedicated CI job opens every zigfitsio-written file with
+CFITSIO `funpack`, Astropy, and `fitsverify`. Lossy HCOMPRESS decoding reproduces `funpack`
+bit-for-bit. Known limits: [`CAVEATS.md`](./CAVEATS.md).
 
-## Examples
+## Development
 
-### Read an image into `[]f32`
-
-```zig
-const fits = @import("zigfitsio");
-
-var f = try fits.openFile(allocator, "img.fits", .read_only, .{});
-defer f.deinit();
-
-var img = try fits.ImageView.of(&f, f.current());
-const buf = try allocator.alloc(f32, @intCast(img.elementCount()));
-defer allocator.free(buf);
-
-// BSCALE/BZERO applied, NaN → 0 substituted, stored → f32 converted, in bounded chunks.
-try img.readAll(f32, buf, .{ .null_sentinel = 0.0 });
+```sh
+zig build              # build the static library
+zig build test         # run the test suite
+zig build capi         # build the C-ABI shared library (for the Python bindings)
+zig build capi-test    # test the C-ABI shim
+zig build bench        # throughput benchmarks
+zig build fitsverify   # run the structural-validation CLI demo
+zig build fuzz         # fuzz the header/table parsers
+zig build wasm-check   # compile the core for wasm32-freestanding
 ```
 
-### Create an image (the programmatic builder is the primary path)
+Release history: [`CHANGELOG.md`](./CHANGELOG.md).
 
-```zig
-var f = try fits.createFile(allocator, "out.fits", .{});
-defer f.deinit();
+## License
 
-var img = try fits.ImageView.append(&f, .{ .bitpix = -32, .axes = &.{ 256, 256 } });
-try img.writeAll(f32, pixels, .{});
-try f.flush();
-```
-
-### Navigate HDUs and read a strided section
-
-```zig
-const n = try f.hduCount();
-var img = try fits.ImageView.of(&f, try f.select(2)); // 1-based HDU number
-var tile: [256 * 256]f32 = undefined;
-try img.readSection(f32, &.{ 0, 0 }, &.{ 511, 511 }, &.{ 2, 2 }, &tile, .{});
-```
-
-In-memory and stdin/stdout back-ends are first-class: build a `fits.MemoryDevice` and pass
-`mem.device()` to `fits.open`/`fits.create` for a freestanding-capable, file-less path.
+MIT — see [`LICENSE`](./LICENSE).
