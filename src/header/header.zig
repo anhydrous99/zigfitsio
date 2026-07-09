@@ -405,7 +405,7 @@ pub const Header = struct {
     /// is normalized and validated (`error.BadKeywordName` on a bad alphabet).
     pub fn rename(self: *Header, old: []const u8, new: []const u8) (ValueError || HeaderError)!void {
         const i = self.findFirst(old) orelse return error.KeywordNotFound;
-        const new_name = try Name.parse(new);
+        const new_name = try Name.parseStrict(new);
         var raw = self.cards.items[i].raw;
         @memcpy(raw[0..8], &new_name.bytes);
         self.cards.items[i] = try Card.parse(&raw);
@@ -732,6 +732,20 @@ test "delete keeps a literal trailing '&' value and an unrelated CONTINUE run in
     const got = try h.getLongString(testing.allocator, "WEATHER");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("cloudy skies overnight", got);
+}
+
+test "write-path keyword names reject embedded/leading blanks (BUGHUNT 62)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try testing.expectError(error.BadKeywordName, h.appendValue(testing.allocator, "AB CD", .{ .int = 1 }, null));
+    try testing.expectError(error.BadKeywordName, h.appendValue(testing.allocator, " XKEY", .{ .int = 1 }, null));
+    try testing.expectError(error.BadKeywordName, h.update(testing.allocator, "AB CD", .{ .int = 1 }, null));
+    try testing.expectError(error.BadKeywordName, h.appendLongString(testing.allocator, "AB CD", "z" ** 150, null));
+
+    try h.appendValue(testing.allocator, "GOODKEY", .{ .int = 7 }, null);
+    try testing.expectError(error.BadKeywordName, h.rename("GOODKEY", "AB CD"));
+    try testing.expectError(error.BadKeywordName, h.rename("GOODKEY", " XKEY"));
+    try testing.expectEqual(@as(i64, 7), try h.getValue(i64, "GOODKEY")); // untouched by the failed renames
 }
 
 test "HIERARCH lookup through the Header by both spellings (FR-HDR-9)" {

@@ -57,14 +57,15 @@ pub const Card = struct {
 
     /// Build a value card `NAME    = <value> / comment` into 80 space-padded bytes.
     ///
-    /// The name is normalized (`Name.parse` errors on a bad alphabet); the value indicator
-    /// `= ` is placed in bytes 9–10; `v` is rendered into the value field by `value.zig`
-    /// (fixed-format for numbers and logicals), followed by `/ comment` when `comment` is
-    /// non-null. A value or comment too long for the 70-byte field yields
-    /// `error.CardOverflow`; the result is re-parsed so its `kind` reflects the `FR-HDR-6`
-    /// rule (e.g. a commentary name stays commentary even with the indicator present).
+    /// The name is normalized (`Name.parseStrict` errors on a bad alphabet or on blanks
+    /// that are not trailing padding); the value indicator `= ` is placed in bytes 9–10;
+    /// `v` is rendered into the value field by `value.zig` (fixed-format for numbers and
+    /// logicals), followed by `/ comment` when `comment` is non-null. A value or comment
+    /// too long for the 70-byte field yields `error.CardOverflow`; the result is re-parsed
+    /// so its `kind` reflects the `FR-HDR-6` rule (e.g. a commentary name stays commentary
+    /// even with the indicator present).
     pub fn buildValue(name_field: []const u8, v: value.KeywordValue, comment: ?[]const u8) HeaderError!Card {
-        const name = try Name.parse(name_field);
+        const name = try Name.parseStrict(name_field);
         var raw: [80]u8 = [_]u8{' '} ** 80;
         @memcpy(raw[0..8], &name.bytes);
         raw[8] = '=';
@@ -240,4 +241,17 @@ test "buildValue: oversized comment overflows the card" {
 
 test "buildValue: bad keyword name is rejected" {
     try testing.expectError(error.BadKeywordName, Card.buildValue("BAD.NAME", .{ .int = 1 }, null));
+}
+
+test "buildValue: embedded or leading blanks in the name are rejected (BUGHUNT 62)" {
+    try testing.expectError(error.BadKeywordName, Card.buildValue("AB CD", .{ .int = 1 }, null));
+    try testing.expectError(error.BadKeywordName, Card.buildValue(" XKEY", .{ .int = 1 }, null));
+}
+
+test "Card.parse stays lenient about blanks in an on-disk name field (read contract)" {
+    // Third-party files with malformed spaced names must still load; only the
+    // build/edit path is strict.
+    const raw = card80("AB CD   =                    1");
+    const c = try Card.parse(&raw);
+    try testing.expectEqualStrings("AB CD", c.name.text());
 }
