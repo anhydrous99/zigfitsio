@@ -860,10 +860,10 @@ describe("misc parity", () => {
 // file does not have (mirrors core.py _emit_columns / _binary_tform_for).
 describe("writeTo reconstructs a reassigned TableData by column name", () => {
   /** Reassign hdu 1's data via `reassign` and return the re-serialized bytes. */
-  const reassigned = (src: Uint8Array, reassign: (hdu: zf.BinTableHDU, d: zf.TableData) => void): Uint8Array => {
+  const reassigned = (src: Uint8Array, reassign: (hdu: zf.TableHDU, d: zf.TableData) => void): Uint8Array => {
     const hl = zf.fromBytes(src);
     try {
-      const hdu = hl.get(1) as zf.BinTableHDU;
+      const hdu = hl.get(1) as zf.TableHDU;
       reassign(hdu, hdu.data as zf.TableData);
       return hl.toBytes();
     } finally {
@@ -964,6 +964,125 @@ describe("writeTo reconstructs a reassigned TableData by column name", () => {
     try {
       expect(chk.get(1).header.get("TFORM1")).toBe("1L");
       expect(asNums((chk.get(1).data as zf.TableData).get("FLAG") as zf.TypedArray)).toEqual([1, 0, 1]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("TNULLn/TDISPn/TUNITn follow their column through a reorder", () => {
+    // Plant indexed metadata on column A (index 1 in the file) in a first
+    // pass, then reorder in a second — the cards must land at A's NEW index.
+    const seeded = zf.fromBytes(intFloatBytes());
+    seeded.get(1).header.set("TNULL1", -999, "null marker for A");
+    seeded.get(1).header.set("TDISP1", "I8");
+    seeded.get(1).header.set("TUNIT1", "adu");
+    const src = seeded.toBytes();
+    seeded.close();
+    const copy = reassigned(src, (hdu, d) => {
+      hdu.data = new zf.TableData(["B", "A"], d.columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      const h = chk.get(1).header;
+      expect(h.get("TNULL2")).toBe(-999);
+      expect(h.get("TDISP2")).toBe("I8");
+      expect(h.get("TUNIT2")).toBe("adu");
+      // Nothing may stay behind labeling B (a TNULL on a float column is spec-invalid).
+      expect(h.get("TNULL1")).toBeUndefined();
+      expect(h.get("TDISP1")).toBeUndefined();
+      expect(h.get("TUNIT1")).toBeUndefined();
+      const got = chk.get(1).data as zf.TableData;
+      expect(asNums(got.get("A") as zf.TypedArray)).toEqual([1, 2, 3]);
+      expect(asNums(got.get("B") as zf.TypedArray)).toEqual([1.5, 2.5, 3.5]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("renamed column synthesizes its format and drops stale indexed metadata", () => {
+    const seeded = zf.fromBytes(
+      new zf.HDUList([
+        new zf.PrimaryHDU(),
+        zf.BinTableHDU.fromColumns([new zf.Column("A", "1J", { array: Int32Array.from([1, 2, 3]) })]),
+      ]).toBytes(),
+    );
+    seeded.get(1).header.set("TNULL1", -999);
+    const src = seeded.toBytes();
+    seeded.close();
+    const copy = reassigned(src, (hdu, d) => {
+      hdu.data = new zf.TableData(["R"], new Map([["R", d.column("A")]]), d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      expect(chk.get(1).header.get("TTYPE1")).toBe("R");
+      expect(chk.get(1).header.get("TFORM1")).toBe("1J");
+      expect(chk.get(1).header.get("TNULL1")).toBeUndefined();
+      expect(asNums((chk.get(1).data as zf.TableData).get("R") as zf.TypedArray)).toEqual([1, 2, 3]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("retyped column keeps its unit but drops the stale TNULL", () => {
+    const seeded = zf.fromBytes(
+      new zf.HDUList([
+        new zf.PrimaryHDU(),
+        zf.BinTableHDU.fromColumns([new zf.Column("V", "1I", { array: Int16Array.from([1, 2, 3]) })]),
+      ]).toBytes(),
+    );
+    seeded.get(1).header.set("TNULL1", -9);
+    seeded.get(1).header.set("TUNIT1", "ct");
+    const src = seeded.toBytes();
+    seeded.close();
+    const copy = reassigned(src, (hdu, d) => {
+      const columns = new Map<string, zf.ColumnData>();
+      columns.set("V", { kind: "numeric", dtype: "i8", repeat: 1, values: BigInt64Array.from([40000n, 50000n, 60000n]) });
+      hdu.data = new zf.TableData(["V"], columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      expect(chk.get(1).header.get("TFORM1")).toBe("1K");
+      expect(chk.get(1).header.get("TUNIT1")).toBe("ct"); // the physical quantity did not change
+      expect(chk.get(1).header.get("TNULL1")).toBeUndefined(); // the i2 sentinel no longer describes the stored type
+      expect(asNums((chk.get(1).data as zf.TableData).get("V") as zf.TypedArray)).toEqual([40000, 50000, 60000]);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("ASCII-table add/rename fails loud instead of guessing a format", () => {
+    const src = new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.AsciiTableHDU.fromColumns([new zf.Column("A", "I6", { array: Int32Array.from([1, 2, 3]) })]),
+    ]).toBytes();
+    expect(() =>
+      reassigned(src, (hdu, d) => {
+        hdu.data = new zf.TableData(["R"], new Map([["R", d.column("A")]]), d.nrows);
+      }),
+    ).toThrow(zf.NotSupportedError);
+  });
+
+  test("added VLA column synthesizes its 1P format from the element dtype", () => {
+    const src = new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("A", "1J", { array: Int32Array.from([1, 2, 3]) })]),
+    ]).toBytes();
+    const copy = reassigned(src, (hdu, d) => {
+      const columns = new Map<string, zf.ColumnData>(d.columns);
+      columns.set("W", {
+        kind: "vla",
+        dtype: "i4",
+        repeat: 1,
+        values: [Int32Array.from([7]), Int32Array.from([8, 9]), Int32Array.from([])],
+      });
+      hdu.data = new zf.TableData(["A", "W"], columns, d.nrows);
+    });
+    const chk = zf.fromBytes(copy);
+    try {
+      expect(String(chk.get(1).header.get("TFORM2"))).toContain("PJ");
+      const got = chk.get(1).data as zf.TableData;
+      expect(got.vla("W").map((cell) => asNums(cell))).toEqual([[7], [8, 9], []]);
+      expect(asNums(got.get("A") as zf.TypedArray)).toEqual([1, 2, 3]);
     } finally {
       chk.close();
     }
