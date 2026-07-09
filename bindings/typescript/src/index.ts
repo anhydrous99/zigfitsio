@@ -36,6 +36,7 @@ export {
   type Row,
   type RowCell,
   type StringColumn,
+  type TableHDUOptions,
   type VlaColumn,
 } from "./table.js";
 export {

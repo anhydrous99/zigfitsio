@@ -1756,3 +1756,229 @@ describe("zf_img_param hostile Z* geometry (finding 47)", () => {
     expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsError);
   });
 });
+
+describe("undefined header values (finding 13)", () => {
+  test("null value writes an undefined card and round-trips", () => {
+    const h = new zf.Header();
+    h.set("UNDEF", null, "no value");
+    const raw = new zf.HDUList([new zf.PrimaryHDU({ header: h })]).toBytes();
+    // astropy's compact undefined form: blank value field, then `/ comment`.
+    expect(new TextDecoder().decode(raw)).toContain("UNDEF   =  / no value");
+    const hl = zf.fromBytes(raw);
+    try {
+      const hh = hl.get(0).header;
+      expect(hh.get("UNDEF")).toBeNull();
+      expect(hh.commentOf("UNDEF")).toBe("no value");
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("update-mode set and reconstruction preserve the undefined card", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([1, 2, 3, 4]), [2, 2]));
+    const hl = zf.open(p, "update");
+    try {
+      hl.get(0).header.set("UNDEF2", null, "cleared");
+    } finally {
+      hl.close();
+    }
+    const hl2 = zf.open(p);
+    let copy: Uint8Array;
+    try {
+      expect(hl2.get(0).header.get("UNDEF2")).toBeNull();
+      expect(hl2.get(0).header.commentOf("UNDEF2")).toBe("cleared");
+      hl2.get(0).header.set("OTHER", 1); // read-only edit → writeTo reconstructs every card
+      copy = hl2.toBytes();
+    } finally {
+      hl2.close();
+    }
+    const hl3 = zf.fromBytes(copy);
+    try {
+      expect(hl3.get(0).header.get("UNDEF2")).toBeNull();
+      expect(hl3.get(0).header.commentOf("UNDEF2")).toBe("cleared");
+    } finally {
+      hl3.close();
+    }
+  });
+});
+
+describe("data = null clears the HDU (finding 14)", () => {
+  test("image clear sticks and writeTo/toBytes emit an empty HDU", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([0, 1, 2, 3, 4, 5]), [2, 3]));
+
+    const out = tmp.path();
+    const hl = zf.open(p);
+    try {
+      hl.get(0).data = null;
+      expect(hl.get(0).data).toBeNull(); // the assignment sticks; no lazy re-read
+      hl.writeTo(out, { overwrite: true });
+    } finally {
+      hl.close();
+    }
+    const reread = zf.open(out);
+    try {
+      expect(reread.get(0).data).toBeNull();
+      expect(reread.get(0).header.get("NAXIS")).toBe(0);
+    } finally {
+      reread.close();
+    }
+
+    const hl2 = zf.open(p);
+    let blob: Uint8Array;
+    try {
+      hl2.get(0).data = null;
+      blob = hl2.toBytes();
+    } finally {
+      hl2.close();
+    }
+    const hl3 = zf.fromBytes(blob);
+    try {
+      expect(hl3.get(0).data).toBeNull();
+    } finally {
+      hl3.close();
+    }
+  });
+
+  test("update-mode clear fails loud and leaves the file intact", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([0, 1, 2, 3, 4, 5]), [2, 3]));
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.get(0).data = null;
+    expect(() => hl.close()).toThrow(zf.NotSupportedError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+
+    // Regression guards: reading an ALREADY-empty HDU's data (null), or clearing
+    // it, is not an update-mode error — there is nothing on disk to clear.
+    const pe = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU()]).writeTo(pe, { overwrite: true });
+    const h1 = zf.open(pe, "update");
+    try {
+      expect(h1.get(0).data).toBeNull();
+    } finally {
+      h1.close();
+    }
+    const h2 = zf.open(pe, "update");
+    h2.get(0).data = null;
+    h2.close(); // no throw
+  });
+
+  test("table clear empties on writeTo and fails loud in update mode", () => {
+    const p = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("X", "J", { array: Int32Array.from([1, 2, 3, 4]) })], { name: "T" }),
+    ]).writeTo(p, { overwrite: true });
+
+    const out = tmp.path();
+    const hl = zf.open(p);
+    try {
+      hl.table(1).data = null;
+      expect(hl.table(1).data).toBeNull();
+      hl.writeTo(out, { overwrite: true });
+    } finally {
+      hl.close();
+    }
+    const reread = zf.open(out);
+    try {
+      expect(reread.get(1).header.get("TFIELDS")).toBe(0);
+      expect(reread.get(1).header.get("NAXIS2")).toBe(0);
+    } finally {
+      reread.close();
+    }
+
+    const before = readFileSync(p);
+    const h = zf.open(p, "update");
+    h.table(1).data = null;
+    expect(() => h.close()).toThrow(zf.NotSupportedError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+  });
+
+  test("section() on a pending clear fails loud in update mode (review follow-up)", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([0, 1, 2, 3, 4, 5]), [2, 3]));
+
+    // Update mode: a pending clear cannot be flushed, so section() cannot honor its
+    // "consistent with .data" promise — it throws like a pending geometry change.
+    const hl = zf.open(p, "update");
+    const orig = hl.image(0).data!;
+    hl.image(0).data = null;
+    expect(() =>
+      hl.image(0).section({
+        window: [
+          [0, 1],
+          [0, 2],
+        ],
+      }),
+    ).toThrow(zf.NotSupportedError);
+    hl.image(0).data = orig; // unblock close()
+    hl.close();
+
+    // Read-only mode: in-memory edits (including a clear) are documented as not visible
+    // to section(), which reads the file as opened.
+    const ro = zf.open(p);
+    try {
+      ro.image(0).data = null;
+      const sec = ro.image(0).section({
+        window: [
+          [0, 1],
+          [0, 2],
+        ],
+      });
+      expect(asNums(sec.data)).toEqual([0, 1]);
+    } finally {
+      ro.close();
+    }
+  });
+});
+
+describe("table data validation + detached TableData writes (finding 15)", () => {
+  test("non-TableData assignment throws instead of writing an empty table", () => {
+    const hdu = new zf.BinTableHDU();
+    expect(() => {
+      (hdu as { data: unknown }).data = new Int32Array(5);
+    }).toThrow(zf.FitsTypeError);
+    expect(() => new zf.BinTableHDU({ data: new Int32Array(5) as unknown as zf.TableData })).toThrow(
+      zf.FitsTypeError,
+    );
+  });
+
+  test("detached BinTableHDU with TableData serializes its rows", () => {
+    const cols = new Map<string, zf.ColumnData>([
+      ["A", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([1, 2, 3]) }],
+      ["B", { kind: "numeric", dtype: "f8", repeat: 1, values: Float64Array.from([0.5, 1.5, 2.5]) }],
+    ]);
+    const hdu = new zf.BinTableHDU({ data: new zf.TableData(["A", "B"], cols, 3), name: "D" });
+    const blob = new zf.HDUList([new zf.PrimaryHDU(), hdu]).toBytes();
+    const hl = zf.fromBytes(blob);
+    try {
+      const rec = hl.table(1).data!;
+      expect(asNums(rec.numeric("A"))).toEqual([1, 2, 3]);
+      expect(asNums(rec.numeric("B"))).toEqual([0.5, 1.5, 2.5]);
+      expect(hl.get(1).name).toBe("D");
+    } finally {
+      hl.close();
+    }
+
+    // The .data-setter path on a detached HDU serializes the same way.
+    const hdu2 = new zf.BinTableHDU({ name: "D2" });
+    hdu2.data = new zf.TableData(["A", "B"], cols, 3);
+    const hl2 = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), hdu2]).toBytes());
+    try {
+      expect(asNums(hl2.table(1).data!.numeric("A"))).toEqual([1, 2, 3]);
+    } finally {
+      hl2.close();
+    }
+  });
+
+  test("detached AsciiTableHDU with TableData fails loud", () => {
+    const cols = new Map<string, zf.ColumnData>([
+      ["A", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([1, 2]) }],
+    ]);
+    const hdu = new zf.AsciiTableHDU();
+    hdu.data = new zf.TableData(["A"], cols, 2);
+    expect(() => new zf.HDUList([new zf.PrimaryHDU(), hdu]).toBytes()).toThrow(zf.NotSupportedError);
+  });
+});

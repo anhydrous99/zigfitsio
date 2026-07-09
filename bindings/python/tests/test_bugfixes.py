@@ -1317,3 +1317,167 @@ def test_out_of_range_znaxis_raises():
     hl = zf.from_bytes(_zimage_bytes(ZBITPIX=16, ZNAXIS=5000))
     with pytest.raises(ll.FitsCompressError):
         _ = hl[1].shape
+
+
+# ── 2026-07 findings 13-15: None header values, data=None clears, table data validation ──────
+def test_none_header_value_round_trips_as_undefined_card(tmp_fits):
+    # Finding 13: header['KEY'] = None must write a FITS *undefined* card (blank value field),
+    # not the literal string 'None' — and reconstruction (writeto/to_bytes) must preserve it
+    # instead of silently dropping the card.
+    hdu = zf.PrimaryHDU()
+    hdu.header["UNDEF"] = (None, "no value")
+    blob = zf.HDUList([hdu]).to_bytes()
+    assert b"'None'" not in blob
+    hh = zf.from_bytes(blob)[0].header
+    assert hh["UNDEF"] is None
+    assert hh.comment_of("UNDEF") == "no value"
+
+    # Attached update-mode set goes through the C ABI write path.
+    p = tmp_fits("undef.fits")
+    zf.writeto(p, np.zeros((2, 2), dtype="i4"), overwrite=True)
+    with zf.open(p, mode="update") as hl:
+        hl[0].header["UNDEF2"] = (None, "cleared")
+    assert b"'None'" not in _file_bytes(p)
+    with zf.open(p) as hl:
+        assert hl[0].header["UNDEF2"] is None
+        assert hl[0].header.comment_of("UNDEF2") == "cleared"
+
+    # Reconstruction: a read-only header edit forces writeto to rebuild every card via
+    # _apply_user_keys, which used to skip value-None cards entirely.
+    out = tmp_fits("undef_recon.fits")
+    with zf.open(p) as hl:
+        hl[0].header["OTHER"] = 1
+        hl.writeto(out, overwrite=True)
+    with zf.open(out) as hl:
+        assert hl[0].header["UNDEF2"] is None
+        assert hl[0].header.comment_of("UNDEF2") == "cleared"
+
+    # Overwriting a CONTINUE'd long-string key with None drops the whole run (Header.update
+    # removes the orphaned CONTINUE cards), not just the base card.
+    with zf.open(p, mode="update") as hl:
+        hl[0].header["LNG"] = "x" * 100
+    assert b"CONTINUE" in _file_bytes(p)
+    with zf.open(p, mode="update") as hl:
+        hl[0].header["LNG"] = None
+    assert b"CONTINUE" not in _file_bytes(p)
+    with zf.open(p) as hl:
+        assert hl[0].header["LNG"] is None
+
+
+def test_data_none_clears_attached_image_hdu(tmp_fits):
+    # Finding 14: hdu.data = None on an attached HDU must stick — writeto/to_bytes emit an
+    # empty (NAXIS=0) HDU like astropy — instead of being silently resurrected by the lazy
+    # getter; in update mode the clear fails loud instead of silently no-oping.
+    p = tmp_fits("full.fits")
+    zf.writeto(p, np.arange(6, dtype="i4").reshape(2, 3), overwrite=True)
+
+    out = tmp_fits("cleared.fits")
+    with zf.open(p) as hl:
+        hl[0].data = None
+        assert hl[0].data is None  # the assignment sticks; no lazy re-read
+        hl.writeto(out, overwrite=True)
+    with zf.open(out) as hl:
+        assert hl[0].data is None
+        assert hl[0].header["NAXIS"] == 0
+
+    with zf.open(p) as hl:
+        hl[0].data = None
+        blob = hl.to_bytes()
+    assert zf.from_bytes(blob)[0].data is None
+
+    # Update mode: clearing is a geometry change — fail loud, leaving the file intact.
+    # Saving the clear to a NEW file works, but the clear stays pending on the OPEN
+    # handle, so close() still refuses (its message says how to unblock: restore).
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    orig = h[0].data.copy()
+    h[0].data = None
+    out2 = tmp_fits("cleared_via_update.fits")
+    h.writeto(out2, overwrite=True)
+    assert zf.getheader(out2)["NAXIS"] == 0
+    with pytest.raises(NotImplementedError, match="restore"):
+        h.close()
+    h[0].data = orig  # restoring the data unblocks close()
+    h.close()
+    assert _file_bytes(p) == before
+
+    # Regression guards: reading an ALREADY-empty HDU's data (None), or clearing it, is not
+    # an update-mode error — there is nothing on disk to clear.
+    pe = tmp_fits("empty.fits")
+    zf.HDUList([zf.PrimaryHDU()]).writeto(pe, overwrite=True)
+    with zf.open(pe, mode="update") as hl:
+        assert hl[0].data is None
+    with zf.open(pe, mode="update") as hl:
+        hl[0].data = None
+
+
+def test_data_none_clears_attached_table_hdu(tmp_fits):
+    # Finding 14 (table twin): data = None on an attached table empties it on writeto and
+    # fails loud in update mode.
+    p = tmp_fits("tbl.fits")
+    cols = [zf.Column("X", "J", np.arange(4, dtype="i4"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols, name="T")]).writeto(p, overwrite=True)
+
+    out = tmp_fits("tbl_cleared.fits")
+    with zf.open(p) as hl:
+        hl[1].data = None
+        assert hl[1].data is None
+        hl.writeto(out, overwrite=True)
+    with zf.open(out) as hl:
+        assert hl[1].header["TFIELDS"] == 0
+        assert hl[1].header["NAXIS2"] == 0
+
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h[1].data = None
+    with pytest.raises(NotImplementedError):
+        h.close()
+    assert _file_bytes(p) == before
+
+
+def test_table_data_rejects_non_structured_arrays(tmp_fits):
+    # Finding 15: a non-structured array assigned to table data must raise TypeError instead
+    # of silently serializing an EMPTY table (TFIELDS=0 — total silent data loss).
+    with pytest.raises(TypeError):
+        zf.BinTableHDU(data=np.arange(5))
+    hdu = zf.BinTableHDU()
+    with pytest.raises(TypeError):
+        hdu.data = np.arange(5)
+    p = tmp_fits("t.fits")
+    cols = [zf.Column("X", "J", np.arange(4, dtype="i4"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(p, overwrite=True)
+    with zf.open(p) as hl:
+        with pytest.raises(TypeError):
+            hl[1].data = np.arange(5)
+
+
+def test_detached_bintable_data_writes_rows():
+    # Finding 15 (adjacent silent loss): BinTableHDU(data=rec) — and a detached .data
+    # assignment — previously emitted an EMPTY table via the _columns early-return; the rows
+    # must serialize, with every TFORM synthesized from the structured dtype.
+    rec = np.zeros(3, dtype=[("A", "i4"), ("B", "f8"), ("S", "S4"), ("V", "f4", (3,)), ("U", "u2")])
+    rec["A"] = [1, 2, 3]
+    rec["B"] = [0.5, 1.5, 2.5]
+    rec["S"] = [b"ab", b"cd", b"ef"]
+    rec["V"] = np.arange(9, dtype="f4").reshape(3, 3)
+    rec["U"] = [0, 32768, 65535]
+    blob = zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU(data=rec, name="D")]).to_bytes()
+    hl = zf.from_bytes(blob)
+    got = hl[1].data
+    assert list(got["A"]) == [1, 2, 3]
+    np.testing.assert_allclose(got["B"], [0.5, 1.5, 2.5])
+    assert list(got["S"]) == [b"ab", b"cd", b"ef"]
+    np.testing.assert_array_equal(got["V"], rec["V"])
+    assert list(got["U"]) == [0, 32768, 65535]  # unsigned via the TZERO convention
+    assert str(hl[1].header["TFORM4"]).strip() == "3E"  # subarray field -> vector column
+
+    # The .data-setter path on a detached HDU serializes the same way.
+    hdu2 = zf.BinTableHDU(name="D2")
+    hdu2.data = rec
+    hl2 = zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), hdu2]).to_bytes())
+    assert list(hl2[1].data["A"]) == [1, 2, 3]
+
+    # Detached ASCII tables cannot synthesize formats; fail loud toward from_columns.
+    arec = np.zeros(2, dtype=[("A", "i4")])
+    with pytest.raises(NotImplementedError):
+        zf.HDUList([zf.PrimaryHDU(), zf.AsciiTableHDU(data=arec)]).to_bytes()

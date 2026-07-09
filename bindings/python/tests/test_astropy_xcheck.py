@@ -166,3 +166,54 @@ def test_wcs_matches_astropy(tmp_fits):
     with zf.open(p) as hdul:
         lon, lat = hdul[0].pix2world(40.0, 30.0)  # 1-based
     np.testing.assert_allclose([lon, lat], ap, atol=1e-6)
+
+
+def test_undefined_card_matches_astropy(tmp_fits):
+    # Finding 13: an undefined-value card written by zigfitsio is byte-identical to astropy's
+    # and reads back as None in both libraries (both directions).
+    p = tmp_fits("undef_zf.fits")
+    hdu = zf.PrimaryHDU()
+    hdu.header["UNDEF"] = (None, "no value")
+    zf.HDUList([hdu]).writeto(p, overwrite=True)
+    with afits.open(p) as t:
+        assert t[0].header["UNDEF"] is None
+        assert t[0].header.comments["UNDEF"] == "no value"
+    with open(p, "rb") as f:
+        raw = f.read()
+    assert afits.Card("UNDEF", None, "no value").image.encode("ascii") in raw
+
+    p2 = tmp_fits("undef_ap.fits")
+    ahdu = afits.PrimaryHDU()
+    ahdu.header["BLANKVAL"] = (None, "from astropy")
+    ahdu.writeto(p2, overwrite=True)
+    with zf.open(p2) as hl:
+        assert hl[0].header["BLANKVAL"] is None
+        assert hl[0].header.comment_of("BLANKVAL") == "from astropy"
+
+
+def test_astropy_reads_cleared_hdu(tmp_fits):
+    # Finding 14: a cleared (data = None) HDU written by zigfitsio is a proper empty primary
+    # for astropy — data None, NAXIS 0, BITPIX 8 (astropy's own empty-HDU header shape).
+    p = tmp_fits("full.fits")
+    zf.writeto(p, np.arange(6, dtype="i4").reshape(2, 3), overwrite=True)
+    out = tmp_fits("cleared.fits")
+    with zf.open(p) as hl:
+        hl[0].data = None
+        hl.writeto(out, overwrite=True)
+    with afits.open(out) as t:
+        assert t[0].data is None
+        assert t[0].header["NAXIS"] == 0
+        assert t[0].header["BITPIX"] == 8
+
+
+def test_astropy_reads_detached_table_data(tmp_fits):
+    # Finding 15: a BinTableHDU built directly from a structured array serializes rows that
+    # astropy reads back identically (previously the output table was EMPTY).
+    rec = np.zeros(3, dtype=[("A", "i4"), ("B", "f8")])
+    rec["A"] = [7, 8, 9]
+    rec["B"] = [0.25, 0.5, 0.75]
+    p = tmp_fits("detached_tbl.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU(data=rec)]).writeto(p, overwrite=True)
+    with afits.open(p) as t:
+        assert list(t[1].data["A"]) == [7, 8, 9]
+        np.testing.assert_allclose(t[1].data["B"], [0.25, 0.5, 0.75])

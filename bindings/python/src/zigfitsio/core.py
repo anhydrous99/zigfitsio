@@ -360,9 +360,26 @@ class Column:
         self.array = None if array is None else np.asarray(array)
 
 
+def _validated_table_data(value):
+    """Coerce a table-data assignment to a structured array, or raise. A plain (unstructured)
+    array has no columns to serialize — accepting it used to write an EMPTY table silently."""
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.dtype.names is None:
+        raise TypeError(f"table data must be a structured/record array, got dtype {arr.dtype!r}")
+    return arr
+
+
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # HDU classes
 # ════════════════════════════════════════════════════════════════════════════════════════════
+# "Data never materialized" marker for _HDU._data. Distinct from None, which is an EXPLICIT
+# `hdu.data = None` clear: the lazy getter re-reads only on _UNSET, so a clear is never
+# silently resurrected from the open file.
+_UNSET = object()
+
+
 class _HDU:
     """Base HDU. Either *attached* (from an open file: ``_hdulist`` + ``_index``) or *detached*
     (built in Python with ``_data``/``_header`` for writing)."""
@@ -372,7 +389,7 @@ class _HDU:
     def __init__(self, data=None, header: Header | None = None, name: str | None = None):
         self._hdulist: Any = None
         self._index: int | None = None
-        self._data = data
+        self._data = _UNSET if data is None else data
         self._data_fingerprint = None  # baseline for update-mode data write-back
         self._header: Header | None = header if header is not None else Header()
         self._name = name
@@ -455,7 +472,10 @@ class _HDU:
         kb = _enc(key)
         cb = _enc(comment) if comment else None
         cl = len(cb) if cb else 0
-        if isinstance(value, bool):
+        if value is None:
+            # An undefined-value card (blank value field), never the literal string 'None'.
+            ll.check(ll.lib.zf_write_key_undef(h, kb, len(kb), cb, cl))
+        elif isinstance(value, bool):
             ll.check(ll.lib.zf_write_key_log(h, kb, len(kb), 1 if value else 0, cb, cl))
         elif isinstance(value, int):
             ll.check(ll.lib.zf_write_key_lng(h, kb, len(kb), value, cb, cl))
@@ -514,8 +534,13 @@ class ImageHDU(_HDU):
 
     @property
     def data(self):
-        if self._hdulist is not None and self._data is None:
-            self._data = self._read_image()
+        if self._data is _UNSET:
+            if self._hdulist is None:
+                return None
+            arr = self._read_image()
+            if arr is None:
+                return None  # empty (NAXIS=0) HDU: stay unset, a mere read is not a clear
+            self._data = arr
         return self._data
 
     @data.setter
@@ -524,7 +549,9 @@ class ImageHDU(_HDU):
         self._mark_dirty()  # a replaced array is not in the open handle's bytes
 
     def _data_changed(self) -> bool:
-        return self._data is not None and _ndarray_fp(self._data) != self._data_fingerprint
+        if self._data is _UNSET or self._data is None:
+            return False
+        return _ndarray_fp(self._data) != self._data_fingerprint
 
     @property
     def shape(self):
@@ -620,8 +647,16 @@ class ImageHDU(_HDU):
         data unit in place (same geometry only). Uses the HDU's own BSCALE/BZERO so scaled/unsigned
         images round-trip through the library's inverse scaling."""
         data = self._data
-        if data is None:
+        if data is _UNSET:
             return
+        if data is None:
+            _bitpix, axes = self._img_param()
+            if not axes:
+                return  # already empty on disk; nothing to clear
+            raise NotImplementedError(
+                "clearing image data cannot be written back to the open file in update mode; "
+                "restore hdu.data or save with writeto() to a new file"
+            )
         fp = _ndarray_fp(data)
         if fp == self._data_fingerprint:
             return
@@ -679,7 +714,10 @@ class ImageHDU(_HDU):
                 ll.check(ll.lib.zf_write_key_lng(handle, kb, len(kb), value, cb, cl))
             elif isinstance(value, float):
                 ll.check(ll.lib.zf_write_key_dbl(handle, kb, len(kb), value, cb, cl))
-            elif value is not None:
+            elif value is None:
+                # Undefined-value card: reconstruct it instead of silently dropping it.
+                ll.check(ll.lib.zf_write_key_undef(handle, kb, len(kb), cb, cl))
+            else:
                 vb = _enc(str(value))
                 if len(vb) <= 68:
                     ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), vb, len(vb), cb, cl))
@@ -778,9 +816,14 @@ class _TableHDU(_HDU):
     _nrows: int = 0
     _col_fingerprints = None  # per-column baselines for update-mode in-place write-back
 
+    def __init__(self, data=None, header: Header | None = None, name: str | None = None):
+        super().__init__(data=_validated_table_data(data), header=header, name=name)
+
     @property
     def data(self):
-        if self._hdulist is not None and self._data is None:
+        if self._data is _UNSET:
+            if self._hdulist is None:
+                return None
             self._data = self._read_table()
         return self._data
 
@@ -790,13 +833,13 @@ class _TableHDU(_HDU):
         # `writeto`/`to_bytes` reconstruct from this via _emit_columns; an in-place update-mode
         # flush of a row-count change fails loud (see _flush_data). If the table was never read,
         # there is no per-column baseline, so treat every column as changed on the next flush.
-        self._data = None if value is None else np.asarray(value)
+        self._data = _validated_table_data(value)
         if self._data is not None and self._col_fingerprints is None:
             self._col_fingerprints = {}
         self._mark_dirty()
 
     def _data_changed(self) -> bool:
-        if self._data is None or self._col_fingerprints is None or self._data.dtype.names is None:
+        if self._data is _UNSET or self._data is None or self._col_fingerprints is None or self._data.dtype.names is None:
             return False
         return any(_col_fp(self._data[n]) != self._col_fingerprints.get(n) for n in self._data.dtype.names)
 
@@ -805,11 +848,30 @@ class _TableHDU(_HDU):
         columns are matched to the file by name (never by position), so a reordered recarray still
         writes each column to its own cells. Changing the row count or column set, or editing a
         VLA/scaled column in place, is not supported (use writeto() to a new file, which reconstructs)."""
-        if self._data is None or self._col_fingerprints is None:
+        if self._data is _UNSET:
+            return
+        if self._data is None:
+            h0 = self._select()
+            t0 = _VOID()
+            ll.check(ll.lib.zf_table_open(h0, c.byref(t0)))
+            try:
+                nrows0 = c.c_longlong()
+                ll.check(ll.lib.zf_table_nrows(t0, c.byref(nrows0)))
+                ncols0 = c.c_int()
+                ll.check(ll.lib.zf_table_ncols(t0, c.byref(ncols0)))
+                if nrows0.value == 0 and ncols0.value == 0:
+                    return  # already empty on disk; nothing to clear
+            finally:
+                ll.lib.zf_table_close(t0)
+            raise NotImplementedError(
+                "clearing table data cannot be written back to the open file in update mode; "
+                "restore hdu.data or save with writeto() to a new file"
+            )
+        if self._col_fingerprints is None:
             return
         rec = self._data
-        if rec.dtype.names is None:
-            return
+        if rec.dtype.names is None:  # unreachable post-validation; defense in depth
+            raise ll.FitsTypeError(410, "table data must be a structured/record array")
         h = self._select()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
@@ -1020,14 +1082,30 @@ class _TableHDU(_HDU):
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
     def _emit_columns(self):
-        """(columns, nrows) to serialize: the builder columns for a detached HDU, or columns
-        reconstructed from the live table for an attached one (so a copied table keeps its rows)."""
-        if self._columns or self._hdulist is None:
+        """(columns, nrows) to serialize: the builder columns when present, columns synthesized
+        from an assigned record array for a detached HDU, or columns reconstructed from the live
+        table for an attached one (so a copied table keeps its rows)."""
+        if self._columns:
             return list(self._columns), self._nrows
         data = self.data
-        if data is None or data.dtype.names is None:
+        if data is None:
             return [], 0
+        if data.dtype.names is None:  # unreachable post-validation; defense in depth
+            raise ll.FitsTypeError(410, "table data must be a structured/record array")
         nrows = len(data)
+        if self._hdulist is None:
+            # A detached HDU carrying a record array: synthesize every TFORM from the dtype
+            # (there is no file column to reuse; unsigned/subarray/string fields all map).
+            if self._table_type == ll.ASCII_TBL:
+                raise NotImplementedError(
+                    "cannot synthesize ASCII-table formats from a record array; "
+                    "build the table with AsciiTableHDU.from_columns(...)"
+                )
+            cols = [
+                Column(n, _binary_tform_for(None, data.dtype.fields[n][0]), array=data[n])
+                for n in data.dtype.names
+            ]
+            return cols, nrows
         h = self._select()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
@@ -1243,8 +1321,9 @@ class HDUList(list):
                 if hdu._hdulist is not self:
                     continue
                 if isinstance(hdu, CompImageHDU):
-                    # In-place recompression isn't supported; fail loud rather than silently drop.
-                    if hdu._data_changed():
+                    # In-place recompression isn't supported; fail loud rather than silently
+                    # drop. An explicit clear (data = None) is a recompression too.
+                    if hdu._data_changed() or hdu._data is None:
                         raise NotImplementedError(
                             "in-place update of a compressed image is not supported; use writeto() to a new file"
                         )
@@ -1343,9 +1422,9 @@ class HDUList(list):
                 # spuriously raise). Byte-copied HDUs keep their old baseline on purpose — the
                 # copy carried the ORIGINAL bytes, so a pending in-place edit must still be
                 # detected and written back at the new index.
-                if isinstance(hdu, ImageHDU) and hdu._data is not None:
+                if isinstance(hdu, ImageHDU) and hdu._data is not _UNSET and hdu._data is not None:
                     hdu._data_fingerprint = _ndarray_fp(hdu._data)
-                elif isinstance(hdu, _TableHDU) and hdu._data is not None and hdu._data.dtype.names:
+                elif isinstance(hdu, _TableHDU) and hdu._data is not _UNSET and hdu._data is not None and hdu._data.dtype.names:
                     hdu._col_fingerprints = {n: _col_fp(hdu._data[n]) for n in hdu._data.dtype.names}
             if hdu._header is not None and hdu._header._persist is None:
                 # A header materialized while detached (or under a read-only list) has no persist

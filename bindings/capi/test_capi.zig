@@ -524,6 +524,56 @@ test "header scalar reads: lng, log, str, and key_comment" {
     try testing.expectEqual(@as(usize, 0), clen2);
 }
 
+test "zf_write_key_undef writes an undefined card and updates in place" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    // Create: undefined value with a comment.
+    const ukey = "UNDEF";
+    const cmt = "no value";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_undef(hh, ukey, ukey.len, cmt, cmt.len));
+    try testing.expectEqual(@as(c_int, 1), capi.zf_key_exists(hh, ukey, ukey.len));
+    var iv: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 204), capi.zf_read_key_lng(hh, ukey, ukey.len, &iv)); // VALUE_UNDEFINED
+    var cbuf: [80]u8 = undefined;
+    var clen: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_comment(hh, ukey, ukey.len, &cbuf, cbuf.len, &clen));
+    try testing.expectEqualStrings(cmt, cbuf[0..clen]);
+
+    // The card bytes are astropy's compact undefined form: blank value field, then `/ comment`.
+    var count: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &count));
+    var found = false;
+    var got: [80]u8 = undefined;
+    var i: c_long = 0;
+    while (i < count) : (i += 1) {
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_card(hh, i, &got));
+        if (std.mem.startsWith(u8, &got, "UNDEF   ")) {
+            try testing.expectEqualStrings("UNDEF   =  / no value", std.mem.trimEnd(u8, &got, " "));
+            found = true;
+        }
+    }
+    try testing.expect(found);
+
+    // Overwriting an existing valued key updates in place: card count unchanged, value blank,
+    // and a null comment preserves the old one (same contract as the other zf_write_key_*).
+    const kkey = "MYINT";
+    const kcmt = "kept";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, kkey, kkey.len, 42, kcmt, kcmt.len));
+    var n_before: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_before));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_undef(hh, kkey, kkey.len, null, 0));
+    var n_after: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_after));
+    try testing.expectEqual(n_before, n_after);
+    try testing.expectEqual(@as(c_int, 204), capi.zf_read_key_lng(hh, kkey, kkey.len, &iv));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_comment(hh, kkey, kkey.len, &cbuf, cbuf.len, &clen));
+    try testing.expectEqualStrings(kcmt, cbuf[0..clen]);
+}
+
 test "rename_key and insert_record" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

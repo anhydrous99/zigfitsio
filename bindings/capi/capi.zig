@@ -687,6 +687,12 @@ pub export fn zf_write_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_
     return 0;
 }
 
+/// Create or update a keyword with an undefined (blank) value field (FITS 4.0 §4.1.2.3).
+pub export fn zf_write_key_undef(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
+    return writeKey(h, name_ptr[0..name_len], .undefined, commentOf(comment_ptr, comment_len));
+}
+
 /// Delete the first card named `name`.
 pub export fn zf_delete_key(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize) c_int {
     const h = h_opt orelse return abi.failNull();

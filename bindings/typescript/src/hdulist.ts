@@ -6,7 +6,7 @@
 import { existsSync, renameSync, rmSync, writeFile } from "./fsbridge.js";
 import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
-import { BaseHDU, CompImageHDU, ImageHDU, PrimaryHDU } from "./hdu.js";
+import { BaseHDU, CompImageHDU, DATA_UNSET, ImageHDU, PrimaryHDU } from "./hdu.js";
 import { AsciiTableHDU, BinTableHDU, TableHDU, colFp } from "./table.js";
 import type { ColumnShape } from "./table.js";
 import { enc, fnv1a64, viewBytes } from "./util.js";
@@ -166,8 +166,9 @@ export class HDUList implements Iterable<AnyHDU> {
       for (const hdu of this.hdus) {
         if (hdu._hdulist !== this) continue;
         if (hdu instanceof CompImageHDU) {
-          // In-place recompression isn't supported; fail loud rather than silently drop.
-          if (hdu._dataChanged()) {
+          // In-place recompression isn't supported; fail loud rather than silently
+          // drop. An explicit clear (data = null) is a recompression too.
+          if (hdu._dataChanged() || hdu._data === null) {
             throw new NotSupportedError(
               410,
               "in-place update of a compressed image is not supported; use writeTo() to a new file",
@@ -299,9 +300,9 @@ export class HDUList implements Iterable<AnyHDU> {
         // their old baseline on purpose — the copy carried the ORIGINAL bytes,
         // so a pending in-place edit must still be detected and written back
         // at the new index.
-        if (hdu instanceof ImageHDU && hdu._data !== null) {
+        if (hdu instanceof ImageHDU && hdu._data !== DATA_UNSET && hdu._data !== null) {
           hdu._dataFingerprint = fnv1a64(viewBytes(hdu._data.data));
-        } else if (hdu instanceof TableHDU && hdu._data !== null) {
+        } else if (hdu instanceof TableHDU && hdu._data !== DATA_UNSET && hdu._data !== null) {
           const rec = hdu._data;
           hdu._colFingerprints = new Map(rec.names.map((n) => [n, colFp(rec.column(n))]));
         }

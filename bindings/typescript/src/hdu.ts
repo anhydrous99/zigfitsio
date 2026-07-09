@@ -11,6 +11,14 @@ import { Header, parseCards, wrapCommentary, type HeaderValue } from "./header.j
 import { enc, fnv1a64, viewBytes } from "./util.js";
 import type { HDUList } from "./hdulist.js";
 
+/**
+ * @internal "Data never materialized" marker for `_data`. Distinct from `null`,
+ * which is an EXPLICIT `hdu.data = null` clear: the lazy getter re-reads only on
+ * DATA_UNSET, so a clear is never silently resurrected from the open file.
+ * Exported for table.ts/hdulist.ts only — not part of the public API surface.
+ */
+export const DATA_UNSET: unique symbol = Symbol("zigfitsio.data.unset");
+
 // Structural keywords the library derives from the data; user header edits must not overwrite them.
 const STRUCTURAL = new Set([
   "SIMPLE",
@@ -200,7 +208,12 @@ export function writeKeyValue(handle: bigint, key: string, value: HeaderValue, c
     }
     return;
   }
-  throw new FitsTypeError(410, `cannot write a null/undefined value for keyword ${key}`);
+  if (value === null) {
+    // An undefined-value card (blank value field) — the FITS way to say "no value".
+    ll.check(ll.lib.zf_write_key_undef(handle, kb, kb.length, cb, cl));
+    return;
+  }
+  throw new FitsTypeError(410, `cannot write an undefined value for keyword ${key}`);
 }
 
 /**
@@ -448,8 +461,8 @@ export abstract class BaseHDU {
         }
         continue;
       }
-      if (value === null || value === undefined) continue;
-      writeKeyValue(handle, kw, value, comment || null);
+      if (value === undefined) continue;
+      writeKeyValue(handle, kw, value, comment || null); // null → undefined-value card
     }
     if (this._name) {
       const nb = enc(this._name);
@@ -473,18 +486,23 @@ export class ImageHDU extends BaseHDU {
   readonly kind: "image" | "primary" | "compimage" = "image";
   override readonly isImage: boolean = true;
 
-  /** @internal */ _data: FitsArray | null = null;
+  /** @internal */ _data: FitsArray | null | typeof DATA_UNSET = DATA_UNSET;
   /** @internal Baseline for update-mode data write-back + the pristine gate. */
   _dataFingerprint: bigint | null = null;
 
   constructor(options: ImageHDUOptions = {}) {
     super(options);
-    this._data = options.data == null ? null : asFitsArray(options.data);
+    this._data = options.data == null ? DATA_UNSET : asFitsArray(options.data);
   }
 
   get data(): FitsArray | null {
-    if (this._hdulist !== null && this._data === null) this._data = this._readImage();
-    return this._data;
+    const d = this._data;
+    if (d !== DATA_UNSET) return d;
+    if (this._hdulist === null) return null;
+    const arr = this._readImage();
+    if (arr === null) return null; // empty (NAXIS=0) HDU: stay unset, a mere read is not a clear
+    this._data = arr;
+    return arr;
   }
 
   set data(value: FitsArray | dt.TypedArray | null) {
@@ -493,7 +511,9 @@ export class ImageHDU extends BaseHDU {
   }
 
   override _dataChanged(): boolean {
-    return this._data !== null && fnv1a64(viewBytes(this._data.data)) !== this._dataFingerprint;
+    const d = this._data;
+    if (d === DATA_UNSET || d === null) return false;
+    return fnv1a64(viewBytes(d.data)) !== this._dataFingerprint;
   }
 
   get shape(): readonly number[] | null {
@@ -561,9 +581,11 @@ export class ImageHDU extends BaseHDU {
    * a full `.data` read.
    *
    * In update mode, pending in-place `.data` edits are flushed to the file
-   * first, so a section is always consistent with `.data`. In read-only mode
-   * the file is read as it was opened — unflushed in-memory edits are not
-   * visible. Only valid on an image HDU opened from a file/bytes.
+   * first, so a section is always consistent with `.data` — a pending clear
+   * (`data = null`) cannot be flushed, so it throws like a pending geometry
+   * change. In read-only mode the file is read as it was opened — unflushed
+   * in-memory edits (including a clear) are not visible. Only valid on an
+   * image HDU opened from a file/bytes.
    */
   section(options: { window: readonly (readonly [number, number])[]; step?: readonly number[] }): FitsArray {
     if (this._hdulist === null) {
@@ -579,7 +601,17 @@ export class ImageHDU extends BaseHDU {
     }
     // section() reads the file bytes; persist any pending in-place edit first
     // (mirrors HDUList._sourceBytes) so it never returns data staler than .data.
-    if (this._writable() && this._dataChanged()) this._flushData();
+    // A pending clear cannot be flushed — reading the stale pixels would break
+    // the consistency promise, so fail like a pending geometry change does.
+    if (this._writable()) {
+      if (this._data === null) {
+        throw new NotSupportedError(
+          410,
+          "cannot read a section of a cleared image (data = null is pending); restore .data or use writeTo() to a new file",
+        );
+      }
+      if (this._dataChanged()) this._flushData();
+    }
     const { bitpix, axes } = this._imgParam(); // axes: FITS order (fastest first)
     const ndim = axes.length;
     if (ndim === 0) throw new FitsIOError(104, "cannot read a section of a data-less image");
@@ -696,7 +728,15 @@ export class ImageHDU extends BaseHDU {
    */
   override _flushData(): void {
     const data = this._data;
-    if (data === null) return;
+    if (data === DATA_UNSET) return;
+    if (data === null) {
+      const { axes } = this._imgParam();
+      if (axes.length === 0) return; // already empty on disk; nothing to clear
+      throw new NotSupportedError(
+        410,
+        "clearing image data cannot be written back to the open file in update mode; restore .data or save with writeTo() to a new file",
+      );
+    }
     const fp = fnv1a64(viewBytes(data.data));
     if (fp === this._dataFingerprint) return;
     const h = this._select();
