@@ -19,6 +19,14 @@ All notable changes to `zigfitsio` are documented here. The format follows
   update-mode `flush()`/`close()` fails loud (`NotImplementedError`/`NotSupportedError`)
   instead of silently keeping the on-disk data. "Never read" and "explicitly cleared" are
   now distinct states, so merely reading an empty HDU's data is still a no-op on close.
+- **Python & TypeScript**: assigning a non-structured array / non-`TableData` value to table
+  `.data` (constructor or setter) now raises `TypeError`/`FitsTypeError` instead of silently
+  writing an **empty** table (`TFIELDS = 0` — total data loss); and a detached
+  `BinTableHDU` built directly from row data (`BinTableHDU(data=rec)` / the `data` setter,
+  new `data` constructor option in TypeScript) now serializes its rows — every `TFORM` is
+  synthesized from the structured dtype / column data — instead of the data being dropped
+  by the builder-columns early-return. Detached ASCII tables fail loud toward
+  `from_columns`/`fromColumns` (their formats cannot be synthesized).
 - **Core**: lossy `HCOMPRESS_1` integer images whose reconstruction overshoots the
   `ZBITPIX` range — a documented, expected artifact of `fpack -h -s N` near the type
   boundary — are now readable: out-of-range decoded values **clamp to the type range**

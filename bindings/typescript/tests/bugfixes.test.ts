@@ -1896,3 +1896,52 @@ describe("data = null clears the HDU (finding 14)", () => {
     expect(readFileSync(p).equals(before)).toBe(true);
   });
 });
+
+describe("table data validation + detached TableData writes (finding 15)", () => {
+  test("non-TableData assignment throws instead of writing an empty table", () => {
+    const hdu = new zf.BinTableHDU();
+    expect(() => {
+      (hdu as { data: unknown }).data = new Int32Array(5);
+    }).toThrow(zf.FitsTypeError);
+    expect(() => new zf.BinTableHDU({ data: new Int32Array(5) as unknown as zf.TableData })).toThrow(
+      zf.FitsTypeError,
+    );
+  });
+
+  test("detached BinTableHDU with TableData serializes its rows", () => {
+    const cols = new Map<string, zf.ColumnData>([
+      ["A", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([1, 2, 3]) }],
+      ["B", { kind: "numeric", dtype: "f8", repeat: 1, values: Float64Array.from([0.5, 1.5, 2.5]) }],
+    ]);
+    const hdu = new zf.BinTableHDU({ data: new zf.TableData(["A", "B"], cols, 3), name: "D" });
+    const blob = new zf.HDUList([new zf.PrimaryHDU(), hdu]).toBytes();
+    const hl = zf.fromBytes(blob);
+    try {
+      const rec = hl.table(1).data!;
+      expect(asNums(rec.numeric("A"))).toEqual([1, 2, 3]);
+      expect(asNums(rec.numeric("B"))).toEqual([0.5, 1.5, 2.5]);
+      expect(hl.get(1).name).toBe("D");
+    } finally {
+      hl.close();
+    }
+
+    // The .data-setter path on a detached HDU serializes the same way.
+    const hdu2 = new zf.BinTableHDU({ name: "D2" });
+    hdu2.data = new zf.TableData(["A", "B"], cols, 3);
+    const hl2 = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), hdu2]).toBytes());
+    try {
+      expect(asNums(hl2.table(1).data!.numeric("A"))).toEqual([1, 2, 3]);
+    } finally {
+      hl2.close();
+    }
+  });
+
+  test("detached AsciiTableHDU with TableData fails loud", () => {
+    const cols = new Map<string, zf.ColumnData>([
+      ["A", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([1, 2]) }],
+    ]);
+    const hdu = new zf.AsciiTableHDU();
+    hdu.data = new zf.TableData(["A"], cols, 2);
+    expect(() => new zf.HDUList([new zf.PrimaryHDU(), hdu]).toBytes()).toThrow(zf.NotSupportedError);
+  });
+});

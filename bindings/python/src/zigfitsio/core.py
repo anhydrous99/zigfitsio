@@ -360,6 +360,17 @@ class Column:
         self.array = None if array is None else np.asarray(array)
 
 
+def _validated_table_data(value):
+    """Coerce a table-data assignment to a structured array, or raise. A plain (unstructured)
+    array has no columns to serialize — accepting it used to write an EMPTY table silently."""
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.dtype.names is None:
+        raise TypeError(f"table data must be a structured/record array, got dtype {arr.dtype!r}")
+    return arr
+
+
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # HDU classes
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -804,6 +815,9 @@ class _TableHDU(_HDU):
     _nrows: int = 0
     _col_fingerprints = None  # per-column baselines for update-mode in-place write-back
 
+    def __init__(self, data=None, header: Header | None = None, name: str | None = None):
+        super().__init__(data=_validated_table_data(data), header=header, name=name)
+
     @property
     def data(self):
         if self._data is _UNSET:
@@ -818,7 +832,7 @@ class _TableHDU(_HDU):
         # `writeto`/`to_bytes` reconstruct from this via _emit_columns; an in-place update-mode
         # flush of a row-count change fails loud (see _flush_data). If the table was never read,
         # there is no per-column baseline, so treat every column as changed on the next flush.
-        self._data = None if value is None else np.asarray(value)
+        self._data = _validated_table_data(value)
         if self._data is not None and self._col_fingerprints is None:
             self._col_fingerprints = {}
         self._mark_dirty()
@@ -854,8 +868,8 @@ class _TableHDU(_HDU):
         if self._col_fingerprints is None:
             return
         rec = self._data
-        if rec.dtype.names is None:
-            return
+        if rec.dtype.names is None:  # unreachable post-validation; defense in depth
+            raise ll.FitsTypeError(410, "table data must be a structured/record array")
         h = self._select()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
@@ -1066,14 +1080,30 @@ class _TableHDU(_HDU):
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
     def _emit_columns(self):
-        """(columns, nrows) to serialize: the builder columns for a detached HDU, or columns
-        reconstructed from the live table for an attached one (so a copied table keeps its rows)."""
-        if self._columns or self._hdulist is None:
+        """(columns, nrows) to serialize: the builder columns when present, columns synthesized
+        from an assigned record array for a detached HDU, or columns reconstructed from the live
+        table for an attached one (so a copied table keeps its rows)."""
+        if self._columns:
             return list(self._columns), self._nrows
         data = self.data
-        if data is None or data.dtype.names is None:
+        if data is None:
             return [], 0
+        if data.dtype.names is None:  # unreachable post-validation; defense in depth
+            raise ll.FitsTypeError(410, "table data must be a structured/record array")
         nrows = len(data)
+        if self._hdulist is None:
+            # A detached HDU carrying a record array: synthesize every TFORM from the dtype
+            # (there is no file column to reuse; unsigned/subarray/string fields all map).
+            if self._table_type == ll.ASCII_TBL:
+                raise NotImplementedError(
+                    "cannot synthesize ASCII-table formats from a record array; "
+                    "build the table with AsciiTableHDU.from_columns(...)"
+                )
+            cols = [
+                Column(n, _binary_tform_for(None, data.dtype.fields[n][0]), array=data[n])
+                for n in data.dtype.names
+            ]
+            return cols, nrows
         h = self._select()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))

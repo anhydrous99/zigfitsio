@@ -204,3 +204,16 @@ def test_astropy_reads_cleared_hdu(tmp_fits):
         assert t[0].data is None
         assert t[0].header["NAXIS"] == 0
         assert t[0].header["BITPIX"] == 8
+
+
+def test_astropy_reads_detached_table_data(tmp_fits):
+    # Finding 15: a BinTableHDU built directly from a structured array serializes rows that
+    # astropy reads back identically (previously the output table was EMPTY).
+    rec = np.zeros(3, dtype=[("A", "i4"), ("B", "f8")])
+    rec["A"] = [7, 8, 9]
+    rec["B"] = [0.25, 0.5, 0.75]
+    p = tmp_fits("detached_tbl.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU(data=rec)]).writeto(p, overwrite=True)
+    with afits.open(p) as t:
+        assert list(t[1].data["A"]) == [7, 8, 9]
+        np.testing.assert_allclose(t[1].data["B"], [0.25, 0.5, 0.75])

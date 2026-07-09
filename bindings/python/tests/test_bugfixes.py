@@ -1414,3 +1414,51 @@ def test_data_none_clears_attached_table_hdu(tmp_fits):
     with pytest.raises(NotImplementedError):
         h.close()
     assert _file_bytes(p) == before
+
+
+def test_table_data_rejects_non_structured_arrays(tmp_fits):
+    # Finding 15: a non-structured array assigned to table data must raise TypeError instead
+    # of silently serializing an EMPTY table (TFIELDS=0 — total silent data loss).
+    with pytest.raises(TypeError):
+        zf.BinTableHDU(data=np.arange(5))
+    hdu = zf.BinTableHDU()
+    with pytest.raises(TypeError):
+        hdu.data = np.arange(5)
+    p = tmp_fits("t.fits")
+    cols = [zf.Column("X", "J", np.arange(4, dtype="i4"))]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(p, overwrite=True)
+    with zf.open(p) as hl:
+        with pytest.raises(TypeError):
+            hl[1].data = np.arange(5)
+
+
+def test_detached_bintable_data_writes_rows():
+    # Finding 15 (adjacent silent loss): BinTableHDU(data=rec) — and a detached .data
+    # assignment — previously emitted an EMPTY table via the _columns early-return; the rows
+    # must serialize, with every TFORM synthesized from the structured dtype.
+    rec = np.zeros(3, dtype=[("A", "i4"), ("B", "f8"), ("S", "S4"), ("V", "f4", (3,)), ("U", "u2")])
+    rec["A"] = [1, 2, 3]
+    rec["B"] = [0.5, 1.5, 2.5]
+    rec["S"] = [b"ab", b"cd", b"ef"]
+    rec["V"] = np.arange(9, dtype="f4").reshape(3, 3)
+    rec["U"] = [0, 32768, 65535]
+    blob = zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU(data=rec, name="D")]).to_bytes()
+    hl = zf.from_bytes(blob)
+    got = hl[1].data
+    assert list(got["A"]) == [1, 2, 3]
+    np.testing.assert_allclose(got["B"], [0.5, 1.5, 2.5])
+    assert list(got["S"]) == [b"ab", b"cd", b"ef"]
+    np.testing.assert_array_equal(got["V"], rec["V"])
+    assert list(got["U"]) == [0, 32768, 65535]  # unsigned via the TZERO convention
+    assert str(hl[1].header["TFORM4"]).strip() == "3E"  # subarray field -> vector column
+
+    # The .data-setter path on a detached HDU serializes the same way.
+    hdu2 = zf.BinTableHDU(name="D2")
+    hdu2.data = rec
+    hl2 = zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), hdu2]).to_bytes())
+    assert list(hl2[1].data["A"]) == [1, 2, 3]
+
+    # Detached ASCII tables cannot synthesize formats; fail loud toward from_columns.
+    arec = np.zeros(2, dtype=[("A", "i4")])
+    with pytest.raises(NotImplementedError):
+        zf.HDUList([zf.PrimaryHDU(), zf.AsciiTableHDU(data=arec)]).to_bytes()

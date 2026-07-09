@@ -469,6 +469,18 @@ export function colFp(cd: ColumnData): bigint {
 // Table HDU base
 // ════════════════════════════════════════════════════════════════════════
 
+/**
+ * Runtime guard for table-data assignments from untyped JS: anything that is
+ * not a TableData has no columns to serialize — accepting it used to write an
+ * EMPTY table silently (or blow up much later, far from the bad assignment).
+ */
+function validatedTableData(value: unknown): TableData {
+  if (!(value instanceof TableData)) {
+    throw new FitsTypeError(410, "table data must be a TableData instance");
+  }
+  return value;
+}
+
 /** Run `fn` with an open table view over the current HDU, closing it after. */
 function withTable<T>(handle: bigint, fn: (t: bigint) => T): T {
   const tout = ll.outU64();
@@ -499,6 +511,11 @@ export interface FromColumnsOptions {
   name?: string;
 }
 
+export interface TableHDUOptions<T extends ColumnShape = ColumnShape> extends HDUOptions {
+  /** Row data for a detached table HDU (TFORMs are synthesized from the column data on write). */
+  data?: TableData<T> | null;
+}
+
 export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends BaseHDU {
   // Abstract + widened to the table subtree: every concrete subclass must
   // supply its own narrower literal (no silently-wrong default), while callers
@@ -513,6 +530,14 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
   /** @internal */ _nrows = 0;
   /** @internal Per-column baselines for update-mode in-place write-back. */
   _colFingerprints: Map<string, bigint> | null = null;
+
+  constructor(options: TableHDUOptions<T> = {}) {
+    super(options);
+    if (options.data != null) {
+      this._data = validatedTableData(options.data);
+      this._colFingerprints = new Map();
+    }
+  }
 
   get data(): TableData<T> | null {
     const d = this._data;
@@ -530,7 +555,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    * per-column baseline, so every column counts as changed on the next flush.
    */
   set data(value: TableData<T> | null) {
-    this._data = value as TableData | null;
+    this._data = value === null ? null : validatedTableData(value);
     if (value !== null && this._colFingerprints === null) this._colFingerprints = new Map();
     this._markDirty();
   }
@@ -773,11 +798,26 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    * where indexed cards already refer to the emitted order.
    */
   _emitColumns(): { cols: Column[]; nrows: number; srcIndex: (number | null)[] | null } {
-    if (this._columns.length > 0 || this._hdulist === null) {
+    if (this._columns.length > 0) {
       return { cols: [...this._columns], nrows: this._nrows, srcIndex: null };
     }
     const data = this.data;
     if (data === null) return { cols: [], nrows: 0, srcIndex: null };
+    if (this._hdulist === null) {
+      // A detached HDU carrying a TableData: synthesize every TFORM from the
+      // column data (there is no file column to reuse). Previously this fell
+      // into the builder-columns early-return and silently emitted an EMPTY table.
+      if (this._tableType === ll.ASCII_TBL) {
+        throw new NotSupportedError(
+          410,
+          "cannot synthesize ASCII-table formats from TableData; build the table with AsciiTableHDU.fromColumns(...)",
+        );
+      }
+      const cols = data.names.map(
+        (name) => new Column(name, binaryTformFor(undefined, data.column(name)), { array: data.get(name) as ColumnArray }),
+      );
+      return { cols, nrows: data.nrows, srcIndex: null };
+    }
     const h = this._select();
     return withTable(h, (t) => {
       const ncolsOut = ll.outI32();
