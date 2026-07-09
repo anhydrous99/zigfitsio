@@ -457,7 +457,10 @@ pub const BinTable = struct {
     // clean error instead. No heap (`PCOUNT == 0`) or an absent/default `THEAP` is fine.
     fn rejectHeapGap(self: *const BinTable) OpenError!void {
         if (self.hdu.pcount == 0) return;
-        const theap = self.hdu.header.getValue(i64, "THEAP") catch return; // absent ⇒ default position
+        const theap = self.hdu.header.getValue(i64, "THEAP") catch |e| switch (e) {
+            error.KeywordNotFound => return, // absent ⇒ default position
+            else => return error.BadTbcol, // present but unparseable — mirror heapGeometry
+        };
         const default_theap = try limits.mul(self.naxis1, self.naxis2);
         if (theap < 0 or @as(u64, @intCast(theap)) != default_theap) return error.BadTbcol;
     }
