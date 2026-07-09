@@ -588,7 +588,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       if (empty) return; // already empty on disk; nothing to clear
       throw new NotSupportedError(
         410,
-        "clearing table data in update mode is not supported; use writeTo() to a new file",
+        "clearing table data cannot be written back to the open file in update mode; restore .data or save with writeTo() to a new file",
       );
     }
     if (this._colFingerprints === null) return;

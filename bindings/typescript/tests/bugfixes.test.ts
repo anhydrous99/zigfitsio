@@ -1895,6 +1895,43 @@ describe("data = null clears the HDU (finding 14)", () => {
     expect(() => h.close()).toThrow(zf.NotSupportedError);
     expect(readFileSync(p).equals(before)).toBe(true);
   });
+
+  test("section() on a pending clear fails loud in update mode (review follow-up)", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Int32Array.from([0, 1, 2, 3, 4, 5]), [2, 3]));
+
+    // Update mode: a pending clear cannot be flushed, so section() cannot honor its
+    // "consistent with .data" promise — it throws like a pending geometry change.
+    const hl = zf.open(p, "update");
+    const orig = hl.image(0).data!;
+    hl.image(0).data = null;
+    expect(() =>
+      hl.image(0).section({
+        window: [
+          [0, 1],
+          [0, 2],
+        ],
+      }),
+    ).toThrow(zf.NotSupportedError);
+    hl.image(0).data = orig; // unblock close()
+    hl.close();
+
+    // Read-only mode: in-memory edits (including a clear) are documented as not visible
+    // to section(), which reads the file as opened.
+    const ro = zf.open(p);
+    try {
+      ro.image(0).data = null;
+      const sec = ro.image(0).section({
+        window: [
+          [0, 1],
+          [0, 2],
+        ],
+      });
+      expect(asNums(sec.data)).toEqual([0, 1]);
+    } finally {
+      ro.close();
+    }
+  });
 });
 
 describe("table data validation + detached TableData writes (finding 15)", () => {

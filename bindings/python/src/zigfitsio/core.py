@@ -654,7 +654,8 @@ class ImageHDU(_HDU):
             if not axes:
                 return  # already empty on disk; nothing to clear
             raise NotImplementedError(
-                "clearing image data in update mode is not supported; use writeto() instead"
+                "clearing image data cannot be written back to the open file in update mode; "
+                "restore hdu.data or save with writeto() to a new file"
             )
         fp = _ndarray_fp(data)
         if fp == self._data_fingerprint:
@@ -863,7 +864,8 @@ class _TableHDU(_HDU):
             finally:
                 ll.lib.zf_table_close(t0)
             raise NotImplementedError(
-                "clearing table data in update mode is not supported; use writeto() to a new file"
+                "clearing table data cannot be written back to the open file in update mode; "
+                "restore hdu.data or save with writeto() to a new file"
             )
         if self._col_fingerprints is None:
             return

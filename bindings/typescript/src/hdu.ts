@@ -581,9 +581,11 @@ export class ImageHDU extends BaseHDU {
    * a full `.data` read.
    *
    * In update mode, pending in-place `.data` edits are flushed to the file
-   * first, so a section is always consistent with `.data`. In read-only mode
-   * the file is read as it was opened — unflushed in-memory edits are not
-   * visible. Only valid on an image HDU opened from a file/bytes.
+   * first, so a section is always consistent with `.data` — a pending clear
+   * (`data = null`) cannot be flushed, so it throws like a pending geometry
+   * change. In read-only mode the file is read as it was opened — unflushed
+   * in-memory edits (including a clear) are not visible. Only valid on an
+   * image HDU opened from a file/bytes.
    */
   section(options: { window: readonly (readonly [number, number])[]; step?: readonly number[] }): FitsArray {
     if (this._hdulist === null) {
@@ -599,7 +601,17 @@ export class ImageHDU extends BaseHDU {
     }
     // section() reads the file bytes; persist any pending in-place edit first
     // (mirrors HDUList._sourceBytes) so it never returns data staler than .data.
-    if (this._writable() && this._dataChanged()) this._flushData();
+    // A pending clear cannot be flushed — reading the stale pixels would break
+    // the consistency promise, so fail like a pending geometry change does.
+    if (this._writable()) {
+      if (this._data === null) {
+        throw new NotSupportedError(
+          410,
+          "cannot read a section of a cleared image (data = null is pending); restore .data or use writeTo() to a new file",
+        );
+      }
+      if (this._dataChanged()) this._flushData();
+    }
     const { bitpix, axes } = this._imgParam(); // axes: FITS order (fastest first)
     const ndim = axes.length;
     if (ndim === 0) throw new FitsIOError(104, "cannot read a section of a data-less image");
@@ -722,7 +734,7 @@ export class ImageHDU extends BaseHDU {
       if (axes.length === 0) return; // already empty on disk; nothing to clear
       throw new NotSupportedError(
         410,
-        "clearing image data in update mode is not supported; use writeTo() instead",
+        "clearing image data cannot be written back to the open file in update mode; restore .data or save with writeTo() to a new file",
       );
     }
     const fp = fnv1a64(viewBytes(data.data));

@@ -1352,6 +1352,17 @@ def test_none_header_value_round_trips_as_undefined_card(tmp_fits):
         assert hl[0].header["UNDEF2"] is None
         assert hl[0].header.comment_of("UNDEF2") == "cleared"
 
+    # Overwriting a CONTINUE'd long-string key with None drops the whole run (Header.update
+    # removes the orphaned CONTINUE cards), not just the base card.
+    with zf.open(p, mode="update") as hl:
+        hl[0].header["LNG"] = "x" * 100
+    assert b"CONTINUE" in _file_bytes(p)
+    with zf.open(p, mode="update") as hl:
+        hl[0].header["LNG"] = None
+    assert b"CONTINUE" not in _file_bytes(p)
+    with zf.open(p) as hl:
+        assert hl[0].header["LNG"] is None
+
 
 def test_data_none_clears_attached_image_hdu(tmp_fits):
     # Finding 14: hdu.data = None on an attached HDU must stick — writeto/to_bytes emit an
@@ -1375,11 +1386,19 @@ def test_data_none_clears_attached_image_hdu(tmp_fits):
     assert zf.from_bytes(blob)[0].data is None
 
     # Update mode: clearing is a geometry change — fail loud, leaving the file intact.
+    # Saving the clear to a NEW file works, but the clear stays pending on the OPEN
+    # handle, so close() still refuses (its message says how to unblock: restore).
     before = _file_bytes(p)
     h = zf.open(p, mode="update")
+    orig = h[0].data.copy()
     h[0].data = None
-    with pytest.raises(NotImplementedError):
+    out2 = tmp_fits("cleared_via_update.fits")
+    h.writeto(out2, overwrite=True)
+    assert zf.getheader(out2)["NAXIS"] == 0
+    with pytest.raises(NotImplementedError, match="restore"):
         h.close()
+    h[0].data = orig  # restoring the data unblocks close()
+    h.close()
     assert _file_bytes(p) == before
 
     # Regression guards: reading an ALREADY-empty HDU's data (None), or clearing it, is not
