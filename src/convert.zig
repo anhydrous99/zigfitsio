@@ -137,6 +137,46 @@ test "int→narrow-float overflow reports PrecisionLoss, never traps on @intFrom
     try testing.expectEqual(@as(f16, 1024.0), try cast(f16, @as(i64, 1024), .scalar));
 }
 
+test "Windows regression: f16-to-i128 runtime round-trip preserves 1024" {
+    // Keep the value runtime-known so this exercises the compiler-rt conversion path which
+    // intermittently returned a corrupt i128 on Windows x86_64 in CI, rather than allowing the
+    // compiler to fold the conversion at comptime.
+    var source_storage: i64 = 1024;
+    const source: i64 = @as(*volatile i64, &source_storage).*;
+    const narrowed: f16 = @floatFromInt(source);
+    const narrowed_bits: u16 = @bitCast(narrowed);
+    const back: i128 = @intFromFloat(narrowed);
+    const back_bits: u128 = @bitCast(back);
+
+    // These details distinguish a bad int-to-float conversion from a bad wide-integer return.
+    // Keep them failure-only so ordinary test output remains quiet.
+    errdefer std.debug.print(
+        "f16/i128 conversion diagnostic: source={d} f16_bits=0x{x} " ++
+            "back={d} back_hi=0x{x} back_lo=0x{x}\n",
+        .{
+            source,
+            narrowed_bits,
+            back,
+            @as(u64, @truncate(back_bits >> 64)),
+            @as(u64, @truncate(back_bits)),
+        },
+    );
+
+    try testing.expectEqual(@as(u16, 0x6400), narrowed_bits);
+    try testing.expectEqual(@as(i128, 1024), back);
+    try testing.expectEqual(narrowed, try cast(f16, source, .scalar));
+}
+
+test "f16 scalar conversion distinguishes exact and inexact integer boundaries" {
+    const exact = [_]i64{ -65504, -2050, -2048, 0, 2048, 2050, 65504 };
+    for (exact) |source| {
+        try testing.expectEqual(@as(f16, @floatFromInt(source)), try cast(f16, source, .scalar));
+    }
+
+    try testing.expectError(error.PrecisionLoss, cast(f16, @as(i64, 2049), .scalar));
+    try testing.expectError(error.PrecisionLoss, cast(f16, @as(i64, -2049), .scalar));
+}
+
 test "float→float narrowing precision policy" {
     const v: f64 = 1.0000000001;
     try testing.expectError(error.PrecisionLoss, cast(f32, v, .scalar));

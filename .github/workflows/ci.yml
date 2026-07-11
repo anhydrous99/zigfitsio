@@ -49,8 +49,74 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: zig build test --summary all
-      - run: zig build        # static library artifact
+      # Compile the exact conversion that has failed intermittently on Windows as a standalone
+      # test first. If it fails, retaining the executable and compiler outputs makes the
+      # float-to-i128 compiler-rt call and its wide return value inspectable after the runner is
+      # gone; the regular full-suite run remains the authoritative matrix check below.
+      - name: Compile focused numeric-conversion regression
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path conversion-diagnostics | Out-Null
+          zig test src/convert.zig `
+            --test-filter "Windows regression: f16-to-i128 runtime round-trip preserves 1024" `
+            --test-no-exec `
+            -femit-bin=conversion-diagnostics/convert-regression.exe `
+            -femit-asm=conversion-diagnostics/convert-regression.s `
+            -femit-llvm-ir=conversion-diagnostics/convert-regression.ll
+      - name: Run focused numeric-conversion regression
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: .\conversion-diagnostics\convert-regression.exe
+      - name: Run full test suite
+        run: zig build test --summary all
+      - name: Build static library
+        run: zig build
+      - name: Collect Windows numeric-conversion diagnostics
+        if: failure() && matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path conversion-diagnostics | Out-Null
+
+          zig env | Out-File conversion-diagnostics/zig-env.txt -Encoding utf8
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, Manufacturer, Architecture, NumberOfCores, NumberOfLogicalProcessors |
+            Format-List | Out-File conversion-diagnostics/cpu.txt -Encoding utf8
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List | Out-File conversion-diagnostics/os.txt -Encoding utf8
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object Manufacturer, Model, HypervisorPresent |
+            Format-List | Out-File conversion-diagnostics/computer-system.txt -Encoding utf8
+          @(
+            "GITHUB_SHA=$env:GITHUB_SHA"
+            "GITHUB_RUN_ID=$env:GITHUB_RUN_ID"
+            "GITHUB_RUN_ATTEMPT=$env:GITHUB_RUN_ATTEMPT"
+            "RUNNER_OS=$env:RUNNER_OS"
+            "RUNNER_ARCH=$env:RUNNER_ARCH"
+            "ImageOS=$env:ImageOS"
+            "ImageVersion=$env:ImageVersion"
+            "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+            "PROCESSOR_IDENTIFIER=$env:PROCESSOR_IDENTIFIER"
+            "NUMBER_OF_PROCESSORS=$env:NUMBER_OF_PROCESSORS"
+          ) | Out-File conversion-diagnostics/runner.txt -Encoding utf8
+
+          Get-ChildItem conversion-diagnostics -File |
+            Select-Object Name, Length, LastWriteTimeUtc |
+            Format-Table -AutoSize | Out-File conversion-diagnostics/files.txt -Encoding utf8
+          Get-ChildItem conversion-diagnostics -File |
+            Where-Object { $_.Extension -in '.s', '.ll' } |
+            Select-String -Pattern '__extendhfsf2|__fixsfti|fptosi .* to i128|compiler_rt' -Context 4,4 |
+            Out-File conversion-diagnostics/conversion-symbols.txt -Encoding utf8
+      - name: Upload Windows numeric-conversion diagnostics
+        if: failure() && matrix.os == 'windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-conversion-diagnostics-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: conversion-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
 
   windows-aarch64-cross:
     name: windows-aarch64 cross-compile (NFR-PORT-1, design §24.3)
