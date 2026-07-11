@@ -24,6 +24,9 @@ All notable changes to `zigfitsio` are documented here. The format follows
   that are still live.
 
 ### Fixed
+- **Core / C ABI**: ASCII-table `writeCell`, `writeColumn`, and `writeCellStr` now reject
+  logically read-only handles with `NotWritable` / `READONLY_FILE` before touching writable
+  in-memory backing storage, including buffers opened directly or inflated from gzip.
 - **Python & TypeScript**: duplicate effective table-column names now fail loud with
   `FitsTableError` (status 219) at every name-keyed high-level boundary instead of allowing
   update-mode write-back to overwrite the wrong physical column or reconstruction to duplicate /
