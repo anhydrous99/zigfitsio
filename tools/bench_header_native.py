@@ -3,8 +3,8 @@
 
 The legacy path is always available.  Candidate cases are added only when all v1
 snapshot/apply symbols are exported by the loaded C library.  The tool deliberately
-loads only ``lowlevel.py`` and ``header.py`` from the source tree, so the harness itself
-has no third-party Python dependency.
+loads only ``lowlevel.py`` from the binding and keeps its former raw-card parser in the
+benchmark directory, so the harness itself has no third-party Python dependency.
 """
 
 from __future__ import annotations
@@ -23,6 +23,11 @@ import sys
 import time
 import types
 from typing import Any, Callable
+
+if __package__:
+    from .bench_header_legacy import parse_cards as legacy_parse_cards
+else:
+    from bench_header_legacy import parse_cards as legacy_parse_cards
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,7 +127,7 @@ def make_fixture(physical_cards: int, profile: str, tail_bytes: int) -> tuple[by
 
 
 def load_binding() -> tuple[Any, Callable[[list[bytes]], list[Any]]]:
-    """Import the two dependency-free binding modules without executing package __init__."""
+    """Import lowlevel.py without executing package __init__; return the legacy tool parser."""
     # A source checkout can also contain an older wheel-layout library next to lowlevel.py, and
     # the normal loader intentionally prefers that bundled artifact.  A repository benchmark must
     # instead measure the optimized artifact it just built.  Keep an explicit caller override.
@@ -141,8 +146,7 @@ def load_binding() -> tuple[Any, Callable[[list[bytes]], list[Any]]]:
     package.__package__ = "zigfitsio"
     sys.modules["zigfitsio"] = package
     lowlevel = importlib.import_module("zigfitsio.lowlevel")
-    header = importlib.import_module("zigfitsio.header")
-    return lowlevel, header.parse_cards
+    return lowlevel, legacy_parse_cards
 
 
 class SnapshotInfo(c.Structure):

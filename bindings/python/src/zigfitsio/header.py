@@ -1,23 +1,15 @@
 """A dict-like, ordered FITS :class:`Header`, modeled on ``astropy.io.fits.Header``.
 
-The header is parsed from raw 80-byte cards (read through the C ABI) into an ordered list of
-records. Edits update the in-memory list and, when the header is attached to a writable open
-file, are persisted immediately through an injected ``_persist`` callback.
+Headers loaded from a file are materialized from the Zig core's logical snapshot. Edits update the
+in-memory list and, when attached to a writable file, persist through an injected callback.
 """
 
 from __future__ import annotations
 
-import math
-import re
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
 
 _COMMENTARY = ("COMMENT", "HISTORY", "")
-
-# FITS 4.0 §4.2.4 real grammar (with the FORTRAN D exponent). Bare ``float()`` also accepts
-# ``nan``/``inf``/``infinity`` and ``1_000.5``, none of which are valid FITS reals — such tokens
-# must fall through as strings, matching the TypeScript parser and the strict Zig-core reader.
-_FITS_REAL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[EDed][+-]?\d+)?\Z")
 
 
 class _Card:
@@ -28,179 +20,6 @@ class _Card:
         self.value = value
         self.comment = comment
         self.commentary = commentary
-
-
-def _parse_value_comment(field: str):
-    """Parse a card value field (card columns 11-80) into (value, comment)."""
-    s = field
-    i = 0
-    while i < len(s) and s[i] == " ":
-        i += 1
-    if i >= len(s):
-        return None, ""  # undefined
-    if s[i] == "/":
-        return None, s[i + 1 :].strip()
-    if s[i] == "'":
-        # String value: consume to the closing quote, honoring '' escapes.
-        i += 1
-        out = []
-        while i < len(s):
-            ch = s[i]
-            if ch == "'":
-                if i + 1 < len(s) and s[i + 1] == "'":
-                    out.append("'")
-                    i += 2
-                    continue
-                i += 1
-                break
-            out.append(ch)
-            i += 1
-        rest = s[i:]
-        comment = ""
-        slash = rest.find("/")
-        if slash >= 0:
-            comment = rest[slash + 1 :].strip()
-        return "".join(out).rstrip(), comment
-    # Non-string: token up to an unquoted '/'.
-    slash = s.find("/")
-    token = (s if slash < 0 else s[:slash]).strip()
-    comment = "" if slash < 0 else s[slash + 1 :].strip()
-    if token == "T":
-        return True, comment
-    if token == "F":
-        return False, comment
-    # int, then float (accept FORTRAN 'D' exponent).
-    try:
-        return int(token), comment
-    except ValueError:
-        pass
-    if _FITS_REAL.match(token):
-        f = float(token.replace("D", "E").replace("d", "e"))
-        if math.isfinite(f):  # a finite FITS real cannot overflow to ±inf (e.g. '1E999')
-            return f, comment
-    return token, comment
-
-
-def _extract_raw_string(field: str):
-    """Locate a quoted string in a value field without unescaping ``''`` pairs.
-
-    Returns ``(raw_escaped, comment, is_string)`` where ``raw_escaped`` is the substring between
-    the opening and closing quotes with escapes left intact. The closing quote is the first ``'``
-    that is not part of a ``''`` pair and is followed only by spaces then end-of-field or a ``/``
-    comment; a lone ``'`` followed by anything else is content (astropy splits ``''`` escape pairs
-    across ``CONTINUE`` cards, leaving a lone ``'&`` at a card boundary). Returns
-    ``(None, "", False)`` when the field does not hold a string value.
-    """
-    s = field
-    i = 0
-    while i < len(s) and s[i] == " ":
-        i += 1
-    if i >= len(s) or s[i] != "'":
-        return None, "", False
-    i += 1
-    start = i
-    while i < len(s):
-        if s[i] == "'":
-            if i + 1 < len(s) and s[i + 1] == "'":
-                i += 2  # escaped quote → content
-                continue
-            stripped = s[i + 1 :].lstrip(" ")
-            if stripped == "" or stripped[0] == "/":
-                comment = stripped[1:].strip() if stripped[:1] == "/" else ""
-                return s[start:i], comment, True
-            i += 1  # lone quote, not a terminator → content
-        else:
-            i += 1
-    return s[start:], "", True  # unterminated (defensive)
-
-
-def _value_field(text: str) -> "str | None":
-    """Raw value field (escapes intact) for a card, or ``None`` when it has no value field.
-
-    Mirrors the value-field selection in :func:`parse_card`: a standard ``KEY = `` card's value
-    starts at column 10; a ``HIERARCH`` card's value starts after the first ``=``. The naive
-    ``find("=")`` matches ``parse_card`` exactly so the folded value never disagrees with the
-    single-card parse. Kept in sync with ``parse_card`` by construction.
-    """
-    if text[8:10] == "= ":
-        return text[10:]
-    if text[0:8].rstrip() == "HIERARCH":
-        rest = text[8:]
-        eq = rest.find("=")
-        if eq >= 0:
-            return rest[eq + 1 :]
-    return None
-
-
-def parse_card(raw: bytes) -> "_Card | None":
-    """Parse one 80-byte card; return None for END."""
-    text = raw.decode("ascii", "replace")
-    name = text[0:8].rstrip()
-    if name == "END":
-        return None
-    if name in ("COMMENT", "HISTORY") or text[0:8] == "        ":
-        return _Card(name, text[8:].rstrip(), "", commentary=True)
-    if text[8:10] == "= ":
-        value, comment = _parse_value_comment(text[10:])
-        return _Card(name, value, comment)
-    if name == "HIERARCH":
-        # `HIERARCH keyword tokens = value / comment`; the spaced token string is the keyword.
-        rest = text[8:]
-        eq = rest.find("=")
-        if eq >= 0:
-            keyword = rest[:eq].strip()
-            if keyword:
-                value, comment = _parse_value_comment(rest[eq + 1 :])
-                return _Card(keyword, value, comment)
-    # other: keep the raw remainder as a commentary-style record.
-    return _Card(name, text[8:].rstrip(), "", commentary=True)
-
-
-def parse_cards(raws: "list[bytes]") -> "list[_Card]":
-    """Parse a sequence of physical 80-byte cards, folding CONTINUE long-string continuations.
-
-    Continuation is folded on the *raw* escaped text before unescaping: astropy splits the escaped
-    representation and can cut a ``''`` escape pair across a card boundary, so unescaping each card
-    independently would misread the split ``'`` as a closing quote and truncate. The raw fragments
-    (each ``&`` continuation sentinel dropped) are concatenated and ``''``→``'`` unescaped exactly
-    once, with the comment taken from the last fragment. A lone ``&``-terminated value with no
-    following CONTINUE keeps the ``&`` literally. Both standard ``KEY = `` cards and ``HIERARCH``
-    long strings are folded (their value field is located by :func:`_value_field`).
-    """
-    cards: "list[_Card]" = []
-    i = 0
-    n = len(raws)
-    while i < n:
-        card = parse_card(raws[i])
-        base = i
-        i += 1
-        if card is None:  # END
-            continue
-        field = _value_field(raws[base].decode("ascii", "replace")) if not card.commentary else None
-        if isinstance(card.value, str) and field is not None:
-            raw, comment, is_string = _extract_raw_string(field)
-            if (
-                is_string
-                and raw.endswith("&")
-                and i < n
-                and raws[i][0:8].rstrip() == b"CONTINUE"
-            ):
-                parts = [raw[:-1]]
-                while i < n and raws[i][0:8].rstrip() == b"CONTINUE":
-                    frag, cont_comment, _ = _extract_raw_string(raws[i][8:].decode("ascii", "replace"))
-                    i += 1
-                    if cont_comment:
-                        comment = cont_comment
-                    frag = frag if isinstance(frag, str) else ""
-                    if frag.endswith("&"):
-                        parts.append(frag[:-1])
-                    else:
-                        parts.append(frag)
-                        break
-                card.value = "".join(parts).replace("''", "'").rstrip()
-                card.comment = comment
-        cards.append(card)
-    return cards
 
 
 def _wrap_commentary(value: Any) -> "list[str]":
@@ -218,12 +37,12 @@ class Header:
 
     def __init__(self):
         self._cards: list[_Card] = []
-        self._persist: Optional[Callable[[str, Any, Optional[str]], None]] = None
-        self._delete: Optional[Callable[[str], None]] = None
+        self._persist: Optional[Callable[[str, Any, Optional[str]], Optional[int]]] = None
+        self._delete: Optional[Callable[[str], Optional[int]]] = None
         # Rewrites every commentary card of a keyword in an attached writable handle to the given
         # texts (delete-all-by-name then re-append). Used by in-place commentary edits/deletes and
         # list replace-all, where a single append is not enough. None on read-only/detached headers.
-        self._resync: Optional[Callable[[str, "list[Any]"], None]] = None
+        self._resync: Optional[Callable[[str, "list[Any]"], Optional[int]]] = None
         # One-call transactional persistence hook installed by an attached writable HDU. The
         # payload is a sequence of small binding-neutral edit tuples assembled below.
         self._batch_apply: Optional[Callable[[list[tuple], Optional[int]], Optional[int]]] = None
@@ -463,7 +282,7 @@ class Header:
         return self._cards[i].comment if i >= 0 else ""
 
     def cards(self) -> list[tuple[str, Any, str]]:
-        """Return all physical records as ``(keyword, value, comment)`` tuples."""
+        """Return materialized logical entries as ``(keyword, value, comment)`` tuples."""
 
         return [(c.keyword, c.value, c.comment) for c in self._cards]
 

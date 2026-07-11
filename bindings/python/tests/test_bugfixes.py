@@ -264,6 +264,18 @@ def test_structural_keyword_persist_raises(tmp_fits):
 
 
 # ── #10 CONTINUE long strings; #14 HIERARCH ──────────────────────────────────────────────────
+def _open_raw_header_cards(*cards: bytes):
+    """Open hand-built physical cards through the production Zig snapshot path."""
+
+    prefix = (
+        b"SIMPLE  =                    T".ljust(80)
+        + b"BITPIX  =                    8".ljust(80)
+        + b"NAXIS   =                    0".ljust(80)
+    )
+    payload = prefix + b"".join(cards) + b"END".ljust(80)
+    return zf.from_bytes(payload.ljust(2880, b" "))
+
+
 def test_long_string_reassembled():
     def build(handle):
         ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
@@ -280,8 +292,6 @@ def test_long_string_quote_split_across_continue():
     boundary, so the base card ends with a lone ``'`` before the ``&`` sentinel and the CONTINUE
     starts with the pair's second ``'``. Deterministic, no astropy dependency.
     """
-    from zigfitsio.header import parse_cards
-
     value = ("abc'def&" * 12) + "END"          # 99 chars, quotes and ampersands throughout
     escaped = value.replace("'", "''")          # FITS doubles quotes
     cut = 67                                     # cuts the 8th block's '' pair after its first '
@@ -290,19 +300,16 @@ def test_long_string_quote_split_across_continue():
     cont = ("CONTINUE  '" + escaped[cut:] + "'").ljust(80).encode("ascii")
     assert len(base) == 80 and len(cont) == 80
 
-    cards = parse_cards([base, cont])
-    got = next(c.value for c in cards if not c.commentary and c.keyword == "LSTR")
-    assert got == value
+    with _open_raw_header_cards(base, cont) as hdul:
+        assert hdul[0].header["LSTR"] == value
 
 
 def test_hierarch_long_string_folded_across_continue():
     """A HIERARCH long string continued by CONTINUE must fold, not leak the CONTINUE card.
 
-    The value field of a HIERARCH card starts after ``=`` (not at column 10), so the fold must
-    locate it via ``_value_field``. Deterministic, no astropy dependency.
+    The value field of a HIERARCH card starts after ``=`` (not at column 10), so the Zig snapshot
+    scanner must locate it there. Deterministic, no astropy dependency.
     """
-    from zigfitsio.header import parse_cards
-
     # `HIERARCH ESO LONG STR = '` is a 25-col prefix, so each fragment must fit the remaining columns.
     part1 = "part one is here, " + "x" * 30                 # 48 chars → base card = 75 cols
     part2 = "part two continues " + "y" * 20 + " END"        # 43 chars → cont card = 55 cols
@@ -311,10 +318,10 @@ def test_hierarch_long_string_folded_across_continue():
     cont = ("CONTINUE  '" + part2 + "'").ljust(80).encode("ascii")
     assert len(base) == 80 and len(cont) == 80
 
-    cards = parse_cards([base, cont])
-    got = next(c.value for c in cards if not c.commentary and c.keyword == "ESO LONG STR")
-    assert got == value
-    assert all(c.keyword != "CONTINUE" for c in cards)  # continuation consumed, not leaked
+    with _open_raw_header_cards(base, cont) as hdul:
+        header = hdul[0].header
+        assert header["ESO LONG STR"] == value
+        assert all(keyword != "CONTINUE" for keyword, _, _ in header.cards())
 
 
 def test_hierarch_long_string_quote_split_across_continue():
@@ -323,8 +330,6 @@ def test_hierarch_long_string_quote_split_across_continue():
     Same split-pair hazard as the standard-keyword case, exercised through the HIERARCH value-field
     path. Deterministic, no astropy dependency.
     """
-    from zigfitsio.header import parse_cards
-
     value = ("abc'def&" * 12) + "END"          # 99 chars, quotes and ampersands throughout
     escaped = value.replace("'", "''")          # FITS doubles quotes
     cut = 49                                     # 6th block's '' pair; keeps base ≤ 80 with the prefix
@@ -333,10 +338,10 @@ def test_hierarch_long_string_quote_split_across_continue():
     cont = ("CONTINUE  '" + escaped[cut:] + "'").ljust(80).encode("ascii")
     assert len(base) == 80 and len(cont) == 80
 
-    cards = parse_cards([base, cont])
-    got = next(c.value for c in cards if not c.commentary and c.keyword == "ESO LSTR")
-    assert got == value
-    assert all(c.keyword != "CONTINUE" for c in cards)
+    with _open_raw_header_cards(base, cont) as hdul:
+        header = hdul[0].header
+        assert header["ESO LSTR"] == value
+        assert all(keyword != "CONTINUE" for keyword, _, _ in header.cards())
 
 
 def test_hierarch_keyword_accessible():
@@ -1642,8 +1647,8 @@ def test_detached_bintable_data_writes_rows():
 
 # ── #25/#27 non-finite float header values must be rejected on write ──────────────────────────
 def test_nonfinite_float_keyword_raises_create_mode():
-    # NaN/Inf would format as bare 'nan'/'inf' tokens — cards no reader (including this
-    # library's own parser) accepts. The write must fail fast instead.
+    # NaN/Inf would format as bare 'nan'/'inf' tokens, which the strict Zig reader rejects.
+    # The write must fail fast instead.
     for bad in (float("nan"), float("inf"), float("-inf")):
         h = zf.Header()
         h["KNAN"] = bad
@@ -1669,8 +1674,7 @@ def test_nonfinite_numpy_float_keyword_raises():
 
 
 def test_nonfinite_hierarch_float_raises():
-    # The HIERARCH path builds raw 80-byte cards client-side (zf_write_record), bypassing the
-    # Zig-core builder — the Python-level guard must cover it too.
+    # Host-side validation rejects the value before descriptor packing; Zig enforces it again.
     h = zf.Header()
     h["ESO DET BAD GAIN"] = float("-inf")
     with pytest.raises(zf.FitsError):
@@ -1678,9 +1682,8 @@ def test_nonfinite_hierarch_float_raises():
 
 
 def test_bare_nan_token_reads_as_string_not_float():
-    # A hostile file carrying an invalid bare 'nan'/'inf' value token: bare float() used to turn
-    # it into float('nan'). It must fall through as a string (matching the TypeScript parser),
-    # while the typed C-ABI read keeps rejecting it with status 207.
+    # A hostile file carrying an invalid bare 'nan'/'inf' token must remain an opaque string in the
+    # logical snapshot, while the typed C-ABI read keeps rejecting it with status 207.
     cards = [
         "SIMPLE  =                    T",
         "BITPIX  =                    8",

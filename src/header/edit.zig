@@ -1,4 +1,4 @@
-//! Transactional, non-structural header edits for the binding-facing API.
+//! Transactional, HDU-aware non-structural header edits for the binding-facing API.
 //!
 //! `apply` clones the source `Header`, applies a borrowed list of operations in declaration order,
 //! and returns the staged header only when every operation succeeds. The source is never modified.
@@ -15,6 +15,7 @@ const keyword_value = @import("value.zig");
 const continuation = @import("continue.zig");
 const hierarch = @import("hierarch.zig");
 const logical_header = @import("logical.zig");
+const HduKind = @import("../hdu.zig").HduKind;
 
 const Allocator = std.mem.Allocator;
 
@@ -98,41 +99,50 @@ pub const Edit = union(enum) {
 /// Errors that can arise while validating, allocating, or staging a header edit batch.
 pub const ApplyError = errors.HeaderError || errors.HeaderEditError || errors.ValueError || errors.LimitError || Allocator.Error;
 
-/// Apply `edits` sequentially to an allocator-owned clone of `source`.
+/// Apply `edits` sequentially to an allocator-owned clone of `source`, using `kind` to distinguish
+/// real layout keywords from context-inapplicable user metadata.
 ///
 /// On success the caller owns the returned `Header` and must call `deinit(alloc)`. On any failure,
 /// all staged storage is discarded and `source` remains byte-for-byte unchanged. The output always
 /// has exactly one final END card, even when the input was missing END or contained duplicates.
-pub fn apply(alloc: Allocator, source: *const Header, edits: []const Edit) ApplyError!Header {
-    return applyInternal(alloc, source, edits, Limits{}, null);
+pub fn apply(alloc: Allocator, source: *const Header, kind: HduKind, edits: []const Edit) ApplyError!Header {
+    return applyInternal(alloc, source, kind, edits, Limits{}, null);
 }
 
 /// Variant used by descriptor-based ABIs that need to report which sequential operation failed.
 /// `failed_index` is set to `edits.len` until an operation returns an error.
-pub fn applyWithFailure(alloc: Allocator, source: *const Header, edits: []const Edit, failed_index: *usize) ApplyError!Header {
+pub fn applyWithFailure(alloc: Allocator, source: *const Header, kind: HduKind, edits: []const Edit, failed_index: *usize) ApplyError!Header {
     failed_index.* = edits.len;
-    return applyInternal(alloc, source, edits, Limits{}, failed_index);
+    return applyInternal(alloc, source, kind, edits, Limits{}, failed_index);
 }
 
 /// Limits-aware descriptor-ABI entry point. Resource ceilings are checked before cloning or
 /// growing a card array, and the same limits are used by the one logical parse needed for a
-/// layout-changing rename. The default wrappers above preserve the original API.
+/// layout-changing rename. The wrappers above use default resource limits.
 pub fn applyWithFailureAndLimits(
     alloc: Allocator,
     source: *const Header,
+    kind: HduKind,
     edits: []const Edit,
     limits: Limits,
     failed_index: *usize,
 ) ApplyError!Header {
     failed_index.* = edits.len;
-    return applyInternal(alloc, source, edits, limits, failed_index);
+    return applyInternal(alloc, source, kind, edits, limits, failed_index);
 }
 
-fn applyInternal(alloc: Allocator, source: *const Header, edits: []const Edit, limits: Limits, failed_index: ?*usize) ApplyError!Header {
+fn applyInternal(
+    alloc: Allocator,
+    source: *const Header,
+    kind: HduKind,
+    edits: []const Edit,
+    limits: Limits,
+    failed_index: ?*usize,
+) ApplyError!Header {
     var staged = try cloneNormalized(alloc, source, limits);
     errdefer staged.deinit(alloc);
 
-    for (edits, 0..) |edit, i| applyOne(alloc, &staged, edit, limits) catch |err| {
+    for (edits, 0..) |edit, i| applyOne(alloc, &staged, kind, edit, limits) catch |err| {
         if (failed_index) |out| out.* = i;
         return err;
     };
@@ -143,15 +153,15 @@ fn applyInternal(alloc: Allocator, source: *const Header, edits: []const Edit, l
     return staged;
 }
 
-fn applyOne(alloc: Allocator, staged: *Header, edit: Edit, limits: Limits) ApplyError!void {
+fn applyOne(alloc: Allocator, staged: *Header, kind: HduKind, edit: Edit, limits: Limits) ApplyError!void {
     switch (edit) {
-        .upsert => |op| try applyUpsert(alloc, staged, op, limits),
-        .delete_first => |name| try deleteFirst(staged, name),
-        .delete_all => |name| try deleteAll(staged, name),
-        .rename => |op| try applyRename(alloc, staged, op, limits),
+        .upsert => |op| try applyUpsert(alloc, staged, kind, op, limits),
+        .delete_first => |name| try deleteFirst(staged, kind, name),
+        .delete_all => |name| try deleteAll(staged, kind, name),
+        .rename => |op| try applyRename(alloc, staged, kind, op, limits),
         .append_commentary => |op| try appendCommentary(alloc, staged, op, limits),
-        .append_raw => |raws| try insertRawRun(alloc, staged, endIndex(staged), raws, limits),
-        .insert_raw => |op| try insertRawRun(alloc, staged, op.index, op.cards, limits),
+        .append_raw => |raws| try insertRawRun(alloc, staged, kind, endIndex(staged), raws, limits),
+        .insert_raw => |op| try insertRawRun(alloc, staged, kind, op.index, op.cards, limits),
         .reserve_blanks => |n| {
             const new_count = std.math.add(usize, staged.cards.items.len, n) catch return error.LimitExceeded;
             try ensureCardCount(new_count, limits);
@@ -234,24 +244,37 @@ fn publicName(name: []const u8) []const u8 {
     return n;
 }
 
-/// Binding-level structural policy: these cards describe the HDU/data layout and cannot be changed
-/// through a user-header transaction. Table/compression reconstruction applies its own additional
-/// filtering before it constructs edits.
-pub fn isStructural(name: []const u8) bool {
+/// Whether `name` controls the layout or interpretation of an HDU of `kind`. Image-like HDUs may
+/// carry table/compression-looking names as inert user metadata; those names remain protected on
+/// table HDUs so an edit cannot invalidate column geometry or seed a partial compression
+/// convention.
+pub fn isStructural(name: []const u8, kind: HduKind) bool {
     const n = publicName(name);
-    const exact = [_][]const u8{
-        "SIMPLE",  "BITPIX",   "NAXIS",    "EXTEND",   "PCOUNT",   "GCOUNT",
-        "GROUPS",  "XTENSION", "END",      "BSCALE",   "BZERO",    "TFIELDS",
-        "THEAP",   "ZIMAGE",   "ZSIMPLE",  "ZEXTEND",  "ZBITPIX",  "ZNAXIS",
-        "ZPCOUNT", "ZGCOUNT",  "ZCMPTYPE", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0",
-        "ZBLANK",  "ZHECKSUM", "ZDATASUM", "ZTHEAP",   "ZTABLE",   "ZTILELEN",
+    const always = [_][]const u8{
+        "SIMPLE", "BITPIX",   "NAXIS", "EXTEND", "PCOUNT", "GCOUNT",
+        "GROUPS", "XTENSION", "END",   "BSCALE", "BZERO",
     };
-    for (exact) |kw| if (std.ascii.eqlIgnoreCase(n, kw)) return true;
-    // NAXIS historically rejects every prefixed spelling, not only a numeric suffix. The other
-    // families are indexed physical-layout descriptors and require at least one decimal digit.
+    for (always) |kw| if (std.ascii.eqlIgnoreCase(n, kw)) return true;
+    // NAXIS historically rejects every prefixed spelling, not only a numeric suffix.
     if (std.ascii.startsWithIgnoreCase(n, "NAXIS")) return true;
-    const indexed = [_][]const u8{ "TFORM", "TBCOL", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "ZFORM", "ZCTYP" };
-    for (indexed) |prefix| if (hasNumericSuffix(n, prefix)) return true;
+
+    if (kind.isImageLike()) return false;
+
+    const table_exact = [_][]const u8{ "TFIELDS", "THEAP" };
+    for (table_exact) |kw| if (std.ascii.eqlIgnoreCase(n, kw)) return true;
+    const table_indexed = [_][]const u8{ "TFORM", "TBCOL" };
+    for (table_indexed) |prefix| if (hasNumericSuffix(n, prefix)) return true;
+
+    // Keep the compression convention protected on table HDUs. In particular, allowing an
+    // ordinary BINTABLE to acquire ZIMAGE/Z* piecemeal could change how it is interpreted.
+    const compression_exact = [_][]const u8{
+        "ZIMAGE",   "ZSIMPLE",  "ZEXTEND",  "ZBITPIX",  "ZNAXIS", "ZPCOUNT",  "ZGCOUNT",
+        "ZCMPTYPE", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0", "ZBLANK", "ZHECKSUM", "ZDATASUM",
+        "ZTHEAP",   "ZTABLE",   "ZTILELEN",
+    };
+    for (compression_exact) |kw| if (std.ascii.eqlIgnoreCase(n, kw)) return true;
+    const compression_indexed = [_][]const u8{ "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "ZFORM", "ZCTYP" };
+    for (compression_indexed) |prefix| if (hasNumericSuffix(n, prefix)) return true;
     return false;
 }
 
@@ -261,8 +284,8 @@ fn hasNumericSuffix(name: []const u8, prefix: []const u8) bool {
     return true;
 }
 
-fn rejectStructural(name: []const u8) errors.HeaderEditError!void {
-    if (isStructural(name)) return error.StructuralKeyword;
+fn rejectStructural(name: []const u8, kind: HduKind) errors.HeaderEditError!void {
+    if (isStructural(name, kind)) return error.StructuralKeyword;
 }
 
 fn isCommentaryName(name: []const u8) bool {
@@ -398,14 +421,14 @@ fn effectiveComment(cards: []const Card, run: Run) ?[]const u8 {
     return out;
 }
 
-fn deleteFirst(header: *Header, name: []const u8) ApplyError!void {
-    try rejectStructural(name);
+fn deleteFirst(header: *Header, kind: HduKind, name: []const u8) ApplyError!void {
+    try rejectStructural(name, kind);
     const run = findRun(header, name) orelse return error.KeywordNotFound;
     removeRun(header, run);
 }
 
-fn deleteAll(header: *Header, name: []const u8) ApplyError!void {
-    try rejectStructural(name);
+fn deleteAll(header: *Header, kind: HduKind, name: []const u8) ApplyError!void {
+    try rejectStructural(name, kind);
     // Compact all non-matching logical runs in one pass. This avoids both the snapshot allocation
     // and the quadratic tail shifting caused by repeated orderedRemove calls.
     const old_len = header.cards.items.len;
@@ -422,8 +445,8 @@ fn deleteAll(header: *Header, name: []const u8) ApplyError!void {
     header.cards.items.len = write;
 }
 
-fn applyUpsert(alloc: Allocator, header: *Header, op: Upsert, limits: Limits) ApplyError!void {
-    try rejectStructural(op.name);
+fn applyUpsert(alloc: Allocator, header: *Header, kind: HduKind, op: Upsert, limits: Limits) ApplyError!void {
+    try rejectStructural(op.name, kind);
     if (isCommentaryName(op.name)) return error.InvalidHeaderOperation;
     try ensureValueLimits(op.value, limits);
 
@@ -543,9 +566,9 @@ fn insertUsingReservedBlanks(alloc: Allocator, header: *Header, cards: []const C
     try replaceRun(alloc, header, first, blanks, cards, limits);
 }
 
-fn applyRename(alloc: Allocator, header: *Header, op: Rename, limits: Limits) ApplyError!void {
-    try rejectStructural(op.old);
-    try rejectStructural(op.new);
+fn applyRename(alloc: Allocator, header: *Header, kind: HduKind, op: Rename, limits: Limits) ApplyError!void {
+    try rejectStructural(op.old, kind);
+    try rejectStructural(op.new, kind);
     if (isCommentaryName(op.old) or isCommentaryName(op.new)) return error.InvalidHeaderOperation;
 
     const run = findRun(header, op.old) orelse return error.KeywordNotFound;
@@ -613,17 +636,17 @@ fn buildCommentaryCard(keyword: []const u8, text: []const u8) errors.HeaderError
     return Card.parse(&raw);
 }
 
-fn validateRawCard(card: *const Card) errors.HeaderEditError!void {
+fn validateRawCard(card: *const Card, kind: HduKind) errors.HeaderEditError!void {
     if (card.kind == .end) return error.InvalidHeaderOperation;
     if (hierarch.isHierarch(card)) {
         var buf: [70]u8 = undefined;
-        if (hierarch.keyword(card, &buf)) |name| try rejectStructural(name);
+        if (hierarch.keyword(card, &buf)) |name| try rejectStructural(name, kind);
     } else {
-        try rejectStructural(card.name.text());
+        try rejectStructural(card.name.text(), kind);
     }
 }
 
-fn insertRawRun(alloc: Allocator, header: *Header, index: usize, raws: []const [80]u8, limits: Limits) ApplyError!void {
+fn insertRawRun(alloc: Allocator, header: *Header, kind: HduKind, index: usize, raws: []const [80]u8, limits: Limits) ApplyError!void {
     const end = endIndex(header);
     if (index > end) return error.InvalidHeaderOperation;
     try ensureCardCount(raws.len, limits); // bounds the temporary parsed-card allocation
@@ -633,7 +656,7 @@ fn insertRawRun(alloc: Allocator, header: *Header, index: usize, raws: []const [
     defer alloc.free(parsed);
     for (raws, 0..) |*raw, i| {
         parsed[i] = try Card.parse(raw);
-        try validateRawCard(&parsed[i]);
+        try validateRawCard(&parsed[i], kind);
     }
     try replaceRun(alloc, header, index, 0, parsed, limits);
 }
@@ -699,7 +722,7 @@ test "apply clones the source and runs mixed upserts sequentially" {
         .{ .delete_first = "OBS" },
         .{ .upsert = .{ .name = "OBS", .value = .{ .int = 3 }, .comment = .{ .explicit = "final" } } },
     };
-    var staged = try apply(testing.allocator, &source, &edits);
+    var staged = try apply(testing.allocator, &source, .primary, &edits);
     defer staged.deinit(testing.allocator);
 
     // The source is untouched; operations see the output of every preceding operation.
@@ -724,7 +747,7 @@ test "delete_first is strict and delete_all removes duplicate logical runs" {
     });
     defer source.deinit(testing.allocator);
 
-    var staged = try apply(testing.allocator, &source, &.{
+    var staged = try apply(testing.allocator, &source, .primary, &.{
         .{ .delete_first = "dup" },
         .{ .delete_all = "COMMENT" },
         .{ .delete_all = "ABSENT" }, // deliberately a no-op
@@ -734,7 +757,7 @@ test "delete_first is strict and delete_all removes duplicate logical runs" {
     try testing.expectEqual(@as(usize, 1), countNamed(&staged, "DUP"));
     try testing.expectEqual(@as(usize, 0), countNamed(&staged, "COMMENT"));
 
-    try testing.expectError(error.KeywordNotFound, apply(testing.allocator, &source, &.{.{ .delete_first = "ABSENT" }}));
+    try testing.expectError(error.KeywordNotFound, apply(testing.allocator, &source, .primary, &.{.{ .delete_first = "ABSENT" }}));
 }
 
 test "rename preserves a standard long-string run and its comment" {
@@ -744,7 +767,7 @@ test "rename preserves a standard long-string run and its comment" {
     defer testing.allocator.free(cards);
     try source.cards.insertSlice(testing.allocator, 0, cards);
 
-    var staged = try apply(testing.allocator, &source, &.{.{ .rename = .{ .old = "OLD", .new = "NEW" } }});
+    var staged = try apply(testing.allocator, &source, .primary, &.{.{ .rename = .{ .old = "OLD", .new = "NEW" } }});
     defer staged.deinit(testing.allocator);
     try testing.expect(!staged.has("OLD"));
     const got = try staged.getLongString(testing.allocator, "NEW");
@@ -763,7 +786,7 @@ test "rename rebuilds transitions to and from HIERARCH without orphaning continu
     defer testing.allocator.free(cards);
     try source.cards.insertSlice(testing.allocator, 0, cards);
 
-    var staged = try apply(testing.allocator, &source, &.{
+    var staged = try apply(testing.allocator, &source, .primary, &.{
         .{ .rename = .{ .old = "HIERARCH ESO OLD LONG KEY", .new = "MIDKEY" } },
         .{ .rename = .{ .old = "MIDKEY", .new = "HIERARCH ESO NEW LONG KEY" } },
     });
@@ -793,7 +816,7 @@ test "snapshot spans make Astropy split-quote runs replace and delete atomically
     try testing.expectEqual(@as(usize, 2), old.physical_count);
     try testing.expect(std.mem.endsWith(u8, old.value.string, "'bbbb"));
 
-    var replaced = try apply(testing.allocator, &source, &.{.{ .upsert = .{
+    var replaced = try apply(testing.allocator, &source, .primary, &.{.{ .upsert = .{
         .name = "LSTR",
         .value = .{ .string = "short" },
     } }});
@@ -806,7 +829,7 @@ test "snapshot spans make Astropy split-quote runs replace and delete atomically
     defer replaced_snap.deinit(testing.allocator);
     try testing.expectEqualStrings("final comment", findSnapshotEntry(&replaced_snap, "LSTR").?.comment.?);
 
-    var deleted = try apply(testing.allocator, &source, &.{.{ .delete_first = "LSTR" }});
+    var deleted = try apply(testing.allocator, &source, .primary, &.{.{ .delete_first = "LSTR" }});
     defer deleted.deinit(testing.allocator);
     try testing.expect(!deleted.has("LSTR"));
     try testing.expectEqual(@as(usize, 0), countNamed(&deleted, "CONTINUE"));
@@ -831,9 +854,9 @@ test "physical scanner folds split-quote CONTINUE runs without allocating" {
     // invoke the matched-run logical parser.
     var no_memory: [0]u8 = .{};
     var fba = std.heap.FixedBufferAllocator.init(&no_memory);
-    try applyRename(fba.allocator(), &header, .{ .old = "LSTR", .new = "RENAMED" }, Limits{});
+    try applyRename(fba.allocator(), &header, .primary, .{ .old = "LSTR", .new = "RENAMED" }, Limits{});
     try testing.expectEqual(@as(usize, 2), findRun(&header, "RENAMED").?.count);
-    try deleteFirst(&header, "RENAMED");
+    try deleteFirst(&header, .primary, "RENAMED");
     try testing.expectEqual(@as(i64, 9), try header.getValue(i64, "KEEP"));
     try testing.expect(findRun(&header, "CONTINUE") == null);
 }
@@ -849,14 +872,14 @@ test "limits-aware apply bounds clone growth serializers and failed index" {
     };
     try testing.expectError(
         error.LimitExceeded,
-        applyWithFailureAndLimits(testing.allocator, &source, &.{.{ .reserve_blanks = 2 }}, three_cards, &failed),
+        applyWithFailureAndLimits(testing.allocator, &source, .primary, &.{.{ .reserve_blanks = 2 }}, three_cards, &failed),
     );
     try testing.expectEqual(@as(usize, 0), failed);
     try testing.expectEqual(@as(usize, 2), source.count());
 
     // A one-card value fits exactly, while a generated long-string run is rejected by its
     // conservative card upper bound before the serializer allocates its []Card result.
-    var short = try applyWithFailureAndLimits(testing.allocator, &source, &.{.{ .upsert = .{
+    var short = try applyWithFailureAndLimits(testing.allocator, &source, .primary, &.{.{ .upsert = .{
         .name = "B",
         .value = .{ .string = "ok" },
     } }}, three_cards, &failed);
@@ -866,7 +889,7 @@ test "limits-aware apply bounds clone growth serializers and failed index" {
     try testing.expectEqualStrings("ok", short_value);
     try testing.expectError(
         error.LimitExceeded,
-        applyWithFailureAndLimits(testing.allocator, &source, &.{.{ .upsert = .{
+        applyWithFailureAndLimits(testing.allocator, &source, .primary, &.{.{ .upsert = .{
             .name = "LONG",
             .value = .{ .string = "x" ** 200 },
         } }}, three_cards, &failed),
@@ -876,7 +899,7 @@ test "limits-aware apply bounds clone growth serializers and failed index" {
     const short_strings: Limits = .{ .max_string_value = 3 };
     try testing.expectError(
         error.LimitExceeded,
-        applyWithFailureAndLimits(testing.allocator, &source, &.{.{ .upsert = .{
+        applyWithFailureAndLimits(testing.allocator, &source, .primary, &.{.{ .upsert = .{
             .name = "B",
             .value = .{ .string = "four" },
         } }}, short_strings, &failed),
@@ -888,7 +911,7 @@ test "append_commentary wraps at 72 bytes and accepts COMMENT HISTORY and blank"
     var source = try headerOf(testing.allocator, &.{});
     defer source.deinit(testing.allocator);
     const text = "0123456789" ** 10;
-    var staged = try apply(testing.allocator, &source, &.{
+    var staged = try apply(testing.allocator, &source, .primary, &.{
         .{ .append_commentary = .{ .keyword = "comment", .text = text } },
         .{ .append_commentary = .{ .keyword = "HISTORY", .text = "" } },
         .{ .append_commentary = .{ .keyword = "", .text = "separator" } },
@@ -906,7 +929,7 @@ test "append_commentary wraps at 72 bytes and accepts COMMENT HISTORY and blank"
 
     try testing.expectError(
         error.InvalidHeaderOperation,
-        apply(testing.allocator, &source, &.{.{ .append_commentary = .{ .keyword = "OBJECT", .text = "bad" } }}),
+        apply(testing.allocator, &source, .primary, &.{.{ .append_commentary = .{ .keyword = "OBJECT", .text = "bad" } }}),
     );
 }
 
@@ -915,7 +938,7 @@ test "raw runs append and insert in operation order but cannot introduce END or 
     defer source.deinit(testing.allocator);
     const appended = [_][80]u8{raw80("TAIL    =                    3")};
     const inserted = [_][80]u8{ raw80("MID1    =                   10"), raw80("MID2    =                   20") };
-    var staged = try apply(testing.allocator, &source, &.{
+    var staged = try apply(testing.allocator, &source, .primary, &.{
         .{ .append_raw = &appended },
         .{ .insert_raw = .{ .index = 1, .cards = &inserted } },
     });
@@ -926,12 +949,12 @@ test "raw runs append and insert in operation order but cannot introduce END or 
     try testing.expectEqualStrings("TAIL", staged.cards.items[3].name.text());
 
     const bad_end = [_][80]u8{raw80("END")};
-    try testing.expectError(error.InvalidHeaderOperation, apply(testing.allocator, &source, &.{.{ .append_raw = &bad_end }}));
+    try testing.expectError(error.InvalidHeaderOperation, apply(testing.allocator, &source, .primary, &.{.{ .append_raw = &bad_end }}));
     const bad_struct = [_][80]u8{raw80("NAXIS1  =                    4")};
-    try testing.expectError(error.StructuralKeyword, apply(testing.allocator, &source, &.{.{ .append_raw = &bad_struct }}));
+    try testing.expectError(error.StructuralKeyword, apply(testing.allocator, &source, .primary, &.{.{ .append_raw = &bad_struct }}));
     try testing.expectError(
         error.InvalidHeaderOperation,
-        apply(testing.allocator, &source, &.{.{ .insert_raw = .{ .index = 99, .cards = &appended } }}),
+        apply(testing.allocator, &source, .primary, &.{.{ .insert_raw = .{ .index = 99, .cards = &appended } }}),
     );
 }
 
@@ -943,7 +966,7 @@ test "reserved blanks are consumed by a later upsert and END is normalized" {
     try source.appendValue(testing.allocator, "AFTEREND", .{ .int = 9 }, null); // intentionally hostile shape
     try source.ensureEnd(testing.allocator); // END, AFTEREND, END
 
-    var staged = try apply(testing.allocator, &source, &.{
+    var staged = try apply(testing.allocator, &source, .primary, &.{
         .{ .reserve_blanks = 3 },
         .{ .upsert = .{ .name = "B", .value = .{ .int = 2 } } },
     });
@@ -968,38 +991,90 @@ test "any later failure discards prior staged edits and structural keywords are 
         .{ .upsert = .{ .name = "USER", .value = .{ .int = 7 } } },
         .{ .delete_first = "BITPIX" },
     };
-    try testing.expectError(error.StructuralKeyword, apply(testing.allocator, &source, &edits));
+    try testing.expectError(error.StructuralKeyword, apply(testing.allocator, &source, .primary, &edits));
     try testing.expect(!source.has("USER"));
     try testing.expectEqual(@as(i64, 8), try source.getValue(i64, "BITPIX"));
 
     try testing.expectError(
         error.StructuralKeyword,
-        apply(testing.allocator, &source, &.{.{ .rename = .{ .old = "USER", .new = "NAXISFOO" } }}),
+        apply(testing.allocator, &source, .primary, &.{.{ .rename = .{ .old = "USER", .new = "NAXISFOO" } }}),
+    );
+    inline for (.{ HduKind.primary, .image, .ascii_table, .binary_table, .random_groups }) |kind| {
+        try testing.expect(isStructural("BITPIX", kind));
+        try testing.expect(isStructural("NAXIS2", kind));
+    }
+    try testing.expect(isStructural("GROUPS", .primary));
+    try testing.expectError(
+        error.StructuralKeyword,
+        apply(testing.allocator, &source, .primary, &.{.{ .upsert = .{ .name = "GROUPS", .value = .{ .int = 1 } } }}),
     );
     inline for (.{
-        "GROUPS", "TFIELDS",  "THEAP",  "TFORM1",   "TBCOL2", "ZBITPIX", "ZNAXIS3",
-        "ZTILE1", "ZCMPTYPE", "ZTABLE", "ZTILELEN", "ZFORM1", "ZCTYP2",
+        "TFIELDS", "THEAP",    "TFORM1", "TBCOL2",   "ZBITPIX", "ZNAXIS3",
+        "ZTILE1",  "ZCMPTYPE", "ZTABLE", "ZTILELEN", "ZFORM1",  "ZCTYP2",
     }) |name| {
-        try testing.expect(isStructural(name));
+        try testing.expect(!isStructural(name, .primary));
+        try testing.expect(!isStructural(name, .image));
+        try testing.expect(!isStructural(name, .random_groups));
+        try testing.expect(isStructural(name, .ascii_table));
+        try testing.expect(isStructural(name, .binary_table));
+
+        var allowed = try apply(testing.allocator, &source, .primary, &.{.{ .upsert = .{ .name = name, .value = .{ .int = 1 } } }});
+        allowed.deinit(testing.allocator);
         try testing.expectError(
             error.StructuralKeyword,
-            apply(testing.allocator, &source, &.{.{ .upsert = .{ .name = name, .value = .{ .int = 1 } } }}),
+            apply(testing.allocator, &source, .binary_table, &.{.{ .upsert = .{ .name = name, .value = .{ .int = 1 } } }}),
         );
     }
     try testing.expectError(
         error.BadValueSyntax,
-        apply(testing.allocator, &source, &.{.{ .upsert = .{ .name = "BAD", .value = .{ .float = std.math.inf(f64) } } }}),
+        apply(testing.allocator, &source, .primary, &.{.{ .upsert = .{ .name = "BAD", .value = .{ .float = std.math.inf(f64) } } }}),
+    );
+}
+
+test "HDU-aware structural policy covers delete rename and raw insertion" {
+    var source = try headerOf(testing.allocator, &.{
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "TFIELDS =                    7",
+        "USER    =                    1",
+    });
+    defer source.deinit(testing.allocator);
+
+    var deleted = try apply(testing.allocator, &source, .primary, &.{.{ .delete_first = "TFIELDS" }});
+    defer deleted.deinit(testing.allocator);
+    try testing.expect(!deleted.has("TFIELDS"));
+    try testing.expectError(
+        error.StructuralKeyword,
+        apply(testing.allocator, &source, .binary_table, &.{.{ .delete_first = "TFIELDS" }}),
+    );
+
+    var renamed = try apply(testing.allocator, &source, .primary, &.{.{ .rename = .{ .old = "USER", .new = "ZTABLE" } }});
+    defer renamed.deinit(testing.allocator);
+    try testing.expect(renamed.has("ZTABLE"));
+    try testing.expectError(
+        error.StructuralKeyword,
+        apply(testing.allocator, &source, .binary_table, &.{.{ .rename = .{ .old = "USER", .new = "ZTABLE" } }}),
+    );
+
+    const raw = [_][80]u8{raw80("ZFORM1  = '1J'")};
+    var inserted = try apply(testing.allocator, &source, .primary, &.{.{ .append_raw = &raw }});
+    defer inserted.deinit(testing.allocator);
+    try testing.expect(inserted.has("ZFORM1"));
+    try testing.expectError(
+        error.StructuralKeyword,
+        apply(testing.allocator, &source, .binary_table, &.{.{ .append_raw = &raw }}),
     );
 }
 
 test "explicit null removes a comment while preserve retains it" {
     var source = try headerOf(testing.allocator, &.{"A       =                    1 / original"});
     defer source.deinit(testing.allocator);
-    var preserved = try apply(testing.allocator, &source, &.{.{ .upsert = .{ .name = "A", .value = .{ .int = 2 } } }});
+    var preserved = try apply(testing.allocator, &source, .primary, &.{.{ .upsert = .{ .name = "A", .value = .{ .int = 2 } } }});
     defer preserved.deinit(testing.allocator);
     try testing.expectEqualStrings("original", preserved.comment("A").?);
 
-    var cleared = try apply(testing.allocator, &preserved, &.{.{ .upsert = .{
+    var cleared = try apply(testing.allocator, &preserved, .primary, &.{.{ .upsert = .{
         .name = "A",
         .value = .{ .int = 3 },
         .comment = .{ .explicit = null },

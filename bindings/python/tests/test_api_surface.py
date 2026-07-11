@@ -93,9 +93,9 @@ def test_fits_io_error_on_missing_file(tmp_fits):
 
 
 def test_fits_header_error_on_undefined_value(tmp_fits):
-    # `Header` (the Python dict-like wrapper) parses cards leniently and never raises on read; a
-    # genuine `FitsHeaderError` (status 204, ValueUndefined) comes from the low-level ABI reading
-    # a keyword whose value indicator is present but the value field is blank.
+    # `Header` materializes the core's logical snapshot without a typed-read error; a genuine
+    # `FitsHeaderError` (status 204, ValueUndefined) comes from the low-level ABI reading a keyword
+    # whose value indicator is present but the value field is blank.
     handle = c.c_void_p()
     ll.check(ll.lib.zf_create_memory(None, c.byref(handle)))
     ll.check(ll.lib.zf_create_img(handle, 8, 0, None))

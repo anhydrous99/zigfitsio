@@ -2229,7 +2229,7 @@ describe("non-finite float header values are rejected on write (BUGHUNT 25/27)",
     }
   });
 
-  test("HIERARCH float -Infinity throws (raw-card path bypasses the Zig-core guard)", () => {
+  test("HIERARCH float -Infinity is rejected before batch packing", () => {
     const h = new zf.Header();
     h.set("ESO DET BAD GAIN", -Infinity);
     expect(() => new zf.HDUList([new zf.PrimaryHDU({ data: new Float32Array(4), header: h })]).toBytes()).toThrow(

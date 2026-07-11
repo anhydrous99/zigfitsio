@@ -232,9 +232,8 @@ _INT64_MAX = 2**63 - 1
 def _coerce_kw_value(value: Any) -> Any:
     """Normalize a header value for the C ABI: numpy scalars → Python scalars, reject integers
     that would silently wrap the ``c_longlong`` keyword slot (ctypes masks out-of-range ints), and
-    reject non-finite floats — the FITS real grammar has no NaN/Inf spelling, so they would produce
-    cards no reader (including this library) can parse. This guard also covers the HIERARCH paths,
-    which build raw 80-byte cards client-side and bypass the Zig-core rejection."""
+    reject non-finite floats before descriptor packing. The Zig core validates the same constraints,
+    but these host-side checks prevent ctypes narrowing from changing a value before Zig sees it."""
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, np.integer):
@@ -428,59 +427,6 @@ _STRUCTURAL = {
     "SIMPLE", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "GROUPS", "XTENSION", "END", "BSCALE", "BZERO",
 }
 
-# The V1 edit engine conservatively treats table/compression layout names as structural for every
-# HDU kind. On a plain IMAGE/primary HDU those names are context-inapplicable extra cards, however,
-# and the reconstruction path must preserve them just as the legacy writer did. These are all
-# fixed-format (<=8-character) spellings; true image structural cards are filtered by `_STRUCTURAL`
-# before this classifier is consulted.
-_CONTEXT_STRUCTURAL = {
-    "TFIELDS", "THEAP", "ZIMAGE", "ZSIMPLE", "ZEXTEND", "ZBITPIX", "ZNAXIS", "ZPCOUNT",
-    "ZGCOUNT", "ZCMPTYPE", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0", "ZBLANK", "ZHECKSUM",
-    "ZDATASUM", "ZTHEAP", "ZTABLE", "ZTILELEN",
-}
-_CONTEXT_STRUCTURAL_INDEXED = (
-    "TFORM", "TBCOL", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "ZFORM", "ZCTYP",
-)
-
-
-def _is_context_structural_keyword(keyword: str) -> bool:
-    """Whether V1 rejects this fixed-format name although it is not structural for an image."""
-
-    up = keyword.strip().upper()
-    if len(up) > 8 or " " in up:
-        return False
-    if up in _CONTEXT_STRUCTURAL:
-        return True
-    return any(up.startswith(prefix) and up[len(prefix):].isdigit() for prefix in _CONTEXT_STRUCTURAL_INDEXED)
-
-
-def _write_legacy_key(handle, key: str, value: Any, comment: str | None) -> None:
-    """Write one fixed-format key through the legacy typed ABI.
-
-    Used only while reconstructing an image card whose name the kind-agnostic V1 transaction
-    policy classifies as structural. The freshly built destination HDU remains authoritative for
-    its real image-layout cards; this path preserves context-inapplicable extras such as TFIELDS.
-    """
-
-    value = _coerce_kw_value(value)
-    kb = _enc(key)
-    cb = _enc(comment) if comment else None
-    cl = len(cb) if cb else 0
-    if value is None:
-        ll.check(ll.lib.zf_write_key_undef(handle, kb, len(kb), cb, cl))
-    elif isinstance(value, bool):
-        ll.check(ll.lib.zf_write_key_log(handle, kb, len(kb), 1 if value else 0, cb, cl))
-    elif isinstance(value, int):
-        ll.check(ll.lib.zf_write_key_lng(handle, kb, len(kb), value, cb, cl))
-    elif isinstance(value, float):
-        ll.check(ll.lib.zf_write_key_dbl(handle, kb, len(kb), value, cb, cl))
-    else:
-        vb = _enc(str(value))
-        if len(vb) <= 68:
-            ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), vb, len(vb), cb, cl))
-        else:
-            ll.check(ll.lib.zf_write_key_longstr(handle, kb, len(kb), vb, len(vb), cb, cl))
-
 
 def _blank_defined(header) -> bool:
     """Whether the HDU declares an integer null sentinel: a ``BLANK`` keyword, or — for a
@@ -642,13 +588,12 @@ class _HDU:
         )
 
     def _resync_commentary(self, keyword: str, texts):
-        """Rewrite every commentary card of ``keyword`` in the open handle to ``texts``: delete all
-        by name, then re-append (before END) as raw records. Used for in-place commentary edits,
-        deletions, and list replace-all, where a single append cannot express the new state. Same
-        delete-then-write-records idiom as the HIERARCH replacement path in ``_write_key``. Rewritten
-        cards migrate to the header end (spec-legal); exact placement holds via reconstruction. For
-        the blank keyword this also rewrites blank *separator* cards (they share the empty name), so
-        an in-place edit/delete of blank commentary reorders every blank card — same as astropy."""
+        """Replace every commentary entry of ``keyword`` with one delete-all plus append batch.
+
+        Rewritten cards migrate to the header end (spec-legal); exact placement holds through full
+        reconstruction. For the blank keyword this also rewrites blank separator cards, so an
+        in-place edit/delete reorders every blank card — matching astropy.
+        """
         up = keyword.upper()
         ops = [("delete_all", up)]
         ops.extend(("append_commentary", up, text) for text in texts)
@@ -852,12 +797,6 @@ class ImageHDU(_HDU):
 
     def _apply_user_keys(self, handle, skip=None):
         ops = []
-
-        def apply_pending():
-            if ops:
-                _apply_header_batch(handle, _header_current_index(handle), ops)
-                ops.clear()
-
         for kw, value, comment in self.header.cards():
             up = kw.upper()
             if up in _STRUCTURAL or up.startswith("NAXIS"):
@@ -870,25 +809,17 @@ class ImageHDU(_HDU):
             # writeto(checksum=True) is requested. Mirrors the TS _applyUserKeys behavior.
             if up in ("CHECKSUM", "DATASUM"):
                 continue
-            # Commentary and HIERARCH/spaced/>8-char keys can't be written as standard 8-char
-            # keywords; reconstruct their 80-byte card and write it verbatim so COMMENT/HISTORY
-            # provenance and HIERARCH keywords survive the reconstruction (non-pristine) path.
             if up in ("COMMENT", "HISTORY", ""):
                 # Wrap so a >72-char commentary card (e.g. built via Header._from_cards) spans
                 # multiple records instead of truncating; set-time cards are already ≤72.
                 for chunk in _wrap_commentary(value):
                     ops.append(("append_commentary", up, chunk))
                 continue
-            if _is_context_structural_keyword(up):
-                # V1 rejects this name, so commit the preceding batch before using the legacy typed
-                # writer. Flushing at the boundary preserves the user's original card order.
-                apply_pending()
-                _write_legacy_key(handle, kw, value, comment)
-                continue
             ops.append(("upsert", kw, value, comment))
         if self._name:
             ops.append(("upsert", "EXTNAME", self._name, ""))
-        apply_pending()
+        if ops:
+            _apply_header_batch(handle, _header_current_index(handle), ops)
 
 
 class PrimaryHDU(ImageHDU):

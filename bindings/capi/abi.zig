@@ -218,7 +218,6 @@ pub const header_op_comment_present: u32 = 1 << 0;
 pub const header_op_strict: u32 = 1 << 1;
 pub const header_op_force_hierarch: u32 = 1 << 2;
 pub const header_apply_check_revision: u32 = 1 << 0;
-pub const header_apply_allow_structural: u32 = 1 << 1;
 
 // ── Thread-local last error ──────────────────────────────────────────────────────────────────
 

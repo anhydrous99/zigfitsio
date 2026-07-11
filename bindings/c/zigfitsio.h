@@ -133,8 +133,7 @@ typedef struct {
 /* Reserved V1 bits: passing either currently returns BAD_KEYCHAR rather than being ignored. */
 #define ZF_HEADER_OP_STRICT          0x00000002u
 #define ZF_HEADER_OP_FORCE_HIERARCH  0x00000004u
-#define ZF_HEADER_APPLY_CHECK_REVISION   0x00000001u
-#define ZF_HEADER_APPLY_ALLOW_STRUCTURAL 0x00000002u
+#define ZF_HEADER_APPLY_CHECK_REVISION 0x00000001u
 
 typedef struct {
     uint64_t revision;

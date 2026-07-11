@@ -1099,6 +1099,50 @@ test "header apply stages mixed edits and commits once" {
     try testing.expectEqual(revision_after, hh.fits.current().header_revision);
 }
 
+test "header apply uses HDU-aware structural policy for image metadata" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    var info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &info));
+
+    var arena: std.ArrayList(u8) = .empty;
+    defer arena.deinit(testing.allocator);
+    const before = try testArenaPut(&arena, "BEFORE");
+    const tfields = try testArenaPut(&arena, "TFIELDS");
+    const ztable = try testArenaPut(&arena, "ZTABLE");
+    const zform = try testArenaPut(&arena, "ZFORM1");
+    const form_value = try testArenaPut(&arena, "1J");
+    const after = try testArenaPut(&arena, "AFTER");
+    const ops = [_]abi.ZfHeaderOpV1{
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = before.off, .name_len = before.len, .int_value = 1 },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = tfields.off, .name_len = tfields.len, .int_value = 7 },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.logical), .name_off = ztable.off, .name_len = ztable.len, .int_value = 1 },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.string), .name_off = zform.off, .name_len = zform.len, .value_off = form_value.off, .value_len = form_value.len },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = after.off, .name_len = after.len, .int_value = 2 },
+    };
+    const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = info.revision, .flags = abi.header_apply_check_revision };
+    var result: abi.ZfHeaderApplyResultV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_apply_v1(hh, 1, &opts, &ops, ops.len, arena.items.ptr, arena.items.len, &result));
+    try testing.expectEqual(info.revision + 1, result.new_revision);
+
+    const header = &hh.fits.current().header;
+    try testing.expectEqual(@as(i64, 7), try header.getValue(i64, "TFIELDS"));
+    try testing.expect(try header.getValue(bool, "ZTABLE"));
+    const got_form = try header.getString(testing.allocator, "ZFORM1");
+    defer testing.allocator.free(got_form);
+    try testing.expectEqualStrings("1J", got_form);
+    const names = [_][]const u8{ "BEFORE", "TFIELDS", "ZTABLE", "ZFORM1", "AFTER" };
+    var next: usize = 0;
+    for (header.cards.items) |*card| {
+        if (next < names.len and card.name.eqlText(names[next])) next += 1;
+    }
+    try testing.expectEqual(names.len, next);
+}
+
 test "header apply rejects table layout metadata before it can stale or corrupt a view" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
@@ -1121,6 +1165,19 @@ test "header apply rejects table layout metadata before it can stale or corrupt 
     const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = info.revision, .flags = abi.header_apply_check_revision };
     var result: abi.ZfHeaderApplyResultV1 = .{};
     try testing.expectEqual(@as(c_int, 207), capi.zf_header_apply_v1(hh, 2, &opts, &op, op.len, arena, arena.len, &result));
+    try testing.expectEqual(info.revision, hh.fits.current().header_revision);
+
+    const compression_arena = "ZFORM1";
+    const compression_op = [_]abi.ZfHeaderOpV1{.{
+        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+        .value_type = @intFromEnum(abi.HeaderValueType.int64),
+        .name_len = compression_arena.len,
+        .int_value = 1,
+    }};
+    try testing.expectEqual(
+        @as(c_int, 207),
+        capi.zf_header_apply_v1(hh, 2, &opts, &compression_op, compression_op.len, compression_arena, compression_arena.len, &result),
+    );
     try testing.expectEqual(info.revision, hh.fits.current().header_revision);
 
     var table: ?*abi.TableHandle = null;

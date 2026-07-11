@@ -110,6 +110,9 @@ describe("headers", () => {
       hdr.transaction((tx) => {
         tx.set("OBSERVER", "Hubble", "who");
         tx.set("ESO DET LONG VALUE", long, "hierarch comment");
+        tx.set("TFIELDS", 7);
+        tx.set("ZTABLE", true);
+        tx.set("ZFORM1", "1J");
         tx.addComment("batch commentary");
         tx.delete("REMOVE");
       });
@@ -127,6 +130,9 @@ describe("headers", () => {
       expect(hdr.commentOf("OBSERVER")).toBe("who");
       expect(hdr.get("ESO DET LONG VALUE")).toBe(long);
       expect(hdr.commentOf("ESO DET LONG VALUE")).toBe("hierarch comment");
+      expect(hdr.get("TFIELDS")).toBe(7);
+      expect(hdr.get("ZTABLE")).toBe(true);
+      expect(hdr.get("ZFORM1")).toBe("1J");
       expect(hdr.comments).toContain("batch commentary");
       expect(hdr.has("REMOVE")).toBe(false);
     } finally {

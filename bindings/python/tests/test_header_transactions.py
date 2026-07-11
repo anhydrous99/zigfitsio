@@ -67,6 +67,40 @@ def test_header_edit_rolls_back_python_and_file_on_commit_error(tmp_fits):
         assert hdul[0].header["BITPIX"] == 16
 
 
+def test_image_transaction_allows_ordered_table_looking_metadata(tmp_fits):
+    """HDU context lives in Zig: image extras batch once while real layout stays protected."""
+
+    path = tmp_fits("image-context-metadata.fits")
+    zf.writeto(path, np.arange(3, dtype="u1"), overwrite=True)
+    with zf.open(path, mode="update") as hdul:
+        header = hdul[0].header
+        calls = []
+        real_apply = header._batch_apply
+
+        def counted(ops, revision):
+            calls.append(list(ops))
+            return real_apply(ops, revision)
+
+        header._batch_apply = counted
+        with header.edit():
+            header["BEFORE"] = 1
+            header["TFIELDS"] = 7
+            header["ZTABLE"] = True
+            header["ZFORM1"] = "1J"
+            header["AFTER"] = 2
+        assert len(calls) == 1
+        with pytest.raises(zf.FitsHeaderError):
+            header["BITPIX"] = 64
+
+    with zf.open(path) as hdul:
+        header = hdul[0].header
+        extras = {"BEFORE", "TFIELDS", "ZTABLE", "ZFORM1", "AFTER"}
+        assert [key for key in header.keys() if key in extras] == [
+            "BEFORE", "TFIELDS", "ZTABLE", "ZFORM1", "AFTER",
+        ]
+        assert header["BITPIX"] == 8
+
+
 def test_header_edit_body_exception_never_calls_backend(tmp_fits):
     path = tmp_fits("header-body-error.fits")
     zf.writeto(path, np.zeros(1, dtype="u1"), overwrite=True)
@@ -121,8 +155,19 @@ def test_checksum_flush_invalidates_materialized_header_revision(tmp_fits):
         assert header._revision == revision
 
 
-def test_plain_image_reconstruction_preserves_context_structural_cards():
+def test_plain_image_reconstruction_preserves_context_structural_cards(monkeypatch):
     """Table-looking extras remain metadata on an image; real image layout stays data-derived."""
+
+    import zigfitsio.core as core
+
+    calls = []
+    real_apply = core._apply_header_batch
+
+    def counted(handle, hdu_index, ops, expected_revision=None):
+        calls.append(list(ops))
+        return real_apply(handle, hdu_index, ops, expected_revision)
+
+    monkeypatch.setattr(core, "_apply_header_batch", counted)
 
     hdu = zf.PrimaryHDU(np.arange(3, dtype="u1"))
     hdu.header["BEFORE"] = 1
@@ -135,7 +180,13 @@ def test_plain_image_reconstruction_preserves_context_structural_cards():
     hdu.header["AFTER"] = 3
     hdu.header["BITPIX"] = 64  # a real image structural override must still be ignored
 
-    with zf.from_bytes(zf.HDUList([hdu]).to_bytes()) as reopened:
+    raw = zf.HDUList([hdu]).to_bytes()
+    assert len(calls) == 1
+    assert [op[1] for op in calls[0] if op[0] == "upsert"] == [
+        "BEFORE", "TFIELDS", "MIDDLE", "ZTABLE", "ZFORM1", "ZCTYP1", "ZTILELEN", "AFTER",
+    ]
+
+    with zf.from_bytes(raw) as reopened:
         header = reopened[0].header
         assert header["TFIELDS"] == 7
         assert header.comment_of("TFIELDS") == "context-inapplicable image metadata"

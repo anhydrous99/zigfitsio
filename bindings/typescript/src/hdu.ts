@@ -68,38 +68,6 @@ export function isCompStructuralKeyword(up: string): boolean {
   );
 }
 
-// The transaction engine conservatively guards these table/compression names for every HDU kind.
-// On a plain image they are context-inapplicable extra cards, so reconstruction preserves their
-// fixed-format spellings through the legacy typed writer. Keep this synchronized with the engine.
-const CONTEXT_STRUCTURAL = new Set([
-  "TFIELDS",
-  "THEAP",
-  "ZIMAGE",
-  "ZSIMPLE",
-  "ZEXTEND",
-  "ZBITPIX",
-  "ZNAXIS",
-  "ZPCOUNT",
-  "ZGCOUNT",
-  "ZTABLE",
-  "ZTILELEN",
-  "ZCMPTYPE",
-  "ZMASKCMP",
-  "ZQUANTIZ",
-  "ZDITHER0",
-  "ZBLANK",
-  "ZHECKSUM",
-  "ZDATASUM",
-  "ZTHEAP",
-]);
-
-function isContextStructuralKeyword(keyword: string): boolean {
-  const up = keyword.trim().toUpperCase();
-  if (up.length > 8 || up.includes(" ")) return false;
-  if (CONTEXT_STRUCTURAL.has(up)) return true;
-  return /^(TFORM|TBCOL|ZNAXIS|ZTILE|ZFORM|ZCTYP|ZNAME|ZVAL)\d+$/.test(up);
-}
-
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
 
@@ -120,60 +88,6 @@ function blankDefined(header: Header): boolean {
     }
   }
   return false;
-}
-
-/**
- * Write one keyword through the type-dispatched ABI calls. Normalizes JS
- * values: safe-integer `number` → integer card, other finite `number` →
- * double card, `bigint` (range-checked) → integer card, `string` →
- * string/long-string card.
- */
-export function writeKeyValue(handle: bigint, key: string, value: HeaderValue, comment: string | null): void {
-  const kb = enc(key);
-  const cb = comment ? enc(comment) : null;
-  const cl = cb ? cb.length : 0;
-  if (typeof value === "boolean") {
-    ll.check(ll.lib.zf_write_key_log(handle, kb, kb.length, value ? 1 : 0, cb, cl));
-    return;
-  }
-  if (typeof value === "bigint") {
-    if (value < INT64_MIN || value > INT64_MAX) {
-      throw new FitsOverflowError(412, `integer keyword value ${value} out of signed-64-bit range`);
-    }
-    ll.check(ll.lib.zf_write_key_lng(handle, kb, kb.length, value, cb, cl));
-    return;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      // NaN/±Infinity fail Number.isInteger and would flow to zf_write_key_dbl, producing a
-      // card no reader parses (the FITS real grammar has no NaN/Inf spelling). Fail fast.
-      throw new FitsHeaderError(207, `non-finite float keyword value ${value} for ${key}: FITS headers cannot represent NaN/Inf`);
-    }
-    // Any exact-integer double in i64 range writes as an integer card, so a
-    // parsed integer keyword (numbers up to 2^63 parse exactly) round-trips
-    // as the same card type. Beyond the range (or non-integer) → double card.
-    if (Number.isInteger(value) && value >= -(2 ** 63) && value < 2 ** 63) {
-      ll.check(ll.lib.zf_write_key_lng(handle, kb, kb.length, BigInt(value), cb, cl));
-    } else {
-      ll.check(ll.lib.zf_write_key_dbl(handle, kb, kb.length, value, cb, cl));
-    }
-    return;
-  }
-  if (typeof value === "string") {
-    const vb = enc(value);
-    if (vb.length <= 68) {
-      ll.check(ll.lib.zf_write_key_str(handle, kb, kb.length, vb, vb.length, cb, cl));
-    } else {
-      ll.check(ll.lib.zf_write_key_longstr(handle, kb, kb.length, vb, vb.length, cb, cl));
-    }
-    return;
-  }
-  if (value === null) {
-    // An undefined-value card (blank value field) — the FITS way to say "no value".
-    ll.check(ll.lib.zf_write_key_undef(handle, kb, kb.length, cb, cl));
-    return;
-  }
-  throw new FitsTypeError(410, `cannot write an undefined value for keyword ${key}`);
 }
 
 /**
@@ -631,15 +545,12 @@ export abstract class BaseHDU {
    * column descriptors, ZIMAGE-convention cards) so they are not duplicated or
    * double-applied; it receives the uppercased keyword.
    */
-  _applyUserKeys(handle: bigint, skip?: (up: string) => boolean): void {
-    let mutations: HeaderMutation[] = [];
-    const flushMutations = (): void => {
-      if (mutations.length === 0) return;
-      const current = ll.newLongArray(1);
-      ll.check(ll.lib.zf_current_hdu(handle, current));
-      applyHeaderMutations(handle, BigInt(ll.readLongAt(current, 0)), mutations, null);
-      mutations = [];
-    };
+  _applyUserKeys(
+    handle: bigint,
+    skip?: (up: string) => boolean,
+    trailingMutations: readonly HeaderMutation[] = [],
+  ): void {
+    const mutations: HeaderMutation[] = [];
     for (const [kw, value, comment] of this.header.cards()) {
       const up = kw.toUpperCase();
       if (isStructuralKeyword(kw)) continue;
@@ -655,21 +566,17 @@ export abstract class BaseHDU {
         continue;
       }
       if (value === undefined) continue;
-      // The transaction engine guards table/compression layout names globally, but on a plain
-      // image those names are context-inapplicable and FITS permits them as extra cards. Preserve
-      // them through the legacy typed writer while reconstruction targets a brand-new image HDU;
-      // attached edits still go through the guarded transaction API.
-      if ((this.kind === "primary" || this.kind === "image") && isContextStructuralKeyword(up)) {
-        flushMutations();
-        writeKeyValue(handle, kw, value, comment || null);
-        continue;
-      }
       mutations.push({ type: "upsert", key: kw, value, comment: comment || null });
     }
     if (this._name) {
       mutations.push({ type: "upsert", key: "EXTNAME", value: this._name, comment: null });
     }
-    flushMutations();
+    mutations.push(...trailingMutations);
+    if (mutations.length > 0) {
+      const current = ll.newLongArray(1);
+      ll.check(ll.lib.zf_current_hdu(handle, current));
+      applyHeaderMutations(handle, BigInt(ll.readLongAt(current, 0)), mutations, null);
+    }
   }
 }
 

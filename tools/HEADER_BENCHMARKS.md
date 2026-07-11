@@ -1,7 +1,7 @@
 # Header binding A/B benchmarks
 
-These tools measure the current card-at-a-time Python and TypeScript/Wasm paths against the
-optional logical-header snapshot and batch-apply v1 C ABI. They do not require the candidate
+These tools measure the retained legacy card-at-a-time Python and TypeScript/Wasm baselines against
+the logical-header snapshot and batch-apply v1 C ABI. They do not require the candidate
 symbols to exist: a legacy build emits a complete JSON report with candidate capabilities marked
 unavailable. The fixture generator is duplicated byte-for-byte in the two drivers; SHA-256 values
 in every case make fixture drift visible to the comparator.

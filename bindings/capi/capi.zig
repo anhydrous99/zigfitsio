@@ -858,9 +858,9 @@ pub export fn zf_header_apply_v1(
     out.* = .{};
     const hdu = headerHduAt(h, hdu_index) catch |e| return abi.fail(&h.diag, e);
     const opts = if (opts_opt) |p| p.* else ZfHeaderApplyOptsV1{};
-    const known_apply_flags = abi.header_apply_check_revision | abi.header_apply_allow_structural;
+    const known_apply_flags = abi.header_apply_check_revision;
     if (opts.flags & ~known_apply_flags != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
-    if (opts.reserved != 0 or opts.flags & abi.header_apply_allow_structural != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
+    if (opts.reserved != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
     if (opts.flags & abi.header_apply_check_revision != 0 and opts.expected_revision != hdu.header_revision)
         return abi.fail(&h.diag, error.TransactionConflict);
     if ((op_count != 0 and ops_opt == null) or (arena_len != 0 and arena_opt == null)) return abi.fail(&h.diag, error.InvalidHeaderOperation);
@@ -893,7 +893,7 @@ pub export fn zf_header_apply_v1(
 
     out.failed_op = std.math.maxInt(u64); // failures below are transaction/global, not decode errors
     var failed_index: usize = edits.len;
-    var staged = fits.header_edit.applyWithFailureAndLimits(abi.gpa, &hdu.header, edits, h.fits.limits, &failed_index) catch |e| {
+    var staged = fits.header_edit.applyWithFailureAndLimits(abi.gpa, &hdu.header, hdu.kind, edits, h.fits.limits, &failed_index) catch |e| {
         out.failed_op = @intCast(failed_index);
         return abi.fail(&h.diag, e);
     };
