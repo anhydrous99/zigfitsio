@@ -6,7 +6,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from publish_bundle import BundleError, MANIFEST_NAME, install_bundle, semver_key
+from publish_bundle import (
+    BUNDLE_METADATA_FILES,
+    BundleError,
+    MANIFEST_NAME,
+    install_bundle,
+    semver_key,
+)
 
 
 def write_bundle(root: Path, version: str, sha: str, pages: dict[str, str]) -> None:
@@ -27,6 +33,8 @@ def write_bundle(root: Path, version: str, sha: str, pages: dict[str, str]) -> N
         "files": sorted(files, key=lambda item: item["path"]),
     }
     (root / MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    for name in BUNDLE_METADATA_FILES - {MANIFEST_NAME}:
+        (root / name).write_text("{}\n", encoding="utf-8")
 
 
 class PublishBundleTests(unittest.TestCase):
@@ -84,6 +92,15 @@ class PublishBundleTests(unittest.TestCase):
             write_bundle(bundle, "1.0.0", "a" * 40, {"Home.md": "one"})
             with self.assertRaises(BundleError):
                 install_bundle(bundle, wiki, expected_sha="b" * 40)
+
+    def test_refuses_unexpected_artifact_content(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); wiki = base / "wiki"; bundle = base / "bundle"
+            wiki.mkdir(); bundle.mkdir()
+            write_bundle(bundle, "1.0.0", "a" * 40, {"Home.md": "one"})
+            (bundle / "unexpected.sh").write_text("echo untrusted", encoding="utf-8")
+            with self.assertRaisesRegex(BundleError, "unexpected=.*unexpected[.]sh"):
+                install_bundle(bundle, wiki)
 
     def test_refuses_destination_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as td:

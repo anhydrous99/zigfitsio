@@ -20,6 +20,7 @@ EXPECTED_WORKFLOWS = (
     ".github/workflows/python-wheels.yml",
     ".github/workflows/typescript.yml",
 )
+PYTHON_WORKFLOW = ".github/workflows/python-wheels.yml"
 _TAG = re.compile(r"^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$")
 
 
@@ -191,6 +192,9 @@ def _write_outputs(path: str | None, state: dict[str, Any]) -> None:
                 if isinstance(value, bool):
                     value = str(value).lower()
                 handle.write(f"{key}={value}\n")
+        run_ids = state.get("workflowRunIds")
+        if isinstance(run_ids, dict) and PYTHON_WORKFLOW in run_ids:
+            handle.write(f"python_run_id={int(run_ids[PYTHON_WORKFLOW])}\n")
 
 
 def main(argv: list[str] | None = None) -> int:

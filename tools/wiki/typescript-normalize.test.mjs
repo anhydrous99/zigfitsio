@@ -33,7 +33,7 @@ const TOOLCHAIN = {
 
 test("parses every literal PROTOS declaration in source order", async () => {
   const protos = parseTypeScriptProtos(await readFile(PROTOS_SOURCE, "utf8"));
-  assert.equal(protos.length, 86);
+  assert.equal(protos.length, 89);
   assert.equal(protos[0].name, "zf_version");
   assert.equal(protos.at(-1).name, "zf_write_compressed3");
   assert.equal(new Set(protos.map((proto) => proto.name)).size, protos.length);

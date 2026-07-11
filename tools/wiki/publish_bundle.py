@@ -20,6 +20,15 @@ from typing import Any
 
 
 MANIFEST_NAME = ".generated-api-manifest.json"
+BUNDLE_METADATA_FILES = frozenset(
+    {
+        MANIFEST_NAME,
+        "zig-api-symbols.json",
+        "python-symbols.json",
+        "typescript-api-manifest.json",
+        "typescript-api-coverage.json",
+    }
+)
 MARKER_PREFIX = "<!-- zigfitsio-api-reference:"
 BOOTSTRAP_MARKER = "<!-- zigfitsio-api-wiki-bootstrap -->"
 _SAFE_FILE = re.compile(r"^[A-Za-z0-9_.-]+\.md$")
@@ -115,6 +124,17 @@ def _entries(manifest: dict[str, Any], bundle: Path | None = None) -> dict[str, 
     return result
 
 
+def _bundle_file_names(bundle: Path) -> set[str]:
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise BundleError(f"bundle must be a normal directory: {bundle}")
+    names: set[str] = set()
+    for entry in bundle.iterdir():
+        if entry.is_symlink() or not entry.is_file():
+            raise BundleError(f"bundle contains a non-regular file: {entry}")
+        names.add(entry.name)
+    return names
+
+
 def install_bundle(
     bundle: Path,
     wiki: Path,
@@ -130,6 +150,7 @@ def install_bundle(
     Files not listed by the previous generated manifest are never touched.
     """
 
+    bundle_files = _bundle_file_names(bundle)
     bundle = bundle.resolve()
     wiki = wiki.resolve()
     if bundle == wiki:
@@ -137,6 +158,13 @@ def install_bundle(
     new_manifest_path = bundle / MANIFEST_NAME
     new_manifest = _load_manifest(new_manifest_path)
     new_files = _entries(new_manifest, bundle)
+    expected_bundle_files = set(new_files) | BUNDLE_METADATA_FILES
+    if bundle_files != expected_bundle_files:
+        missing = sorted(expected_bundle_files - bundle_files)
+        unexpected = sorted(bundle_files - expected_bundle_files)
+        raise BundleError(
+            f"bundle layout mismatch: missing={missing}, unexpected={unexpected}"
+        )
     expected = {
         "tag": expected_tag,
         "sha": expected_sha,

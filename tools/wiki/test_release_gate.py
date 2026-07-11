@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
-from release_gate import GateError, _event_release, evaluate_runs, select_workflow_runs
+from release_gate import (
+    GateError,
+    PYTHON_WORKFLOW,
+    _event_release,
+    _write_outputs,
+    evaluate_runs,
+    select_workflow_runs,
+)
 
 
 TAG = "v1.2.3"
@@ -74,6 +83,20 @@ class ReleaseGateTests(unittest.TestCase):
         newest = run(".github/workflows/python-wheels.yml", ident=11)
         selected = select_workflow_runs([old, newest], TAG, SHA)
         self.assertEqual(selected[".github/workflows/python-wheels.yml"]["id"], 11)
+
+    def test_writes_verified_python_run_id_for_artifact_download(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "outputs"
+            _write_outputs(
+                str(output),
+                {
+                    "ready": True,
+                    "tag": TAG,
+                    "sha": SHA,
+                    "workflowRunIds": {PYTHON_WORKFLOW: 123456},
+                },
+            )
+            self.assertIn("python_run_id=123456\n", output.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

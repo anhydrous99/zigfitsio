@@ -46,9 +46,9 @@ def test_generates_complete_static_contract(tmp_path):
     ]
     assert manifest["counts"]["public_exports"] == 25
     assert manifest["counts"]["lowlevel_exports"] == 62
-    assert manifest["counts"]["lowlevel_functions"] == 86
+    assert manifest["counts"]["lowlevel_functions"] == 89
     assert manifest["coverage"]["missing"] == []
-    assert len(manifest["abi_prototypes"]) == 86
+    assert len(manifest["abi_prototypes"]) == 89
     assert manifest["abi_prototypes"][0] == {
         "name": "zf_version",
         "returns": "CHARP",

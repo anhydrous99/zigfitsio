@@ -25,13 +25,10 @@ permissions:
   contents: read
 
 # A completion event arrives for each upstream workflow. Serialize the whole coordinator; the
-# second ready run is harmless because generation and Wiki installation are deterministic.
+# second ready run is harmless because artifact validation and Wiki installation are idempotent.
 concurrency:
   group: api-wiki-${{ github.repository }}
   cancel-in-progress: false
-
-env:
-  ZIG_VERSION: "0.16.0"
 
 jobs:
   gate:
@@ -48,9 +45,10 @@ jobs:
       tag: ${{ steps.gate.outputs.tag }}
       version: ${{ steps.gate.outputs.version }}
       sha: ${{ steps.gate.outputs.sha }}
+      python_run_id: ${{ steps.gate.outputs.python_run_id }}
     steps:
-      # workflow_run executes the workflow definition from the default branch. Keep the gate on
-      # that trusted branch and do not check out or execute release-tag code until verification.
+      # workflow_run executes the workflow definition from the default branch. Keep every script
+      # in this privileged workflow on that trusted branch; release-tag output is data only.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -66,6 +64,7 @@ jobs:
           REASON: ${{ steps.gate.outputs.reason }}
           TAG: ${{ steps.gate.outputs.tag }}
           SHA: ${{ steps.gate.outputs.sha }}
+          PYTHON_RUN_ID: ${{ steps.gate.outputs.python_run_id }}
         run: |
           {
             echo "### API Wiki release gate"
@@ -74,71 +73,20 @@ jobs:
             echo "- reason: \`${REASON:-unknown}\`"
             if [ -n "${TAG:-}" ]; then echo "- tag: \`$TAG\`"; fi
             if [ -n "${SHA:-}" ]; then echo "- commit: \`$SHA\`"; fi
+            if [ -n "${PYTHON_RUN_ID:-}" ]; then echo "- Python artifact run: \`$PYTHON_RUN_ID\`"; fi
           } >> "$GITHUB_STEP_SUMMARY"
-
-  generate:
-    name: generate immutable Wiki bundle
-    needs: gate
-    if: needs.gate.outputs.ready == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ needs.gate.outputs.sha }}
-          persist-credentials: false
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: bindings/typescript/package-lock.json
-      - run: npm ci
-        working-directory: bindings/typescript
-      - name: Generate twice and prove determinism
-        env:
-          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
-          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
-          REPOSITORY: ${{ needs.gate.outputs.repository }}
-        run: |
-          set -euo pipefail
-          python3 tools/wiki/generate.py \
-            --out "$RUNNER_TEMP/wiki-a" --tag "$RELEASE_TAG" \
-            --sha "$RELEASE_SHA" --repository "$REPOSITORY"
-          python3 tools/wiki/generate.py \
-            --out "$RUNNER_TEMP/wiki-b" --tag "$RELEASE_TAG" \
-            --sha "$RELEASE_SHA" --repository "$REPOSITORY"
-          diff -ru "$RUNNER_TEMP/wiki-a" "$RUNNER_TEMP/wiki-b"
-          mkdir -p "$RUNNER_TEMP/wiki-artifact"
-          cp -R "$RUNNER_TEMP/wiki-a" "$RUNNER_TEMP/wiki-artifact/wiki"
-          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 \
-            --numeric-owner -C "$RUNNER_TEMP/wiki-a" -cf - . | gzip -n > \
-            "$RUNNER_TEMP/wiki-artifact/zigfitsio-api-${RELEASE_TAG}.tar.gz"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: api-wiki-${{ needs.gate.outputs.tag }}-${{ needs.gate.outputs.sha }}
-          path: ${{ runner.temp }}/wiki-artifact
-          if-no-files-found: error
-          include-hidden-files: true
-          overwrite: true
 
   publish:
     name: publish GitHub Wiki
-    needs: [gate, generate]
+    needs: gate
     if: needs.gate.outputs.ready == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: write
     steps:
-      # Use the trusted default-branch publication script. The generated tag content arrives only
-      # as a checked artifact and is never executed with the write token.
+      # Use only trusted default-branch code with the write token. The generated tag content
+      # arrives as data from the exact gate-verified Python run and is never executed here.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -148,8 +96,11 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: api-wiki-${{ needs.gate.outputs.tag }}-${{ needs.gate.outputs.sha }}
-          path: ${{ runner.temp }}/wiki-artifact
+          name: api-wiki-preview-${{ needs.gate.outputs.sha }}
+          path: ${{ runner.temp }}/wiki-artifact/wiki
+          github-token: ${{ github.token }}
+          repository: ${{ needs.gate.outputs.repository }}
+          run-id: ${{ needs.gate.outputs.python_run_id }}
       - name: Clone Wiki with the short-lived repository token
         env:
           GH_TOKEN: ${{ github.token }}
@@ -181,6 +132,14 @@ jobs:
           )
           if [ "$ALLOW_DOWNGRADE" = "true" ]; then args+=(--allow-downgrade); fi
           python3 tools/wiki/publish_bundle.py "${args[@]}"
+      - name: Package the validated API bundle reproducibly
+        env:
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 \
+            --numeric-owner -C "$RUNNER_TEMP/wiki-artifact/wiki" -cf - . | gzip -n > \
+            "$RUNNER_TEMP/wiki-artifact/zigfitsio-api-${RELEASE_TAG}.tar.gz"
       - name: Revalidate the tag, workflows, and release immediately before mutation
         env:
           GITHUB_TOKEN: ${{ github.token }}
