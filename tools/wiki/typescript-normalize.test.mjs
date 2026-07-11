@@ -19,10 +19,10 @@ import {
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PROTOS_SOURCE = path.join(REPO_ROOT, "bindings", "typescript", "src", "lowlevel", "protos.ts");
 const METADATA = {
-  tag: "v0.1.4",
+  tag: "v0.1.5",
   sha: "0123456789abcdef0123456789abcdef01234567",
   repository: "anhydrous99/zigfitsio",
-  packageVersion: "0.1.4",
+  packageVersion: "0.1.5",
 };
 const TOOLCHAIN = {
   typedoc: "0.28.20",
