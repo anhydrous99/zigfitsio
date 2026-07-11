@@ -152,6 +152,87 @@ describe("packed VLA ABI", () => {
 });
 
 describe("struct-offset tripwires", () => {
+  test("logical-header V1 snapshot and batch-edit layouts cross Wasm intact", () => {
+    const h = createMemory();
+    try {
+      emptyPrimary(h);
+      const infoBuf = ll.newHeaderSnapshotInfoV1Buf();
+      ll.check(ll.lib.zf_header_snapshot_query_v1(h, 1n, 0, infoBuf));
+      const info = ll.decodeHeaderSnapshotInfoV1(infoBuf);
+      expect(info.revision).toBeGreaterThan(0n);
+      expect(info.logicalCount).toBeGreaterThan(0n);
+      expect(info.rawBytes).toBe(0n);
+
+      const count = Number(info.logicalCount);
+      const entriesBuf = new Uint8Array(count * ll.HEADER_ENTRY_V1_SIZE);
+      const arena = new Uint8Array(Number(info.arenaBytes));
+      const filledBuf = ll.newHeaderSnapshotInfoV1Buf();
+      ll.check(
+        ll.lib.zf_header_snapshot_fill_v1(
+          h,
+          1n,
+          0,
+          info.revision,
+          entriesBuf,
+          count,
+          arena,
+          arena.length,
+          null,
+          0,
+          filledBuf,
+        ),
+      );
+      const filled = ll.decodeHeaderSnapshotInfoV1(filledBuf);
+      expect(filled).toEqual(info);
+      const decoder = new TextDecoder();
+      const entries = ll.decodeHeaderEntriesV1(entriesBuf, count);
+      const keyword = (entry: ll.HeaderEntryV1): string =>
+        decoder.decode(arena.subarray(Number(entry.keywordOff), Number(entry.keywordOff + entry.keywordLen)));
+      const simple = entries.find((entry) => keyword(entry) === "SIMPLE");
+      expect(simple?.kind).toBe(ll.ZF_HEADER_ENTRY_VALUE);
+      expect(simple?.valueType).toBe(ll.ZF_HEADER_VALUE_LOGICAL);
+      expect(simple?.intValue).toBe(1n);
+
+      const name = enc("OBSERVER");
+      const value = enc("Hubble");
+      const comment = enc("who");
+      const editArena = new Uint8Array(name.length + value.length + comment.length);
+      editArena.set(name, 0);
+      editArena.set(value, name.length);
+      editArena.set(comment, name.length + value.length);
+      const ops = ll.encodeHeaderOpsV1([
+        {
+          opcode: ll.ZF_HEADER_OP_UPSERT,
+          valueType: ll.ZF_HEADER_VALUE_STRING,
+          flags: ll.ZF_HEADER_OP_COMMENT_PRESENT,
+          nameOff: 0n,
+          nameLen: BigInt(name.length),
+          valueOff: BigInt(name.length),
+          valueLen: BigInt(value.length),
+          commentOff: BigInt(name.length + value.length),
+          commentLen: BigInt(comment.length),
+        },
+      ]);
+      const opts = ll.encodeHeaderApplyOptsV1({
+        expectedRevision: info.revision,
+        flags: ll.ZF_HEADER_APPLY_CHECK_REVISION,
+      });
+      const resultBuf = ll.newHeaderApplyResultV1Buf();
+      ll.check(ll.lib.zf_header_apply_v1(h, 1n, opts, ops, 1, editArena, editArena.length, resultBuf));
+      const result = ll.decodeHeaderApplyResultV1(resultBuf);
+      expect(result.newRevision).toBe(info.revision + 1n);
+      expect(result.failedOp).toBe(0xffffffffffffffffn);
+      expect(result.cardsAfter).toBeGreaterThan(result.cardsBefore);
+
+      const got = new Uint8Array(32);
+      const gotLen = ll.outU64();
+      ll.check(ll.lib.zf_read_key_str(h, name, name.length, got, got.length, gotLen));
+      expect(decoder.decode(got.subarray(0, Number(gotLen[0])))).toBe("Hubble");
+    } finally {
+      ll.lib.zf_close(h);
+    }
+  });
+
   test("ZfColInfo layout: fresh unscaled J column reads back exactly", () => {
     const h = createMemory();
     try {
@@ -350,7 +431,10 @@ describe("allocate-and-return", () => {
 describe("wasm buf-direction map", () => {
   const byName = new Map(PROTOS.map((p) => [p.name, p]));
   test("prototype count and packed VLA directions match the ABI", () => {
-    expect(PROTOS).toHaveLength(89);
+    expect(PROTOS).toHaveLength(92);
+    expect(BUF_DIRS.zf_header_snapshot_query_v1).toEqual({ 3: "out" });
+    expect(BUF_DIRS.zf_header_snapshot_fill_v1).toEqual({ 4: "out", 6: "out", 8: "out", 10: "out" });
+    expect(BUF_DIRS.zf_header_apply_v1).toEqual({ 2: "in", 3: "in", 5: "in", 7: "out" });
     expect(BUF_DIRS.zf_read_col_vla_layout).toEqual({ 4: "out", 6: "out" });
     expect(BUF_DIRS.zf_read_col_vla_packed).toEqual({ 5: "out" });
     expect(BUF_DIRS.zf_write_col_vla_packed).toEqual({ 5: "in", 7: "in" });

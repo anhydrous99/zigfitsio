@@ -442,7 +442,7 @@ describe("HIERARCH long-string write (multi-card)", () => {
     const idCard = cards.find((c) => c.includes("ESO DET ID"))!;
     expect(idCard.split("HIERARCH").length - 1).toBe(1);
     const expCard = cards.find((c) => c.includes("ESO DET EXPTIME"))!;
-    expect(expCard).toContain("E-7");
+    expect(expCard).toContain("E-07");
     expect(expCard).not.toContain("e-7");
     const hl = zf.fromBytes(blob);
     try {

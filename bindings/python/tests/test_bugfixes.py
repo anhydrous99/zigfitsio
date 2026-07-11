@@ -412,31 +412,33 @@ def test_hierarch_float_uppercase_exponent():
 
 def test_hierarch_comment_dedicated_card():
     """A comment that cannot ride the last data fragment gets astropy's CONTINUE '' card."""
-    from zigfitsio.core import _hierarch_cards
-
     # base takes 53 chars, the next CONTINUE 67; the final 60 exceed the comment-reserving
     # terminal window (49) so they fill their own card and the comment spills to a '' card.
     value = "A" * 180
-    cards = _hierarch_cards("ESO LONG STR", value, "trailing comment")
-    assert cards[-1].startswith(b"CONTINUE  '' / trailing comment")
     hdu = zf.PrimaryHDU()
     hdu.header["ESO LONG STR"] = (value, "trailing comment")
-    hh = zf.from_bytes(zf.HDUList([hdu]).to_bytes())[0].header
+    blob = zf.HDUList([hdu]).to_bytes()
+    cards = _header_cards(blob)
+    assert any(card.startswith(b"CONTINUE  '' / trailing comment") for card in cards)
+    hh = zf.from_bytes(blob)[0].header
     assert hh["ESO LONG STR"] == value
     assert hh.comment_of("ESO LONG STR") == "trailing comment"
 
 
 def test_hierarch_nonstring_overflow():
     """Non-string HIERARCH cards never CONTINUE: the comment is cut, a value never is (item 11)."""
-    from zigfitsio.core import _hierarch_cards
-
     # Comment overflow: the integer value survives intact, the comment is truncated at col 80.
     kw = "ESO DET " + "LONG NAME " * 4
-    [card] = _hierarch_cards(kw.strip(), 123456, "c" * 60)
+    hdu = zf.PrimaryHDU()
+    hdu.header[kw.strip()] = (123456, "c" * 60)
+    blob = zf.HDUList([hdu]).to_bytes()
+    card = next(card for card in _header_cards(blob) if b"ESO DET" in card)
     assert b"= 123456 / " in card
     # Value overflow (absurd keyword): loud error instead of silent truncation.
-    with pytest.raises(ValueError):
-        _hierarch_cards("ESO " + "X" * 76, 1, None)
+    bad = zf.PrimaryHDU()
+    bad.header["ESO " + "X" * 76] = 1
+    with pytest.raises(zf.FitsHeaderError):
+        zf.HDUList([bad]).to_bytes()
 
 
 def test_hierarch_numpy_scalar_value():

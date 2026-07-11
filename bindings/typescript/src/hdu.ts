@@ -3,11 +3,11 @@
  * An HDU is either *attached* (from an open file: `_hdulist` + `_index`) or
  * *detached* (built in JS with `_data`/`_header` for writing).
  */
-import { FitsHeaderError, FitsIOError, FitsOverflowError, FitsTypeError, KeywordNotFound, NotSupportedError } from "./errors.js";
+import { FitsHeaderError, FitsIOError, FitsOverflowError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import { FitsArray, asFitsArray } from "./fitsarray.js";
-import { Header, parseCards, wrapCommentary, type HeaderValue } from "./header.js";
+import { Header, type CardRec, type HeaderMutation, type HeaderValue } from "./header.js";
 import { enc, fnv1a64, viewBytes } from "./util.js";
 import type { HDUList } from "./hdulist.js";
 
@@ -70,22 +70,6 @@ export function isCompStructuralKeyword(up: string): boolean {
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
 
-/** ASCII bytes with non-ASCII replaced by '?' (Python encode("ascii", "replace")). */
-function asciiBytes(s: string): Uint8Array {
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    out[i] = c < 128 ? c : 63;
-  }
-  return out;
-}
-
-/** An 80-byte COMMENT/HISTORY/blank card: keyword in cols 1-8, free text in cols 9-80. */
-function commentaryCard(kw: string, value: HeaderValue): Uint8Array {
-  const text = value === null || value === undefined ? "" : String(value);
-  return asciiBytes((kw.toUpperCase().padEnd(8) + text).slice(0, 80).padEnd(80));
-}
-
 /**
  * Whether the HDU declares an integer null sentinel: a `BLANK` keyword, or — for a
  * tile-compressed image, whose visible header is the raw BINTABLE one — `ZBLANK` as a
@@ -103,94 +87,6 @@ function blankDefined(header: Header): boolean {
     }
   }
   return false;
-}
-
-/** Serialize a header value to its FITS card literal (for HIERARCH cards written raw). */
-function fitsValueLiteral(value: HeaderValue): string {
-  if (typeof value === "boolean") return value ? "T" : "F";
-  if (value === null || value === undefined) return "";
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      // FITS has no NaN/Inf spelling; `String(NaN)` would stamp a literal "NaN" token no
-      // reader accepts. This raw-card path bypasses the Zig-core guard, so reject here.
-      throw new FitsHeaderError(207, `non-finite float keyword value ${value}: FITS headers cannot represent NaN/Inf`);
-    }
-    return String(value).replace("e", "E"); // FITS exponents are uppercase
-  }
-  if (typeof value === "bigint") return String(value);
-  return "'" + String(value).replace(/'/g, "''") + "'";
-}
-
-/**
- * Largest cut ≤ `want` that does not split a `''` escape pair. `esc` always
- * starts on a pair boundary (callers only advance by pair-safe takes), so a
- * left-to-right walk decides pair membership unambiguously.
- */
-function pairSafeTake(esc: string, want: number): number {
-  let j = 0;
-  while (j < want) {
-    if (esc[j] === "'") {
-      if (j + 1 === want) return want - 1;
-      j += 2;
-    } else {
-      j++;
-    }
-  }
-  return want;
-}
-
-/**
- * The 80-byte card run for a HIERARCH keyword: one card when it fits, else
- * HIERARCH+CONTINUE (port of the Python `_hierarch_cards`; astropy's layout).
- *
- * Long string values continue across CONTINUE cards: the base fragment fills
- * to column 80 with the `&` sentinel inside the quotes, and the comment rides
- * the last fragment or a dedicated `CONTINUE  '' / comment` card. The escaped
- * text is chunked so a `''` escape pair is never split across cards. A
- * non-string value never continues (the convention applies to strings only):
- * its comment may be truncated, but a value that cannot fit throws instead of
- * being silently cut (the old single-card builder truncated at 80 bytes).
- */
-function hierarchCards(kw: string, value: HeaderValue, comment: string): Uint8Array[] {
-  let tokens = kw.trim();
-  if (/^hierarch /i.test(tokens)) tokens = tokens.slice(9).replace(/^ +/, ""); // never double the prefix
-  const prefix = "HIERARCH " + tokens + " = ";
-  const lit = fitsValueLiteral(value);
-  const body = prefix + lit + (comment ? " / " + comment : "");
-  if (body.length <= 80) return [asciiBytes(body.padEnd(80))]; // fast path: identical to the single-card form
-  if (typeof value !== "string") {
-    if ((prefix + lit).length <= 80) return [asciiBytes(body.slice(0, 80).padEnd(80))]; // only the comment is cut
-    throw new FitsHeaderError(207, `HIERARCH card for '${tokens}' does not fit in 80 columns`);
-  }
-  const esc = value.replace(/'/g, "''");
-  if (esc.length === 0) {
-    // Empty string value: only the comment overflows — truncate it.
-    return [asciiBytes((prefix + "'' / " + comment).slice(0, 80).padEnd(80))];
-  }
-  const ccost = comment ? 3 + comment.length : 0;
-  const cards: string[] = [];
-  let pos = 0;
-  let first = true;
-  let commentDone = !comment;
-  while (pos < esc.length) {
-    const head = first ? prefix : "CONTINUE  ";
-    const cap = 80 - head.length - 2; // columns between the quotes (incl. a possible '&')
-    const remaining = esc.length - pos;
-    const terminal = remaining <= cap - ccost;
-    const take = terminal ? remaining : pairSafeTake(esc.slice(pos), Math.min(cap - 1, remaining));
-    if (take <= 0) throw new FitsHeaderError(207, `HIERARCH keyword '${tokens}' leaves no room for a value`);
-    const frag = esc.slice(pos, pos + take);
-    pos += take;
-    first = false;
-    if (terminal) {
-      cards.push(head + "'" + frag + "'" + (comment ? " / " + comment : ""));
-      commentDone = true;
-      break;
-    }
-    cards.push(head + "'" + frag + "&'");
-  }
-  if (!commentDone) cards.push(("CONTINUE  '' / " + comment).slice(0, 80)); // astropy's dedicated comment card
-  return cards.map((t) => asciiBytes(t.padEnd(80)));
 }
 
 /**
@@ -279,6 +175,207 @@ function headerNum(v: HeaderValue | undefined, dflt: number): number {
   return dflt;
 }
 
+const headerTextDecoder = new TextDecoder();
+
+function checkedByteCount(value: bigint, what: string): number {
+  // The Wasm bridge uses wasm32 offsets and deliberately rejects a span at/above 4 GiB.
+  if (value < 0n || value >= 0x1_0000_0000n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new FitsOverflowError(412, `${what} ${value} is not representable by the Wasm binding`);
+  }
+  return Number(value);
+}
+
+function arenaText(arena: Uint8Array, off64: bigint, len64: bigint): string {
+  const off = checkedByteCount(off64, "header arena offset");
+  const len = checkedByteCount(len64, "header arena length");
+  const end = off + len;
+  if (!Number.isSafeInteger(end) || end > arena.byteLength) {
+    throw new FitsHeaderError(207, `invalid header snapshot arena slice ${off}+${len}/${arena.byteLength}`);
+  }
+  return headerTextDecoder.decode(arena.subarray(off, end));
+}
+
+function exactInteger(big: bigint): number | bigint {
+  const num = Number(big);
+  return Number.isFinite(num) && BigInt(num) === big ? num : big;
+}
+
+function snapshotValue(entry: ll.HeaderEntryV1, arena: Uint8Array): HeaderValue {
+  switch (entry.valueType) {
+    case ll.ZF_HEADER_VALUE_NONE:
+      return arenaText(arena, entry.valueOff, entry.valueLen);
+    case ll.ZF_HEADER_VALUE_UNDEFINED:
+      return null;
+    case ll.ZF_HEADER_VALUE_LOGICAL:
+      return entry.intValue !== 0n;
+    case ll.ZF_HEADER_VALUE_INT64:
+      return exactInteger(entry.intValue);
+    case ll.ZF_HEADER_VALUE_INTEGER_TEXT: {
+      const token = arenaText(arena, entry.valueOff, entry.valueLen);
+      try {
+        return exactInteger(BigInt(token));
+      } catch {
+        // Defensive only: the core emits INTEGER_TEXT solely for syntactically valid integers.
+        return token;
+      }
+    }
+    case ll.ZF_HEADER_VALUE_FLOAT64:
+      return entry.floatValue;
+    case ll.ZF_HEADER_VALUE_STRING:
+    case ll.ZF_HEADER_VALUE_RAW_TOKEN:
+      return arenaText(arena, entry.valueOff, entry.valueLen);
+    default:
+      throw new FitsHeaderError(207, `unknown logical-header value type ${entry.valueType}`);
+  }
+}
+
+function snapshotCards(entries: readonly ll.HeaderEntryV1[], arena: Uint8Array): CardRec[] {
+  return entries.map((entry) => {
+    if (
+      entry.kind !== ll.ZF_HEADER_ENTRY_VALUE &&
+      entry.kind !== ll.ZF_HEADER_ENTRY_COMMENTARY &&
+      entry.kind !== ll.ZF_HEADER_ENTRY_BLANK &&
+      entry.kind !== ll.ZF_HEADER_ENTRY_OTHER
+    ) {
+      throw new FitsHeaderError(207, `unknown logical-header entry kind ${entry.kind}`);
+    }
+    const commentary = entry.kind !== ll.ZF_HEADER_ENTRY_VALUE;
+    return {
+      keyword: arenaText(arena, entry.keywordOff, entry.keywordLen),
+      value: snapshotValue(entry, arena),
+      comment: arenaText(arena, entry.commentOff, entry.commentLen),
+      commentary,
+    };
+  });
+}
+
+interface ArenaRef {
+  off: bigint;
+  len: bigint;
+}
+
+function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
+  descriptors: Uint8Array;
+  arena: Uint8Array;
+} {
+  const chunks: Uint8Array[] = [];
+  let arenaLength = 0;
+  const add = (text: string): ArenaRef => {
+    const bytes = enc(text);
+    if (arenaLength + bytes.length >= 0x1_0000_0000) {
+      throw new FitsOverflowError(412, "header transaction arena exceeds the Wasm address space");
+    }
+    const ref = { off: BigInt(arenaLength), len: BigInt(bytes.length) };
+    chunks.push(bytes);
+    arenaLength += bytes.length;
+    return ref;
+  };
+  const descriptors: ll.HeaderOpV1[] = [];
+
+  for (const mutation of mutations) {
+    const name = add(mutation.key);
+    if (mutation.type === "delete_first" || mutation.type === "delete_all") {
+      descriptors.push({
+        opcode: mutation.type === "delete_first" ? ll.ZF_HEADER_OP_DELETE_FIRST : ll.ZF_HEADER_OP_DELETE_ALL,
+        nameOff: name.off,
+        nameLen: name.len,
+      });
+      continue;
+    }
+    if (mutation.type === "append_commentary") {
+      const text = add(mutation.value === null || mutation.value === undefined ? "" : String(mutation.value));
+      descriptors.push({
+        opcode: ll.ZF_HEADER_OP_APPEND_COMMENTARY,
+        nameOff: name.off,
+        nameLen: name.len,
+        valueOff: text.off,
+        valueLen: text.len,
+      });
+      continue;
+    }
+
+    const op: ll.HeaderOpV1 = {
+      opcode: ll.ZF_HEADER_OP_UPSERT,
+      nameOff: name.off,
+      nameLen: name.len,
+      flags: 0,
+    };
+    if (mutation.comment !== null) {
+      const comment = add(mutation.comment);
+      op.flags = ll.ZF_HEADER_OP_COMMENT_PRESENT;
+      op.commentOff = comment.off;
+      op.commentLen = comment.len;
+    }
+    const value = mutation.value;
+    if (value === null) {
+      op.valueType = ll.ZF_HEADER_VALUE_UNDEFINED;
+    } else if (typeof value === "boolean") {
+      op.valueType = ll.ZF_HEADER_VALUE_LOGICAL;
+      op.intValue = value ? 1n : 0n;
+    } else if (typeof value === "bigint") {
+      if (value < INT64_MIN || value > INT64_MAX) {
+        throw new FitsOverflowError(412, `integer keyword value ${value} out of signed-64-bit range`);
+      }
+      op.valueType = ll.ZF_HEADER_VALUE_INT64;
+      op.intValue = value;
+    } else if (typeof value === "number") {
+      if (!Number.isFinite(value)) {
+        throw new FitsHeaderError(207, `non-finite float keyword value ${value}: FITS headers cannot represent NaN/Inf`);
+      }
+      if (Number.isInteger(value) && value >= -(2 ** 63) && value < 2 ** 63) {
+        op.valueType = ll.ZF_HEADER_VALUE_INT64;
+        op.intValue = BigInt(value);
+      } else {
+        op.valueType = ll.ZF_HEADER_VALUE_FLOAT64;
+        op.floatValue = value;
+      }
+    } else if (typeof value === "string") {
+      const text = add(value);
+      op.valueType = ll.ZF_HEADER_VALUE_STRING;
+      op.valueOff = text.off;
+      op.valueLen = text.len;
+    } else {
+      throw new FitsTypeError(410, `cannot encode header value for keyword ${mutation.key}`);
+    }
+    descriptors.push(op);
+  }
+
+  const arena = new Uint8Array(arenaLength);
+  let at = 0;
+  for (const chunk of chunks) {
+    arena.set(chunk, at);
+    at += chunk.length;
+  }
+  return { descriptors: ll.encodeHeaderOpsV1(descriptors), arena };
+}
+
+function applyHeaderMutations(
+  handle: bigint,
+  hduIndex: bigint,
+  mutations: readonly HeaderMutation[],
+  expectedRevision: bigint | null,
+): ll.HeaderApplyResultV1 {
+  const encoded = encodeHeaderMutations(mutations);
+  const opts = ll.encodeHeaderApplyOptsV1({
+    expectedRevision: expectedRevision ?? 0n,
+    flags: expectedRevision === null ? 0 : ll.ZF_HEADER_APPLY_CHECK_REVISION,
+  });
+  const result = ll.newHeaderApplyResultV1Buf();
+  ll.check(
+    ll.lib.zf_header_apply_v1(
+      handle,
+      hduIndex,
+      opts,
+      encoded.descriptors.byteLength === 0 ? null : encoded.descriptors,
+      mutations.length,
+      encoded.arena.byteLength === 0 ? null : encoded.arena,
+      encoded.arena.byteLength,
+      result,
+    ),
+  );
+  return ll.decodeHeaderApplyResultV1(result);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Base HDU
 // ════════════════════════════════════════════════════════════════════════
@@ -310,6 +407,8 @@ export abstract class BaseHDU {
   /** @internal */ _hdulist: HDUList | null = null;
   /** @internal */ _index: number | null = null;
   /** @internal */ _header: Header | null;
+  /** @internal Generation returned by the logical-header snapshot/edit ABI. */
+  _headerRevision: bigint | null = null;
   /** @internal */ _name: string | null;
 
   constructor(options: HDUOptions = {}) {
@@ -326,6 +425,15 @@ export abstract class BaseHDU {
     }
     ll.check(ll.lib.zf_select(hl._handle, this._index as number));
     return hl._handle;
+  }
+
+  /** @internal Attached handle plus the ABI's explicit 1-based HDU index. */
+  _headerTarget(): { handle: bigint; hduIndex: bigint } {
+    const hl = this._hdulist;
+    if (hl === null || hl._handle === null || this._index === null) {
+      throw new FitsIOError(104, "operation on a detached or closed HDU");
+    }
+    return { handle: hl._handle, hduIndex: BigInt(this._index) };
   }
 
   /** @internal */
@@ -361,21 +469,54 @@ export abstract class BaseHDU {
 
   /** @internal */
   _readHeader(): Header {
-    const h = this._select();
-    const n = ll.newLongArray(1);
-    ll.check(ll.lib.zf_card_count(h, n));
-    const raws: Uint8Array[] = [];
-    const count = ll.readLongAt(n, 0);
-    for (let i = 0; i < count; i++) {
-      const buf = new Uint8Array(80);
-      ll.check(ll.lib.zf_read_card(h, i, buf));
-      raws.push(buf);
+    const { handle, hduIndex } = this._headerTarget();
+    let hdr: Header | null = null;
+    // Generation can only race when a caller mutates the same low-level handle re-entrantly
+    // between query and fill. Retry that narrow case without ever exposing a partial snapshot.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const queriedBuf = ll.newHeaderSnapshotInfoV1Buf();
+      ll.check(ll.lib.zf_header_snapshot_query_v1(handle, hduIndex, 0, queriedBuf));
+      const queried = ll.decodeHeaderSnapshotInfoV1(queriedBuf);
+      const count = checkedByteCount(queried.logicalCount, "logical header entry count");
+      const descriptorBytes = BigInt(count) * BigInt(ll.HEADER_ENTRY_V1_SIZE);
+      const entriesBuf = new Uint8Array(checkedByteCount(descriptorBytes, "logical header descriptors"));
+      const arena = new Uint8Array(checkedByteCount(queried.arenaBytes, "logical header arena"));
+      const filledBuf = ll.newHeaderSnapshotInfoV1Buf();
+      const status = Number(
+        ll.lib.zf_header_snapshot_fill_v1(
+          handle,
+          hduIndex,
+          0,
+          queried.revision,
+          entriesBuf.byteLength === 0 ? null : entriesBuf,
+          count,
+          arena.byteLength === 0 ? null : arena,
+          arena.byteLength,
+          null,
+          0,
+          filledBuf,
+        ),
+      );
+      if (status !== 0) {
+        const message = ll.lastErrorMessage();
+        if (status === 412 && message.includes("changed since the snapshot") && attempt < 2) continue;
+        ll.check(status);
+      }
+      const filled = ll.decodeHeaderSnapshotInfoV1(filledBuf);
+      if (filled.logicalCount !== queried.logicalCount || filled.arenaBytes !== queried.arenaBytes) {
+        throw new FitsHeaderError(207, "logical-header snapshot sizes changed without a revision change");
+      }
+      const entries = ll.decodeHeaderEntriesV1(entriesBuf, count);
+      hdr = Header.fromCards(snapshotCards(entries, arena));
+      this._headerRevision = filled.revision;
+      break;
     }
-    const hdr = Header.fromCards(parseCards(raws));
+    if (hdr === null) throw new FitsOverflowError(412, "logical-header snapshot remained unstable after 3 attempts");
     if (this._writable()) {
       hdr._persist = (key, value, comment) => this._writeKey(key, value, comment);
       hdr._delete = (key) => this._deleteKey(key);
       hdr._resync = (keyword, texts) => this._resyncCommentary(keyword, texts);
+      hdr._batchCommit = (ops) => this._applyHeaderMutations(ops);
     }
     // A read-only header edit is not persisted to the handle; flag it so save reconstructs.
     hdr._dirtyCb = () => this._markDirty();
@@ -385,63 +526,39 @@ export abstract class BaseHDU {
   /** @internal */
   _writeKey(key: string, value: HeaderValue, comment: string | null): void {
     const up = key.toUpperCase();
-    if (up === "COMMENT" || up === "HISTORY" || up === "") {
-      // Commentary cards are appended verbatim (insert-before-END) as raw records, never written
-      // as valued keywords. Callers pre-split long text into ≤72-char chunks.
-      ll.check(ll.lib.zf_write_record(this._select(), commentaryCard(up, value)));
-      return;
-    }
-    if (isStructuralKeyword(key)) {
-      throw new FitsHeaderError(207, `cannot set structural keyword '${key}' on an open header`);
-    }
-    const keyS = key.trim();
-    if (keyS.includes(" ") || keyS.length > 8) {
-      // HIERARCH-convention keyword: the fixed-format ABI cannot express it (>8 chars fails
-      // Name.parse; an embedded space would stamp a spec-invalid keyword). Build the cards
-      // FIRST so a bad value cannot delete the old card and then fail; the Zig-side delete
-      // also removes an old CONTINUE run, so replacement never orphans continuations.
-      const cards = hierarchCards(keyS, value, comment ?? "");
-      const h = this._select();
-      const kb = enc(keyS);
-      try {
-        ll.check(ll.lib.zf_delete_key(h, kb, kb.length)); // matches HIERARCH names in Zig
-      } catch (e) {
-        if (!(e instanceof KeywordNotFound)) throw e;
-      }
-      for (const card of cards) ll.check(ll.lib.zf_write_record(h, card)); // insert-before-END keeps order
-      return;
-    }
-    writeKeyValue(this._select(), key, value, comment);
+    this._applyHeaderMutations([
+      up === "COMMENT" || up === "HISTORY" || up === ""
+        ? { type: "append_commentary", key: up, value }
+        : { type: "upsert", key, value, comment },
+    ]);
   }
 
   /** @internal */
   _deleteKey(key: string): void {
-    const h = this._select();
-    const kb = enc(key);
-    ll.check(ll.lib.zf_delete_key(h, kb, kb.length));
+    this._applyHeaderMutations([{ type: "delete_first", key }]);
   }
 
   /**
-   * @internal Rewrite every commentary card of `keyword` in the open handle to `texts`: delete all
-   * by name, then re-append (before END) as raw records. Used for in-place commentary edits,
-   * deletions, and array replace-all, where a single append cannot express the new state. Same
-   * delete-then-write-records idiom as the HIERARCH replacement path in `_writeKey`. For the blank
-   * keyword this also rewrites blank separator cards (they share the empty name), so an in-place
-   * edit/delete of blank commentary reorders every blank card — same as astropy.
+   * @internal Replace every commentary card of `keyword` through one staged delete-all + append
+   * batch. Used for in-place commentary edits, deletions, and array replace-all, where a single
+   * append cannot express the new state. For the blank keyword this also rewrites blank separator
+   * cards (they share the empty name), so an in-place edit/delete reorders every blank card — same
+   * as astropy.
    */
   _resyncCommentary(keyword: string, texts: HeaderValue[]): void {
-    const h = this._select();
-    const kb = enc(keyword);
-    for (;;) {
-      try {
-        ll.check(ll.lib.zf_delete_key(h, kb, kb.length));
-      } catch (e) {
-        if (e instanceof KeywordNotFound) break;
-        throw e;
-      }
-    }
     const up = keyword.toUpperCase();
-    for (const t of texts) ll.check(ll.lib.zf_write_record(h, commentaryCard(up, t)));
+    this._applyHeaderMutations([
+      { type: "delete_all", key: up },
+      ...texts.map((value): HeaderMutation => ({ type: "append_commentary", key: up, value })),
+    ]);
+  }
+
+  /** @internal Commit normalized edits to this attached HDU and advance its known generation. */
+  _applyHeaderMutations(mutations: readonly HeaderMutation[]): void {
+    if (mutations.length === 0) return;
+    const { handle, hduIndex } = this._headerTarget();
+    const result = applyHeaderMutations(handle, hduIndex, mutations, this._headerRevision);
+    this._headerRevision = result.newRevision;
   }
 
   get name(): string {
@@ -464,6 +581,7 @@ export abstract class BaseHDU {
    * double-applied; it receives the uppercased keyword.
    */
   _applyUserKeys(handle: bigint, skip?: (up: string) => boolean): void {
+    const mutations: HeaderMutation[] = [];
     for (const [kw, value, comment] of this.header.cards()) {
       const up = kw.toUpperCase();
       if (isStructuralKeyword(kw)) continue;
@@ -474,31 +592,20 @@ export abstract class BaseHDU {
       // requested. Applies to every _writeTo path (image, table, compressed).
       if (up === "CHECKSUM" || up === "DATASUM") continue;
       if (skip?.(up)) continue;
-      // Commentary and HIERARCH/spaced/>8-char keys can't be written as
-      // standard 8-char keywords; reconstruct their 80-byte card and write it
-      // verbatim so COMMENT/HISTORY provenance and HIERARCH keywords survive
-      // the reconstruction (non-pristine) path.
       if (up === "COMMENT" || up === "HISTORY" || up === "") {
-        // Wrap so a >72-char commentary card (e.g. built via Header.fromCards) spans multiple
-        // records instead of truncating; set-time cards are already ≤72.
-        for (const chunk of wrapCommentary(value)) {
-          ll.check(ll.lib.zf_write_record(handle, commentaryCard(kw, chunk)));
-        }
-        continue;
-      }
-      if (kw.includes(" ") || kw.length > 8) {
-        for (const card of hierarchCards(kw, value, comment)) {
-          ll.check(ll.lib.zf_write_record(handle, card));
-        }
+        mutations.push({ type: "append_commentary", key: up, value });
         continue;
       }
       if (value === undefined) continue;
-      writeKeyValue(handle, kw, value, comment || null); // null → undefined-value card
+      mutations.push({ type: "upsert", key: kw, value, comment: comment || null });
     }
     if (this._name) {
-      const nb = enc(this._name);
-      const kb = enc("EXTNAME");
-      ll.check(ll.lib.zf_write_key_str(handle, kb, kb.length, nb, nb.length, null, 0));
+      mutations.push({ type: "upsert", key: "EXTNAME", value: this._name, comment: null });
+    }
+    if (mutations.length > 0) {
+      const current = ll.newLongArray(1);
+      ll.check(ll.lib.zf_current_hdu(handle, current));
+      applyHeaderMutations(handle, BigInt(ll.readLongAt(current, 0)), mutations, null);
     }
   }
 }

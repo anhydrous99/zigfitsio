@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "calibrated-header-v1",
+  "defaults": {
+    "bootstrap_resamples": 5000,
+    "confidence": 0.95,
+    "decision": "lower_bound"
+  },
+  "rules": [
+    {"runtime": "python-native", "group": "read/*/cards-0006/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 0.90, "required": false},
+    {"runtime": "python-native", "group": "read/*/cards-0036/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 1.25, "required": false},
+    {"runtime": "python-native", "group": "read/*/cards-0360/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 2.00, "required": false},
+    {"runtime": "python-native", "group": "read/*/cards-3600/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 3.00, "required": false},
+    {"runtime": "node-wasm", "group": "read/*/cards-0006/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 0.85, "required": false},
+    {"runtime": "node-wasm", "group": "read/*/cards-0036/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 0.95, "required": false},
+    {"runtime": "node-wasm", "group": "read/*/cards-0360/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 1.10, "required": false},
+    {"runtime": "node-wasm", "group": "read/*/cards-3600/*", "baseline": "legacy_e2e", "candidate": "snapshot_e2e", "min_speedup": 1.10, "required": false},
+    {"runtime": "*", "group": "apply/*/cards-*/edits-1/*", "baseline": "legacy_individual", "candidate": "batch_apply", "min_speedup": 0.85, "required": false},
+    {"runtime": "*", "group": "apply/*/cards-*/edits-8/*", "baseline": "legacy_individual", "candidate": "batch_apply", "min_speedup": 1.50, "required": false},
+    {"runtime": "*", "group": "apply/*/cards-*/edits-32/*", "baseline": "legacy_individual", "candidate": "batch_apply", "min_speedup": 3.00, "required": false}
+  ]
+}

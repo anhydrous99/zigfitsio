@@ -28,6 +28,8 @@ comptime {
     _ = @import("header/header.zig");
     _ = @import("header/continue.zig");
     _ = @import("header/hierarch.zig");
+    _ = @import("header/logical.zig");
+    _ = @import("header/edit.zig");
 
     // HDU model + file handle (FileDevice gated out under freestanding).
     _ = @import("hdu.zig");

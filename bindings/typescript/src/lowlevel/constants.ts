@@ -32,3 +32,40 @@ export const HDU_RANDOM_GROUPS = 4;
 // ── Table types ──
 export const BINARY_TBL = 0;
 export const ASCII_TBL = 1;
+
+// ── Logical-header snapshot/edit V1 ──
+export const ZF_HEADER_SNAPSHOT_INCLUDE_RAW = 0x00000001;
+
+export const ZF_HEADER_ENTRY_VALUE = 1;
+export const ZF_HEADER_ENTRY_COMMENTARY = 2;
+export const ZF_HEADER_ENTRY_BLANK = 3;
+export const ZF_HEADER_ENTRY_OTHER = 4;
+
+export const ZF_HEADER_VALUE_NONE = 0;
+export const ZF_HEADER_VALUE_UNDEFINED = 1;
+export const ZF_HEADER_VALUE_LOGICAL = 2;
+export const ZF_HEADER_VALUE_INT64 = 3;
+export const ZF_HEADER_VALUE_INTEGER_TEXT = 4;
+export const ZF_HEADER_VALUE_FLOAT64 = 5;
+export const ZF_HEADER_VALUE_STRING = 6;
+export const ZF_HEADER_VALUE_RAW_TOKEN = 7;
+
+export const ZF_HEADER_ENTRY_HIERARCH = 0x00000001;
+export const ZF_HEADER_ENTRY_CONTINUED = 0x00000002;
+export const ZF_HEADER_ENTRY_MALFORMED = 0x00000004;
+
+export const ZF_HEADER_OP_UPSERT = 1;
+export const ZF_HEADER_OP_DELETE_FIRST = 2;
+export const ZF_HEADER_OP_DELETE_ALL = 3;
+export const ZF_HEADER_OP_RENAME = 4;
+export const ZF_HEADER_OP_APPEND_COMMENTARY = 5;
+export const ZF_HEADER_OP_APPEND_RAW_RUN = 6;
+export const ZF_HEADER_OP_INSERT_RAW_RUN = 7;
+export const ZF_HEADER_OP_RESERVE_BLANKS = 8;
+
+export const ZF_HEADER_OP_COMMENT_PRESENT = 0x00000001;
+export const ZF_HEADER_OP_STRICT = 0x00000002;
+export const ZF_HEADER_OP_FORCE_HIERARCH = 0x00000004;
+
+export const ZF_HEADER_APPLY_CHECK_REVISION = 0x00000001;
+export const ZF_HEADER_APPLY_ALLOW_STRUCTURAL = 0x00000002;

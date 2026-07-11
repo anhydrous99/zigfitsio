@@ -11,6 +11,8 @@ const errors = @import("../errors.zig");
 const HeaderError = errors.HeaderError;
 const Card = @import("card.zig").Card;
 const value = @import("value.zig");
+const logical = @import("logical.zig");
+const Limits = @import("../limits.zig").Limits;
 
 const Allocator = std.mem.Allocator;
 
@@ -32,47 +34,16 @@ pub const Assembled = struct {
 /// not a string value that actually continues (so the caller uses the single-card value as-is,
 /// keeping any literal trailing `&`). The returned `value` is allocator-owned.
 pub fn assemble(alloc: Allocator, cards: []const Card, i: usize, max_len: usize) (HeaderError || errors.LimitError || Allocator.Error)!?Assembled {
-    if (i >= cards.len or cards[i].kind != .value) return null;
-    const first = value.parseValue(alloc, cards[i].valueField()) catch return null;
-    defer first.deinit(alloc);
-    const s0 = switch (first) {
-        .string => |s| s,
-        else => return null,
+    if (i >= cards.len) return null;
+    var lim = Limits{};
+    lim.max_string_value = @intCast(@min(max_len, std.math.maxInt(u32)));
+    var parsed = (try logical.parseAt(alloc, cards, i, lim)) orelse return null;
+    defer parsed.deinit(alloc);
+    if (!parsed.entry.continued) return null;
+    return switch (parsed.entry.value) {
+        .string => |s| .{ .value = try alloc.dupe(u8, s), .consumed = parsed.entry.physical_count },
+        else => null,
     };
-    // Continues only if it ends with '&' AND a CONTINUE card follows; otherwise '&' is literal.
-    if (s0.len == 0 or s0[s0.len - 1] != '&') return null;
-    if (i + 1 >= cards.len or cards[i + 1].kind != .continuation) return null;
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try buf.appendSlice(alloc, s0[0 .. s0.len - 1]);
-    // NFR-SAFE-1: bound the assembled length against limits.Limits.max_string_value so a long
-    // run of CONTINUE cards cannot drive an unbounded allocation (DoS).
-    if (buf.items.len > max_len) return error.LimitExceeded;
-
-    var consumed: usize = 1;
-    var j = i + 1;
-    while (j < cards.len and cards[j].kind == .continuation) : (j += 1) {
-        const cv = value.parseValue(alloc, cards[j].valueField()) catch break;
-        defer cv.deinit(alloc);
-        const cs = switch (cv) {
-            .string => |s| s,
-            else => break,
-        };
-        consumed += 1;
-        const continues = cs.len > 0 and cs[cs.len - 1] == '&' and
-            (j + 1 < cards.len and cards[j + 1].kind == .continuation);
-        if (continues) {
-            try buf.appendSlice(alloc, cs[0 .. cs.len - 1]);
-            if (buf.items.len > max_len) return error.LimitExceeded;
-        } else {
-            // Last card: keep its text verbatim (a trailing '&' here is literal).
-            try buf.appendSlice(alloc, cs);
-            if (buf.items.len > max_len) return error.LimitExceeded;
-            break;
-        }
-    }
-    return .{ .value = try buf.toOwnedSlice(alloc), .consumed = consumed };
 }
 
 /// Split a string value into a primary card plus `CONTINUE` cards (FR-HDR-8). Short strings
@@ -171,7 +142,13 @@ pub fn endsWithSentinel(field: []const u8) bool {
                 i += 2;
                 continue;
             }
-            return last == '&'; // lone quote closes the string
+            // Astropy may split a doubled quote across cards. A lone quote followed by content
+            // (`'&'` at the end of one fragment) is content; only blanks then end/comment closes.
+            const rest = std.mem.trimStart(u8, field[i + 1 ..], " ");
+            if (rest.len == 0 or rest[0] == '/') return last == '&';
+            last = '\'';
+            i += 1;
+            continue;
         }
         if (c != ' ') last = c;
         i += 1;
@@ -247,9 +224,40 @@ test "orphaned CONTINUE is not a value start" {
     try testing.expect(a == null); // a CONTINUE card is commentary, not a value card
 }
 
+test "assemble ignores unrelated strings that exceed the requested run limit" {
+    const cards = [_]Card{
+        card80("TARGET  = 'ab&'"),
+        card80("CONTINUE  'cd'"),
+        card80("UNRELATE= 'this unrelated value is much longer than four bytes'"),
+        card80("END"),
+    };
+    const a = try assemble(testing.allocator, &cards, 0, 4);
+    try testing.expect(a != null);
+    defer testing.allocator.free(a.?.value);
+    try testing.expectEqualStrings("abcd", a.?.value);
+    try testing.expectEqual(@as(usize, 2), a.?.consumed);
+}
+
+test "assemble allocation is scoped to the requested run, not the header" {
+    var cards: [512]Card = undefined;
+    for (&cards) |*card| card.* = card80("FILLER  =                    1");
+    cards[0] = card80("TARGET  = 'ab&'");
+    cards[1] = card80("CONTINUE  'cd'");
+    cards[cards.len - 1] = card80("END");
+
+    // A whole-header snapshot needs tens of KiB for this header. The requested two-card run fits
+    // comfortably here, proving the assembly path's allocation does not scale with header size.
+    var backing: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const a = try assemble(fixed.allocator(), &cards, 0, 4);
+    try testing.expect(a != null);
+    try testing.expectEqualStrings("abcd", a.?.value);
+    try testing.expectEqual(@as(usize, 2), a.?.consumed);
+}
+
 test "split then assemble round-trips a long string" {
     const long = "The quick brown fox jumps over the lazy dog, and then continues running across " ++
-        "a very wide field for a considerable distance under a clear blue sky." ; // > 68 chars
+        "a very wide field for a considerable distance under a clear blue sky."; // > 68 chars
     const cards = try split(testing.allocator, "LONGKEY", long, "a comment");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2); // it was split

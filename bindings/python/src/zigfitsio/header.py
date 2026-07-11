@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
 
 _COMMENTARY = ("COMMENT", "HISTORY", "")
@@ -223,6 +224,11 @@ class Header:
         # texts (delete-all-by-name then re-append). Used by in-place commentary edits/deletes and
         # list replace-all, where a single append is not enough. None on read-only/detached headers.
         self._resync: Optional[Callable[[str, "list[Any]"], None]] = None
+        # One-call transactional persistence hook installed by an attached writable HDU. The
+        # payload is a sequence of small binding-neutral edit tuples assembled below.
+        self._batch_apply: Optional[Callable[[list[tuple], Optional[int]], Optional[int]]] = None
+        self._revision: Optional[int] = None
+        self._edit_ops: "list[tuple] | None" = None
         # Called after an edit that is NOT persisted to an open handle (read-only mode), so the
         # owning HDUList can flag itself dirty and reconstruct rather than copy stale bytes on save.
         self._dirty_cb: Optional[Callable[[], None]] = None
@@ -288,15 +294,19 @@ class Header:
         resolved_comment = comment if comment is not None else (self._cards[i].comment if i >= 0 else "")
         # Persist FIRST: a rejected edit (a structural keyword, or a read-only device) must not
         # leave a bogus card in the in-memory header, which would poison every later read.
-        if self._persist is not None:
-            self._persist(key, value, resolved_comment)
+        if self._edit_ops is not None:
+            self._edit_ops.append(("upsert", key, value, resolved_comment))
+        elif self._persist is not None:
+            revision = self._persist(key, value, resolved_comment)
+            if revision is not None:
+                self._revision = int(revision)
         if i >= 0:
             self._cards[i].value = value
             if comment is not None:
                 self._cards[i].comment = comment
         else:
             self._cards.append(_Card(key.upper(), value, comment or ""))
-        if self._persist is None and self._dirty_cb is not None:
+        if self._edit_ops is None and self._persist is None and self._dirty_cb is not None:
             self._dirty_cb()  # read-only edit → not in the handle's bytes; reconstruct on save
 
     def __delitem__(self, key: str) -> None:
@@ -315,10 +325,14 @@ class Header:
         i = self._find(key)
         if i < 0:
             raise KeyError(key)
-        if self._delete is not None:
-            self._delete(key)  # persist first; on failure the in-memory card is retained
+        if self._edit_ops is not None:
+            self._edit_ops.append(("delete_first", key))
+        elif self._delete is not None:
+            revision = self._delete(key)  # persist first; on failure the in-memory card is retained
+            if revision is not None:
+                self._revision = int(revision)
         del self._cards[i]
-        if self._delete is None and self._dirty_cb is not None:
+        if self._edit_ops is None and self._delete is None and self._dirty_cb is not None:
             self._dirty_cb()
 
     # ── commentary (COMMENT / HISTORY / blank) ────────────────────────────────────────────
@@ -345,20 +359,67 @@ class Header:
             value = value[0]  # (text, comment): keep the text, drop the meaningless comment
         for chunk in _wrap_commentary(value):
             # Persist FIRST so a rejected write leaves no bogus in-memory card (mirrors valued keys).
-            if self._persist is not None:
-                self._persist(keyword, chunk, None)
+            if self._edit_ops is not None:
+                self._edit_ops.append(("append_commentary", keyword, chunk))
+            elif self._persist is not None:
+                revision = self._persist(keyword, chunk, None)
+                if revision is not None:
+                    self._revision = int(revision)
             self._cards.append(_Card(keyword, chunk, "", commentary=True))
-        if self._persist is None and self._dirty_cb is not None:
+        if self._edit_ops is None and self._persist is None and self._dirty_cb is not None:
             self._dirty_cb()
 
     def _resync_keyword(self, keyword: str) -> None:
         """Push the current in-memory commentary cards of ``keyword`` to an attached writable handle
         (rewrite-all), or flag the list dirty so a read-only edit reconstructs on save."""
-        if self._resync is not None:
+        if self._edit_ops is not None:
             texts = [c.value for c in self._cards if c.commentary and c.keyword.upper() == keyword]
-            self._resync(keyword, texts)
+            self._edit_ops.append(("delete_all", keyword))
+            self._edit_ops.extend(("append_commentary", keyword, text) for text in texts)
+        elif self._resync is not None:
+            texts = [c.value for c in self._cards if c.commentary and c.keyword.upper() == keyword]
+            revision = self._resync(keyword, texts)
+            if revision is not None:
+                self._revision = int(revision)
         elif self._dirty_cb is not None:
             self._dirty_cb()
+
+    @contextmanager
+    def edit(self):
+        """Stage header mutations and persist them with one Zig validation/commit batch.
+
+        Outside this context, attached writable headers retain their eager persistence behavior.
+        If the body or commit raises, the Python card list is restored. Validation and revision
+        failures happen before disk mutation; device failures use best-effort disk rollback rather
+        than crash-safe journaling. Nested contexts share the outer transaction rather than creating
+        savepoints. Detached/read-only headers use the same local staging semantics and are marked
+        dirty once.
+        """
+
+        if self._edit_ops is not None:
+            yield self
+            return
+
+        backup = [
+            _Card(c.keyword, c.value, c.comment, commentary=c.commentary)
+            for c in self._cards
+        ]
+        self._edit_ops = []
+        try:
+            yield self
+            ops = self._edit_ops
+            if ops:
+                if self._batch_apply is not None:
+                    revision = self._batch_apply(ops, self._revision)
+                    if revision is not None:
+                        self._revision = int(revision)
+                elif self._dirty_cb is not None:
+                    self._dirty_cb()
+        except BaseException:
+            self._cards = backup
+            raise
+        finally:
+            self._edit_ops = None
 
     def add_comment(self, value: Any) -> None:
         """Append a COMMENT card (astropy-compatible). Long text spans multiple cards."""

@@ -2,8 +2,9 @@
  * A Map-like, ordered FITS `Header`, modeled on `astropy.io.fits.Header`
  * (direct port of the Python `header.py`).
  *
- * The header is parsed from raw 80-byte cards (read through the C ABI) into
- * an ordered list of records. Edits update the in-memory list and, when the
+ * Attached headers are decoded from the core's logical snapshot into an ordered list of records;
+ * the standalone `parseCard`/`parseCards` helpers retain raw-card parsing for callers that need it.
+ * Edits update the in-memory list and, when the
  * header is attached to a writable open file, are persisted immediately
  * through an injected `_persist` callback (persist-first: a rejected edit
  * must not leave a bogus card that would poison later reads).
@@ -24,6 +25,13 @@ export interface CardRec {
   commentary: boolean;
 }
 
+/** @internal Normalized mutations consumed by the attached-header V1 batch bridge. */
+export type HeaderMutation =
+  | { type: "upsert"; key: string; value: HeaderValue; comment: string | null }
+  | { type: "delete_first"; key: string }
+  | { type: "delete_all"; key: string }
+  | { type: "append_commentary"; key: string; value: HeaderValue };
+
 const card = (keyword: string, value: HeaderValue, comment = "", commentary = false): CardRec => ({
   keyword,
   value,
@@ -33,6 +41,17 @@ const card = (keyword: string, value: HeaderValue, comment = "", commentary = fa
 
 const COMMENTARY_KEYWORDS = new Set(["COMMENT", "HISTORY", ""]);
 const isCommentaryKey = (key: string): boolean => COMMENTARY_KEYWORDS.has(key.toUpperCase());
+
+function requireSynchronousResult<T>(result: T): T {
+  if (
+    result !== null &&
+    (typeof result === "object" || typeof result === "function") &&
+    typeof (result as { then?: unknown }).then === "function"
+  ) {
+    throw new TypeError("Header.transaction callback must be synchronous");
+  }
+  return result;
+}
 
 /**
  * Split commentary text into physical-card chunks of ≤72 chars (a COMMENT/HISTORY/blank card holds
@@ -257,6 +276,8 @@ export function parseCards(raws: readonly (Uint8Array | string)[]): CardRec[] {
 /** An ordered, case-insensitive collection of FITS keyword records. */
 export class Header implements Iterable<[string, HeaderValue]> {
   private _cards: CardRec[] = [];
+  private _transactionDepth = 0;
+  private _pendingMutations: HeaderMutation[] | null = null;
   /** @internal Persist-first write hook (attached writable headers). */
   _persist: ((key: string, value: HeaderValue, comment: string | null) => void) | null = null;
   /** @internal Persist-first delete hook. */
@@ -266,6 +287,8 @@ export class Header implements Iterable<[string, HeaderValue]> {
    * handle (delete-all-by-name then re-append). Null on read-only/detached headers.
    */
   _resync: ((keyword: string, texts: HeaderValue[]) => void) | null = null;
+  /** @internal Commit a transaction's normalized edits in one native call. */
+  _batchCommit: ((ops: readonly HeaderMutation[]) => void) | null = null;
   /**
    * @internal Called after an edit that is NOT persisted to an open handle
    * (read-only mode), so the owning HDUList can flag itself dirty and
@@ -278,6 +301,86 @@ export class Header implements Iterable<[string, HeaderValue]> {
     const h = new Header();
     h._cards = cards;
     return h;
+  }
+
+  /**
+   * Apply several header edits as one synchronous transaction.
+   *
+   * On an attached writable header, the callback's edits are staged in memory and committed by
+   * one native batch operation. Every thrown callback, validation failure, revision conflict, or
+   * device error restores the pre-transaction JS header; validation/conflict failures occur before
+   * disk mutation, while device failures use best-effort disk rollback (not crash-safe journaling).
+   * Outside this method, mutations keep their existing eager persist-first behavior. Nested
+   * transactions share the outer native commit while retaining a JS savepoint if the nested
+   * callback throws.
+   */
+  transaction<T>(callback: (header: Header) => T): T {
+    if (typeof callback !== "function") throw new TypeError("Header.transaction callback must be a function");
+
+    if (this._transactionDepth > 0) {
+      const before = this._cards.map((c) => ({ ...c }));
+      const pending = this._pendingMutations as HeaderMutation[];
+      const opCount = pending.length;
+      this._transactionDepth++;
+      try {
+        return requireSynchronousResult(callback(this));
+      } catch (e) {
+        this._cards = before;
+        pending.length = opCount;
+        throw e;
+      } finally {
+        this._transactionDepth--;
+      }
+    }
+
+    const before = this._cards.map((c) => ({ ...c }));
+    const mutations: HeaderMutation[] = [];
+    const savedPersist = this._persist;
+    const savedDelete = this._delete;
+    const savedResync = this._resync;
+    const savedDirty = this._dirtyCb;
+    const batchCommit = this._batchCommit;
+    const restoreHooks = (): void => {
+      this._persist = savedPersist;
+      this._delete = savedDelete;
+      this._resync = savedResync;
+      this._dirtyCb = savedDirty;
+    };
+
+    this._transactionDepth = 1;
+    this._pendingMutations = mutations;
+    // Install collectors even on detached/read-only headers. This suppresses per-edit dirty
+    // callbacks and gives those modes the same JS rollback semantics without attempting native I/O.
+    this._persist = (key, value, comment) => {
+      if (isCommentaryKey(key)) {
+        mutations.push({ type: "append_commentary", key: key.toUpperCase(), value });
+      } else {
+        mutations.push({ type: "upsert", key, value, comment });
+      }
+    };
+    this._delete = (key) => mutations.push({ type: "delete_first", key });
+    this._resync = (key, texts) => {
+      mutations.push({ type: "delete_all", key });
+      for (const value of texts) mutations.push({ type: "append_commentary", key, value });
+    };
+    this._dirtyCb = null;
+
+    try {
+      const result = requireSynchronousResult(callback(this));
+      restoreHooks();
+      if (mutations.length > 0) {
+        if (batchCommit !== null) batchCommit(mutations);
+        else if (savedDirty !== null) savedDirty();
+      }
+      return result;
+    } catch (e) {
+      this._cards = before;
+      restoreHooks();
+      throw e;
+    } finally {
+      this._pendingMutations = null;
+      this._transactionDepth = 0;
+    }
   }
 
   private _find(key: string): number {

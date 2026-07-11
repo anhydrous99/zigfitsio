@@ -293,6 +293,9 @@ export class HDUList implements Iterable<AnyHDU> {
       const hdu = this.hdus[i];
       hdu._hdulist = this;
       hdu._index = i + 1;
+      // The object now targets a newly-created/copied native HDU. Its former snapshot generation
+      // belongs to the displaced HDU; the first subsequent batch establishes the new generation.
+      hdu._headerRevision = null;
       if (serialized.has(i)) {
         // _writeTo serialized the CURRENT in-memory data: baseline it so step 2
         // doesn't re-write it (or, for a foreign table with a pending
@@ -315,6 +318,7 @@ export class HDUList implements Iterable<AnyHDU> {
         hdu._header._persist = (key, value, comment) => bound._writeKey(key, value, comment);
         hdu._header._delete = (key) => bound._deleteKey(key);
         hdu._header._resync = (keyword, texts) => bound._resyncCommentary(keyword, texts);
+        hdu._header._batchCommit = (ops) => bound._applyHeaderMutations(ops);
         hdu._header._dirtyCb = () => bound._markDirty();
       }
     }

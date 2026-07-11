@@ -196,6 +196,81 @@ describe("Header", () => {
     expect(h.has("BAD")).toBe(false);
     expect(h.get("SAFE")).toBe(1);
   });
+
+  test("transaction collects one batch and rolls back when the commit fails", () => {
+    const h = new Header();
+    h.set("KEEP", 1);
+    // Model an attached header: eager hooks must be replaced by collectors inside transaction().
+    h._persist = () => {
+      throw new Error("eager hook must not run inside a transaction");
+    };
+    h._delete = () => {
+      throw new Error("eager hook must not run inside a transaction");
+    };
+    h._resync = () => {
+      throw new Error("eager hook must not run inside a transaction");
+    };
+    let batches = 0;
+    h._batchCommit = (ops) => {
+      batches++;
+      expect(ops.map((op) => op.type)).toEqual(["upsert", "append_commentary", "delete_first"]);
+    };
+    const result = h.transaction((tx) => {
+      tx.set("NEW", "value", "comment");
+      tx.addHistory("step");
+      tx.delete("KEEP");
+      return 42;
+    });
+    expect(result).toBe(42);
+    expect(batches).toBe(1);
+    expect(h.get("NEW")).toBe("value");
+    expect(h.history).toEqual(["step"]);
+    expect(h.has("KEEP")).toBe(false);
+
+    h._batchCommit = () => {
+      throw new Error("native transaction rejected");
+    };
+    expect(() =>
+      h.transaction((tx) => {
+        tx.set("NEW", "changed");
+        tx.set("OTHER", 2);
+      }),
+    ).toThrow("native transaction rejected");
+    expect(h.get("NEW")).toBe("value");
+    expect(h.has("OTHER")).toBe(false);
+  });
+
+  test("nested transaction uses a savepoint and the outer callback commits once", () => {
+    const h = new Header();
+    const batches: string[][] = [];
+    h._batchCommit = (ops) => batches.push(ops.map((op) => op.type));
+    h.transaction((outer) => {
+      outer.set("A", 1);
+      try {
+        outer.transaction((inner) => {
+          inner.set("B", 2);
+          throw new Error("undo nested work");
+        });
+      } catch {
+        // The nested savepoint removes B and its queued op; outer work remains staged.
+      }
+      outer.set("C", 3);
+    });
+    expect(h.get("A")).toBe(1);
+    expect(h.has("B")).toBe(false);
+    expect(h.get("C")).toBe(3);
+    expect(batches).toEqual([["upsert", "upsert"]]);
+  });
+
+  test("transaction rejects async callbacks and rolls back synchronous work before the first await", () => {
+    const h = new Header();
+    expect(() =>
+      h.transaction(async (tx) => {
+        tx.set("NOTCOMMITTED", 1);
+      }),
+    ).toThrow("must be synchronous");
+    expect(h.has("NOTCOMMITTED")).toBe(false);
+  });
 });
 
 describe("commentary cards (BUGHUNT #6)", () => {

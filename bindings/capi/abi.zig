@@ -40,6 +40,10 @@ pub const Handle = struct {
     /// `ZfTable*` cannot use-after-free the freed `Fits`/`Hdu` it borrows. `zf_table_open` registers
     /// a view here; `zf_table_close` removes it.
     tables: std.ArrayList(*TableHandle) = .empty,
+    /// One revision-bound logical snapshot retained between the V1 capacity query and fill calls.
+    /// A handle is single-threaded by contract, so this removes the otherwise duplicate parse
+    /// without synchronization or exposing an owned pointer across the ABI.
+    header_snapshot: ?HeaderSnapshotCache = null,
 
     /// The current HDU, or `error.WrongHduType` when the file has no HDU yet (a freshly
     /// `create`d handle before the first `zf_create_img`/table builder). Mirrors the contract
@@ -48,6 +52,19 @@ pub const Handle = struct {
         if (self.fits.hdus.items.len == 0) return error.WrongHduType;
         return self.fits.current();
     }
+
+    pub fn clearHeaderSnapshot(self: *Handle) void {
+        if (self.header_snapshot) |*cache| cache.snapshot.deinit(gpa);
+        self.header_snapshot = null;
+    }
+};
+
+pub const HeaderSnapshotCache = struct {
+    hdu: *const fits.Hdu,
+    hdu_index: u64,
+    flags: u32,
+    revision: u64,
+    snapshot: fits.logical_header.Snapshot,
 };
 
 /// The object behind a `ZfTable*`: a parsed table view over a specific HDU plus the owning
@@ -101,6 +118,107 @@ pub const ZfColInfo = extern struct {
     tnull: i64 = 0,
     has_tnull: c_int = 0,
 };
+
+// ── Versioned logical-header snapshot / edit descriptors ─────────────────────────────────
+
+/// Capacity and generation information for the V1 logical-header snapshot ABI.
+pub const ZfHeaderSnapshotInfoV1 = extern struct {
+    revision: u64 = 0,
+    logical_count: u64 = 0,
+    physical_count: u64 = 0,
+    arena_bytes: u64 = 0,
+    raw_bytes: u64 = 0,
+    flags: u64 = 0,
+};
+
+/// One logical header record. Variable-width bytes are offsets into the caller-owned arena.
+pub const ZfHeaderEntryV1 = extern struct {
+    kind: u32 = 0,
+    value_type: u32 = 0,
+    flags: u32 = 0,
+    reserved: u32 = 0,
+    physical_first: u64 = 0,
+    physical_count: u64 = 0,
+    keyword_off: u64 = 0,
+    keyword_len: u64 = 0,
+    value_off: u64 = 0,
+    value_len: u64 = 0,
+    comment_off: u64 = 0,
+    comment_len: u64 = 0,
+    int_value: i64 = 0,
+    float_value: f64 = 0,
+};
+
+/// One staged header operation. All byte slices reference the input arena.
+pub const ZfHeaderOpV1 = extern struct {
+    opcode: u32 = 0,
+    value_type: u32 = 0,
+    flags: u32 = 0,
+    reserved: u32 = 0,
+    name_off: u64 = 0,
+    name_len: u64 = 0,
+    value_off: u64 = 0,
+    value_len: u64 = 0,
+    comment_off: u64 = 0,
+    comment_len: u64 = 0,
+    int_value: i64 = 0,
+    float_value: f64 = 0,
+    position: i64 = -1,
+};
+
+pub const ZfHeaderApplyOptsV1 = extern struct {
+    expected_revision: u64 = 0,
+    flags: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const ZfHeaderApplyResultV1 = extern struct {
+    new_revision: u64 = 0,
+    failed_op: u64 = std.math.maxInt(u64),
+    cards_before: u64 = 0,
+    cards_after: u64 = 0,
+};
+
+pub const header_snapshot_include_raw: u32 = 1 << 0;
+
+pub const HeaderEntryKind = enum(u32) {
+    value = 1,
+    commentary = 2,
+    blank = 3,
+    other = 4,
+};
+
+pub const HeaderValueType = enum(u32) {
+    none = 0,
+    undefined = 1,
+    logical = 2,
+    int64 = 3,
+    integer_text = 4,
+    float64 = 5,
+    string = 6,
+    raw_token = 7,
+};
+
+pub const header_entry_hierarch: u32 = 1 << 0;
+pub const header_entry_continued: u32 = 1 << 1;
+pub const header_entry_malformed: u32 = 1 << 2;
+
+pub const HeaderOpCode = enum(u32) {
+    upsert = 1,
+    delete_first = 2,
+    delete_all = 3,
+    rename = 4,
+    append_commentary = 5,
+    append_raw_run = 6,
+    insert_raw_run = 7,
+    reserve_blanks = 8,
+};
+
+pub const header_op_comment_present: u32 = 1 << 0;
+pub const header_op_strict: u32 = 1 << 1;
+pub const header_op_force_hierarch: u32 = 1 << 2;
+pub const header_apply_check_revision: u32 = 1 << 0;
+pub const header_apply_allow_structural: u32 = 1 << 1;
 
 // ── Thread-local last error ──────────────────────────────────────────────────────────────────
 

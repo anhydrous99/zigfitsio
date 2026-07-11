@@ -91,6 +91,83 @@ describe("headers", () => {
       hdul.close();
     }
   });
+
+  test("Header.transaction commits standard, HIERARCH, commentary, and delete edits in one native call", () => {
+    const p = tmp.path();
+    const seed = new zf.Header();
+    seed.set("REMOVE", 1);
+    new zf.HDUList([new zf.PrimaryHDU({ header: seed })]).writeTo(p);
+    const long = "quote ' and ampersand & ".repeat(8) + "END";
+    const hdul = zf.open(p, "update");
+    const originalApply = ll.native.fn.zf_header_apply_v1;
+    let applyCalls = 0;
+    ll.native.fn.zf_header_apply_v1 = (...args) => {
+      applyCalls++;
+      return originalApply(...args);
+    };
+    try {
+      const hdr = hdul.get(0).header;
+      hdr.transaction((tx) => {
+        tx.set("OBSERVER", "Hubble", "who");
+        tx.set("ESO DET LONG VALUE", long, "hierarch comment");
+        tx.addComment("batch commentary");
+        tx.delete("REMOVE");
+      });
+      expect(applyCalls).toBe(1);
+      expect(hdr.get("ESO DET LONG VALUE")).toBe(long);
+      expect(hdr.has("REMOVE")).toBe(false);
+    } finally {
+      ll.native.fn.zf_header_apply_v1 = originalApply;
+      hdul.close();
+    }
+    const reopened = zf.open(p);
+    try {
+      const hdr = reopened.get(0).header;
+      expect(hdr.get("OBSERVER")).toBe("Hubble");
+      expect(hdr.commentOf("OBSERVER")).toBe("who");
+      expect(hdr.get("ESO DET LONG VALUE")).toBe(long);
+      expect(hdr.commentOf("ESO DET LONG VALUE")).toBe("hierarch comment");
+      expect(hdr.comments).toContain("batch commentary");
+      expect(hdr.has("REMOVE")).toBe(false);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test("Header.transaction is atomic on callback and native validation failures", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(4), [2, 2]));
+    const hdul = zf.open(p, "update");
+    try {
+      const hdr = hdul.get(0).header;
+      expect(() =>
+        hdr.transaction((tx) => {
+          tx.set("CALLBACK", 1);
+          throw new Error("stop");
+        }),
+      ).toThrow("stop");
+      expect(hdr.has("CALLBACK")).toBe(false);
+
+      expect(() =>
+        hdr.transaction((tx) => {
+          tx.set("VALID", 1);
+          tx.set("BITPIX", 16);
+        }),
+      ).toThrow(zf.FitsHeaderError);
+      expect(hdr.has("VALID")).toBe(false);
+      expect(hdr.get("BITPIX")).toBe(-32);
+    } finally {
+      hdul.close();
+    }
+    const reopened = zf.open(p);
+    try {
+      expect(reopened.get(0).header.has("CALLBACK")).toBe(false);
+      expect(reopened.get(0).header.has("VALID")).toBe(false);
+      expect(reopened.get(0).header.get("BITPIX")).toBe(-32);
+    } finally {
+      reopened.close();
+    }
+  });
 });
 
 describe("tables", () => {
