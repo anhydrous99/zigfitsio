@@ -58,12 +58,18 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path conversion-diagnostics | Out-Null
-          zig test src/convert.zig `
-            --test-filter "Windows regression: f16-to-i128 runtime round-trip preserves 1024" `
-            --test-no-exec `
-            -femit-bin=conversion-diagnostics/convert-regression.exe `
-            -femit-asm=conversion-diagnostics/convert-regression.s `
-            -femit-llvm-ir=conversion-diagnostics/convert-regression.ll
+          $zigArgs = @(
+            'test'
+            'src/convert.zig'
+            '--test-filter'
+            'Windows regression: f16-to-i128 runtime round-trip preserves 1024'
+            '--test-no-exec'
+            '-femit-bin=conversion-diagnostics\convert-regression.exe'
+            '-femit-asm=conversion-diagnostics\convert-regression.s'
+            '-femit-llvm-ir=conversion-diagnostics\convert-regression.ll'
+          )
+          & zig @zigArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run focused numeric-conversion regression
         if: matrix.os == 'windows'
         shell: pwsh
