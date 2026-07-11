@@ -88,6 +88,7 @@ pub const Hdu = struct {
         return self;
     }
 
+    /// Release the parsed axis list and header owned by this HDU.
     pub fn deinit(self: *Hdu, alloc: Allocator) void {
         alloc.free(self.axes);
         self.header.deinit(alloc);

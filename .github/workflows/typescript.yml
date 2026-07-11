@@ -22,7 +22,9 @@ on:
       - "src/**"
       - "build.zig"
       - "build.zig.zon"
+      - "tools/wiki/**"
       - ".github/workflows/typescript.yml"
+      - ".github/workflows/publish-wiki.yml"
   workflow_dispatch:
     inputs:
       publish_dry_run:
@@ -65,6 +67,47 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match bindings/typescript/package.json $pkg"
             exit 1
           fi
+
+  # The Python workflow runs this check on every PR/main push. Repeat it on tag/dispatch runs so
+  # npm publication is independently gated on all three generated API references.
+  api-docs:
+    name: generated API Wiki bundle (release gate)
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: bindings/typescript/package-lock.json
+      - run: npm ci
+        working-directory: bindings/typescript
+      - name: Test Wiki generators and publication guards
+        run: |
+          python3 -m unittest discover -s tools/wiki -p 'test_*.py' -v
+          python3 -m pip install pytest==8.3.5
+          python3 -m pytest tools/wiki/tests -q
+          npm run test:docs --prefix bindings/typescript
+          zig build wiki-zig-test
+      - name: Generate and validate all public API references
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./bindings/typescript/package.json").version')"
+          tag="v${version}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tag="$GITHUB_REF_NAME"; fi
+          python3 tools/wiki/generate.py \
+            --out "$RUNNER_TEMP/wiki" --tag "$tag" --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
 
   # `zig build wasm` is hard-coded ReleaseSmall and byte-identical on every host, so build the
   # module once and share it via artifact instead of installing Zig and compiling in all six
@@ -178,7 +221,7 @@ jobs:
   publish-rehearsal:
     name: npm publish rehearsal (--dry-run)
     if: github.event_name == 'workflow_dispatch' && inputs.publish_dry_run
-    needs: [version-check, test, interop]
+    needs: [version-check, api-docs, test, interop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -199,7 +242,7 @@ jobs:
     name: publish to npm
     # Strictly tag pushes: a workflow_dispatch run pointed at a tag ref must NOT publish here.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version-check, test, interop]
+    needs: [version-check, api-docs, test, interop]
     runs-on: ubuntu-latest
     environment:
       name: npm

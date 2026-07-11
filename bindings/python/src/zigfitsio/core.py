@@ -571,6 +571,8 @@ class ImageHDU(_HDU):
 
     @property
     def data(self):
+        """The lazily loaded image as a native-endian NumPy array, or ``None``."""
+
         if self._data is _UNSET:
             if self._hdulist is None:
                 return None
@@ -592,6 +594,8 @@ class ImageHDU(_HDU):
 
     @property
     def shape(self):
+        """The image array shape, or ``None`` for an empty HDU."""
+
         d = self.data
         return None if d is None else d.shape
 
@@ -646,6 +650,8 @@ class ImageHDU(_HDU):
 
     # ── WCS celestial transforms (1-based pixel coords, FITS CRPIX convention) ────────────
     def pix2world(self, x: float, y: float, alt: str = " "):
+        """Convert one-based FITS pixel coordinates to celestial longitude and latitude."""
+
         h = self._select()
         lon = c.c_double()
         lat = c.c_double()
@@ -653,6 +659,8 @@ class ImageHDU(_HDU):
         return lon.value, lat.value
 
     def world2pix(self, lon: float, lat: float, alt: str = " "):
+        """Convert celestial longitude and latitude to one-based FITS pixel coordinates."""
+
         h = self._select()
         px = c.c_double()
         py = c.c_double()
@@ -786,6 +794,8 @@ class ImageHDU(_HDU):
 
 
 class PrimaryHDU(ImageHDU):
+    """The primary image HDU at the start of a FITS file."""
+
     _kind_name = "PrimaryHDU"
 
 
@@ -877,6 +887,8 @@ class _TableHDU(_HDU):
 
     @property
     def data(self):
+        """The lazily loaded table as a NumPy structured array, or ``None``."""
+
         if self._data is _UNSET:
             if self._hdulist is None:
                 return None
@@ -978,6 +990,8 @@ class _TableHDU(_HDU):
 
     @property
     def columns(self):
+        """Return the table's column names or detached :class:`Column` specifications."""
+
         return self._read_columns_meta() if self._hdulist is not None else self._columns
 
     def _read_columns_meta(self):
@@ -1310,6 +1324,8 @@ class _TableHDU(_HDU):
 
     @classmethod
     def from_columns(cls, columns: Sequence[Column], nrows: int | None = None, name: str | None = None):
+        """Build a detached table HDU from :class:`Column` specifications."""
+
         columns = list(columns)
         _assert_unique_column_names([col.name for col in columns])
         hdu = cls(name=name)
@@ -1327,11 +1343,15 @@ class _TableHDU(_HDU):
 
 
 class BinTableHDU(_TableHDU):
+    """A FITS binary-table HDU with NumPy structured-array data."""
+
     _table_type = ll.BINARY_TBL
     _kind_name = "BinTableHDU"
 
 
 class AsciiTableHDU(_TableHDU):
+    """A FITS ASCII-table HDU with NumPy structured-array data."""
+
     _table_type = ll.ASCII_TBL
     _kind_name = "AsciiTableHDU"
 
@@ -1391,6 +1411,8 @@ class HDUList(list):
 
     # ── access ────────────────────────────────────────────────────────────────────────────
     def __getitem__(self, key):
+        """Select an HDU by integer/slice or by case-insensitive extension name."""
+
         if isinstance(key, str):
             for hdu in self:
                 if hdu.name.upper() == key.upper():
@@ -1399,6 +1421,8 @@ class HDUList(list):
         return super().__getitem__(key)
 
     def info(self):
+        """Return a compact, one-line-per-HDU summary."""
+
         rows = []
         for i, hdu in enumerate(self):
             rows.append(f"{i:>3}  {hdu.name:<12}  {type(hdu).__name__}")
@@ -1406,6 +1430,8 @@ class HDUList(list):
 
     # ── lifecycle ─────────────────────────────────────────────────────────────────────────
     def flush(self):
+        """Persist pending changes to an attached writable FITS file."""
+
         if self._handle is None:
             return
         if self._mode != ll.READONLY:
@@ -1551,6 +1577,8 @@ class HDUList(list):
         return buf.raw[: got.value]
 
     def close(self):
+        """Flush writable changes and release the underlying FITS handle."""
+
         if self._handle is None:
             return
         # Persist pending edits before closing (astropy flushes on close in update mode); always
@@ -1563,9 +1591,13 @@ class HDUList(list):
             self._handle = None
 
     def __enter__(self):
+        """Return this open HDU list for use as a context manager."""
+
         return self
 
     def __exit__(self, *exc):
+        """Close the file handle when leaving a context-manager block."""
+
         self.close()
         return False
 
@@ -1577,6 +1609,8 @@ class HDUList(list):
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
     def writeto(self, path, overwrite: bool = False, checksum: bool = False):
+        """Write the HDU sequence atomically to ``path``."""
+
         path = os.fspath(path)
         if os.path.exists(path) and not overwrite:
             raise OSError(f"file exists: {path} (use overwrite=True)")
@@ -1677,11 +1711,15 @@ def from_bytes(data: bytes, mode: str = "readonly") -> HDUList:
 
 
 def getheader(path: str, ext: int = 0) -> Header:
+    """Read and return the header for extension ``ext``."""
+
     with open(path) as hdul:
         return hdul[ext].header
 
 
 def getdata(path: str, ext: int = 0, header: bool = False):
+    """Read extension data, optionally returning ``(data, header)``."""
+
     with open(path) as hdul:
         hdu = hdul[ext]
         # astropy convention: an empty primary (ext 0) falls through to the first HDU with data.
@@ -1697,11 +1735,15 @@ def getdata(path: str, ext: int = 0, header: bool = False):
 
 
 def getval(path: str, keyword: str, ext: int = 0):
+    """Read one header keyword value from extension ``ext``."""
+
     with open(path) as hdul:
         return hdul[ext].header[keyword]
 
 
 def writeto(path: str, data, header: Header | None = None, overwrite: bool = False, checksum: bool = False):
+    """Write ``data`` and an optional header as a primary HDU."""
+
     HDUList([PrimaryHDU(data=data, header=header)]).writeto(path, overwrite=overwrite, checksum=checksum)
 
 
@@ -1717,6 +1759,8 @@ class Finding:
         self.message = message
 
     def __repr__(self):
+        """Return a compact diagnostic representation of this validation finding."""
+
         kw = f" {self.keyword}" if self.keyword else ""
         return f"<{self.severity} HDU {self.hdu}{kw}: {self.message}>"
 

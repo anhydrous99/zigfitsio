@@ -58,6 +58,7 @@ pub const BlockReader = struct {
         return .{ .dev = dev, .alloc = allocator, .window = window };
     }
 
+    /// Release the block-aligned read window allocated by `init`.
     pub fn deinit(self: *BlockReader) void {
         self.alloc.free(self.window);
     }
@@ -119,6 +120,7 @@ pub const BlockWriter = struct {
         return .{ .dev = dev, .alloc = allocator, .buf = buf, .base = start_off };
     }
 
+    /// Release the staging buffer allocated by `init`.
     pub fn deinit(self: *BlockWriter) void {
         self.alloc.free(self.buf);
     }
