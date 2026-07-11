@@ -27,8 +27,9 @@
 //!
 //! Because `binary.zig`'s `BinTable` is read-only for VLA columns, the write side lives here
 //! as free functions that operate on a `*BinTable` plus raw `fits.dev` access (all new code in
-//! this file). A `HeapManager` created from an *empty* table (`initForTable`) and used for all
-//! writes keeps its accounting consistent with the on-disk descriptors.
+//! this file). `HeapManager.initForTable` reconstructs allocator state from every live VLA
+//! descriptor (or starts at zero for a freshly reserved empty heap); routing subsequent writes
+//! through that manager keeps its accounting consistent with the on-disk descriptors.
 const std = @import("std");
 const errors = @import("../errors.zig");
 const convert = @import("../convert.zig");
@@ -102,6 +103,11 @@ pub const Extent = struct {
     len: u64,
 };
 
+fn lessThanExtent(_: void, a: Extent, b: Extent) bool {
+    if (a.off != b.off) return a.off < b.off;
+    return a.len < b.len;
+}
+
 /// Resolved heap geometry for a table (§14.2). All offsets are absolute file offsets except
 /// `theap`/`gap`/`heap_size`, which are relative byte counts.
 pub const HeapGeometry = struct {
@@ -129,12 +135,27 @@ pub const DescriptorError = errors.TableError || errors.IoError || errors.LimitE
 pub const ReadError = errors.TableError || errors.IoError || errors.ConvError ||
     errors.LimitError || Allocator.Error;
 
+/// Errors from measuring a packed VLA column range. Layout measurement performs no value
+/// conversion and no allocation: it validates descriptors and reports scalar-slot offsets.
+pub const LayoutError = errors.TableError || errors.IoError || errors.LimitError;
+
+/// Errors from reading a packed VLA column range into caller-owned storage. Unlike
+/// `ReadError`, this operation does not allocate.
+pub const ReadIntoError = errors.TableError || errors.IoError || errors.ConvError ||
+    errors.LimitError;
+
 /// Errors from `writeVlaCell` / `freeVlaCell`.
 pub const WriteError = errors.TableError || errors.IoError || errors.ConvError ||
     errors.LimitError || Allocator.Error;
 
 /// Errors from `HeapManager.compact`.
 pub const CompactError = errors.TableError || errors.IoError || errors.LimitError ||
+    Allocator.Error;
+
+/// Errors from seeding a `HeapManager` from an existing table heap. Initialization validates and
+/// reads every live VLA descriptor and temporarily allocates an extent list to establish a safe,
+/// non-overlapping high-water mark.
+pub const ManagerInitError = errors.TableError || errors.IoError || errors.LimitError ||
     Allocator.Error;
 
 const SCRATCH_BYTES: usize = 8192;
@@ -184,9 +205,15 @@ fn slotCount(elem: BinaryType, len: u64) errors.LimitError!u64 {
 // otherwise (the complex per-element sizes 8/16 already cover the real+imaginary pair).
 fn byteLen(elem: BinaryType, len: u64) errors.LimitError!u64 {
     return switch (elem) {
-        .bit => (len + 7) / 8,
+        .bit => (try limits.add(len, 7)) / 8,
         else => limits.mul(len, elem.elemBytes()),
     };
+}
+
+fn validateRowRange(table: *const BinTable, first_row: u64, nrows: u64) errors.TableError!void {
+    // Express the check as a subtraction so `first_row + nrows` can never overflow.
+    if (first_row > table.naxis2) return error.RowOutOfRange;
+    if (nrows > table.naxis2 - first_row) return error.RowOutOfRange;
 }
 
 // ── descriptors ──────────────────────────────────────────────────────────────────────────
@@ -199,7 +226,7 @@ fn descAbsOffset(table: *const BinTable, column: *const Column, row: u64) Descri
     return limits.add(base, column.byte_offset);
 }
 
-fn readDescAt(table: *BinTable, column: *const Column, row: u64) DescriptorError!Descriptor {
+fn readDescAt(table: *const BinTable, column: *const Column, row: u64) DescriptorError!Descriptor {
     const off = try descAbsOffset(table, column, row);
     var buf: [16]u8 = undefined;
     switch (column.tform.type) {
@@ -253,6 +280,56 @@ pub fn setDescriptor(table: *BinTable, col: ColumnRef, row: u64, desc: Descripto
 
 // ── reading ──────────────────────────────────────────────────────────────────────────────
 
+const CellPlan = struct {
+    /// Logical FITS elements (complex values count once here).
+    len: u64,
+    /// Caller-visible scalar slots (complex values count twice here).
+    slots: u64,
+    /// Stored payload bytes.
+    bytes: u64,
+    /// Absolute payload offset. Null for an empty cell, whose descriptor offset is undefined.
+    abs: ?u64,
+};
+
+/// Validate one already-read descriptor and resolve its payload. `dev_size` is populated lazily
+/// so an all-empty range does not query the device merely to validate undefined offsets. Keeping
+/// this logic shared is important: legacy cell reads and packed reads must accept and reject the
+/// exact same descriptors.
+fn planDescriptor(
+    table: *const BinTable,
+    spec: VlaSpec,
+    desc: Descriptor,
+    geom: *const HeapGeometry,
+    dev_size: *?u64,
+) LayoutError!CellPlan {
+    if (desc.len < 0) return error.BadDescriptor;
+
+    // FITS §7.3.5: when len is zero, off is undefined. In particular, do not reject a
+    // negative or out-of-heap offset and do not perform arithmetic with it.
+    if (desc.len == 0) return .{ .len = 0, .slots = 0, .bytes = 0, .abs = null };
+    if (desc.off < 0) return error.BadDescriptor;
+
+    const len: u64 = @intCast(desc.len);
+    const off: u64 = @intCast(desc.off);
+    const bytes = try byteLen(spec.elem, len);
+    const slots = try slotCount(spec.elem, len);
+
+    // Validate configured per-cell limits before a caller allocates the packed output.
+    try limits.ensureWithin(len, table.fits.limits.max_vla_elems, null);
+    try limits.ensureWithin(bytes, table.fits.limits.max_heap_bytes, null);
+
+    // A forged descriptor is structural corruption, even when its arithmetic alone overflowed.
+    const heap_end = std.math.add(u64, off, bytes) catch return error.BadDescriptor;
+    if (heap_end > geom.heap_size) return error.BadDescriptor;
+    const abs = std.math.add(u64, geom.heap_abs_off, off) catch return error.BadDescriptor;
+    const abs_end = std.math.add(u64, abs, bytes) catch return error.BadDescriptor;
+    if (abs_end > geom.data_abs_end) return error.BadDescriptor;
+    if (dev_size.* == null) dev_size.* = try table.fits.dev.getSize();
+    if (abs_end > dev_size.*.?) return error.BadDescriptor;
+
+    return .{ .len = len, .slots = slots, .bytes = bytes, .abs = abs };
+}
+
 /// Read the variable-length array at (`row`, `col`) into a freshly allocated, owned `[]T`
 /// (caller frees with `alloc`). The descriptor is followed into the heap and every value is
 /// converted to `T` with `TSCALn`/`TZEROn` scaling applied under the bulk policy, exactly as
@@ -267,41 +344,67 @@ pub fn readVlaCell(alloc: Allocator, table: *BinTable, col: ColumnRef, row: u64,
     const column = &table.columns[try table.resolve(col)];
     const spec = try VlaSpec.of(column);
     const desc = try readDescAt(table, column, row);
-    if (desc.len < 0) return error.BadDescriptor;
-
-    // Resolve the (table-level, structural) heap geometry first so a bad THEAP/PCOUNT surfaces
-    // for every read, even a zero-length one.
     const geom = try heapGeometry(table);
-
-    // §7.3.5: when the element count is zero the byte offset is undefined, so a zero-length cell
-    // short-circuits to an empty slice BEFORE the offset is validated — a garbage (out of range
-    // or negative) offset on a zero-length cell is legal and must not be rejected.
-    if (desc.len == 0) return alloc.alloc(T, 0);
-    if (desc.off < 0) return error.BadDescriptor;
-    const len: u64 = @intCast(desc.len);
-    const off: u64 = @intCast(desc.off);
-
-    const bytes = try byteLen(spec.elem, len);
-
-    // Validate against the configured limits BEFORE allocating (NFR-SAFE-1).
-    try limits.ensureWithin(len, table.fits.limits.max_vla_elems, null);
-    try limits.ensureWithin(bytes, table.fits.limits.max_heap_bytes, null);
-
-    // Bounds-check the payload against the heap size, the data unit, and the device length.
-    const heap_end = std.math.add(u64, off, bytes) catch return error.BadDescriptor;
-    if (heap_end > geom.heap_size) return error.BadDescriptor;
-    const abs = geom.heap_abs_off + off;
-    const abs_end = abs + bytes;
-    if (abs_end > geom.data_abs_end) return error.BadDescriptor;
-    const dev_size = try table.fits.dev.getSize();
-    if (abs_end > dev_size) return error.BadDescriptor;
-
-    const slots = try slotCount(spec.elem, len);
-    const n: usize = std.math.cast(usize, slots) orelse return error.LimitExceeded;
+    var dev_size: ?u64 = null;
+    const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+    const n: usize = std.math.cast(usize, plan.slots) orelse return error.LimitExceeded;
     const out = try alloc.alloc(T, n);
     errdefer alloc.free(out);
-    try fillFromHeap(T, table.fits.dev, abs, spec.elem, out, column);
+    if (n != 0) try fillFromHeap(T, table.fits.dev, plan.abs.?, spec.elem, out, column);
     return out;
+}
+
+/// Fill `offsets` with scalar-slot prefix sums for `offsets.len - 1` consecutive rows.
+/// Complex values occupy two slots; empty rows repeat the prior offset. Rows are 0-based.
+pub fn vlaColumnLayout(table: *BinTable, col: ColumnRef, first_row: u64, offsets: []u64) LayoutError!u64 {
+    if (offsets.len == 0) return error.CellOutOfRange;
+    const nrows: u64 = std.math.cast(u64, offsets.len - 1) orelse return error.LimitExceeded;
+    try validateRowRange(table, first_row, nrows);
+    const column = &table.columns[try table.resolve(col)];
+    const spec = try VlaSpec.of(column);
+    const geom = try heapGeometry(table);
+    var dev_size: ?u64 = null;
+    var total: u64 = 0;
+    offsets[0] = 0;
+    for (0..offsets.len - 1) |i| {
+        const row = first_row + @as(u64, @intCast(i));
+        const desc = try readDescAt(table, column, row);
+        const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+        total = try limits.add(total, plan.slots);
+        offsets[i + 1] = total;
+    }
+    return total;
+}
+
+/// Read `nrows` consecutive VLA cells into one exactly-sized flat caller buffer without any
+/// per-cell allocation. Descriptors are revalidated while reading; a grown descriptor can never
+/// write beyond `out`, though preceding cells may already have been filled on failure.
+pub fn readVlaColumnInto(
+    comptime T: type,
+    table: *BinTable,
+    col: ColumnRef,
+    first_row: u64,
+    nrows: u64,
+    out: []T,
+) ReadIntoError!void {
+    try validateRowRange(table, first_row, nrows);
+    const column = &table.columns[try table.resolve(col)];
+    const spec = try VlaSpec.of(column);
+    const geom = try heapGeometry(table);
+    var dev_size: ?u64 = null;
+    var cursor: usize = 0;
+    var row_delta: u64 = 0;
+    while (row_delta < nrows) : (row_delta += 1) {
+        const desc = try readDescAt(table, column, first_row + row_delta);
+        const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+        const slots: usize = std.math.cast(usize, plan.slots) orelse return error.LimitExceeded;
+        if (slots > out.len - cursor) return error.CellOutOfRange;
+        if (slots != 0) {
+            try fillFromHeap(T, table.fits.dev, plan.abs.?, spec.elem, out[cursor..][0..slots], column);
+        }
+        cursor += slots;
+    }
+    if (cursor != out.len) return error.CellOutOfRange;
 }
 
 fn fillFromHeap(comptime T: type, dev: Device, abs: u64, elem: BinaryType, out: []T, column: *const Column) (errors.IoError || errors.ConvError)!void {
@@ -368,6 +471,200 @@ pub fn writeVlaCell(alloc: Allocator, table: *BinTable, mgr: *HeapManager, col: 
     try writeDescAt(table, column, row, .{ .len = @intCast(len), .off = @intCast(heap_off) });
 }
 
+const PackedWritePlan = struct {
+    row: u64,
+    len: u64,
+    bytes: u64,
+    old_desc: Descriptor,
+    release_old: bool,
+    heap_off: u64,
+    abs: ?u64,
+};
+
+const OldExtentRef = struct {
+    extent: Extent,
+    plan_index: usize,
+};
+
+fn lessThanOldExtent(_: void, a: OldExtentRef, b: OldExtentRef) bool {
+    return lessThanExtent({}, a.extent, b.extent);
+}
+
+fn descriptorExtent(d: Descriptor, elem: BinaryType, geom: *const HeapGeometry) ?Extent {
+    if (d.len <= 0 or d.off < 0) return null;
+    const len: u64 = @intCast(d.len);
+    const off: u64 = @intCast(d.off);
+    const bytes = byteLen(elem, len) catch return null;
+    const end = std.math.add(u64, off, bytes) catch return null;
+    if (end > geom.heap_size) return null;
+    return .{ .off = off, .len = bytes };
+}
+
+fn validateStoredValues(comptime Stored: type, comptime T: type, in: []const T, column: *const Column) errors.ConvError!void {
+    for (in) |value| _ = try convertToStored(Stored, T, value, column);
+}
+
+// Perform every deterministic conversion before a packed write starts mutating the heap. The
+// actual transfer repeats these conversions into its bounded scratch buffer, but cannot then
+// discover a data-dependent conversion error after earlier rows were committed.
+fn validateWriteValues(comptime T: type, elem: BinaryType, in: []const T, column: *const Column) errors.ConvError!void {
+    switch (elem) {
+        .logical, .bit => {}, // numeric truth testing is total
+        .char => if (T != u8) {
+            for (in) |value| _ = try convert.cast(u8, value, .bulk);
+        },
+        .byte => try validateStoredValues(u8, T, in, column),
+        .int16 => try validateStoredValues(i16, T, in, column),
+        .int32 => try validateStoredValues(i32, T, in, column),
+        .int64 => try validateStoredValues(i64, T, in, column),
+        .float32 => try validateStoredValues(f32, T, in, column),
+        .float64 => try validateStoredValues(f64, T, in, column),
+        .complex32 => try validateStoredValues(f32, T, in, column),
+        .complex64 => try validateStoredValues(f64, T, in, column),
+        .vla32, .vla64 => unreachable,
+    }
+}
+
+fn descriptorValueFits(width: Width, value: u64) bool {
+    return switch (width) {
+        .p32 => value <= std.math.maxInt(i32),
+        .q64 => value <= std.math.maxInt(i64),
+    };
+}
+
+/// Write `offsets.len - 1` consecutive VLA cells from one flat scalar buffer. Offsets are
+/// zero-based scalar-slot prefix sums and must start at zero, be monotonic, and end at `in.len`.
+/// Complex row spans must be even. Rows are 0-based.
+///
+/// All row/offset/limit/descriptor-width/conversion checks and a trial run of heap allocation are
+/// completed before the first device write. Device failures retain the legacy non-transactional
+/// behavior, but deterministic validation failures leave the file and logical manager state
+/// unchanged.
+pub fn writeVlaColumn(
+    comptime T: type,
+    alloc: Allocator,
+    table: *BinTable,
+    mgr: *HeapManager,
+    col: ColumnRef,
+    first_row: u64,
+    offsets: []const u64,
+    in: []const T,
+) WriteError!void {
+    if (table.fits.mode == .read_only or !table.fits.dev.isWritable()) return error.NotWritable;
+    if (offsets.len == 0) return error.CellOutOfRange;
+    const input_len: u64 = std.math.cast(u64, in.len) orelse return error.LimitExceeded;
+    if (offsets[0] != 0 or offsets[offsets.len - 1] != input_len) return error.CellOutOfRange;
+    for (offsets[1..], offsets[0 .. offsets.len - 1]) |next, prev| {
+        if (next < prev) return error.CellOutOfRange;
+    }
+
+    const nrows: u64 = std.math.cast(u64, offsets.len - 1) orelse return error.LimitExceeded;
+    try validateRowRange(table, first_row, nrows);
+    const column = &table.columns[try table.resolve(col)];
+    const spec = try VlaSpec.of(column);
+    const geom = try heapGeometry(table);
+
+    const plans = try alloc.alloc(PackedWritePlan, offsets.len - 1);
+    defer alloc.free(plans);
+    const old_extents = try alloc.alloc(OldExtentRef, plans.len);
+    defer alloc.free(old_extents);
+    var old_extent_count: usize = 0;
+
+    for (plans, 0..) |*plan, i| {
+        const span = offsets[i + 1] - offsets[i];
+        const len: u64 = switch (spec.elem) {
+            .complex32, .complex64 => blk: {
+                if (span % 2 != 0) return error.CellOutOfRange;
+                break :blk span / 2;
+            },
+            else => span,
+        };
+        try limits.ensureWithin(len, table.fits.limits.max_vla_elems, null);
+        const bytes = try byteLen(spec.elem, len);
+        try limits.ensureWithin(bytes, table.fits.limits.max_heap_bytes, null);
+        if (!descriptorValueFits(spec.width, len)) return error.BadDescriptor;
+
+        const row = first_row + @as(u64, @intCast(i));
+        const old_desc = try readDescAt(table, column, row);
+        plan.* = .{
+            .row = row,
+            .len = len,
+            .bytes = bytes,
+            .old_desc = old_desc,
+            .release_old = true,
+            .heap_off = 0,
+            .abs = null,
+        };
+        if (descriptorExtent(old_desc, spec.elem, &geom)) |extent| {
+            old_extents[old_extent_count] = .{ .extent = extent, .plan_index = i };
+            old_extent_count += 1;
+        }
+    }
+
+    // All old target extents are released before any replacement is allocated. Exact aliases
+    // among target rows are released once; partially overlapping target descriptors are corrupt
+    // and rejected before either the manager or device is touched.
+    std.mem.sort(OldExtentRef, old_extents[0..old_extent_count], {}, lessThanOldExtent);
+    if (old_extent_count > 1) {
+        for (old_extents[1..old_extent_count], old_extents[0 .. old_extent_count - 1]) |next, prev| {
+            const prev_end = std.math.add(u64, prev.extent.off, prev.extent.len) catch return error.BadDescriptor;
+            if (next.extent.off >= prev_end) continue;
+            if (next.extent.off == prev.extent.off and next.extent.len == prev.extent.len) {
+                plans[next.plan_index].release_old = false;
+            } else {
+                return error.BadDescriptor;
+            }
+        }
+    }
+
+    // Clone the manager, release the complete target range, then simulate replacement
+    // allocations in row order. This prevents a bump allocation from overlapping an earlier
+    // replacement when the manager was seeded from a populated heap.
+    var trial = HeapManager.init(mgr.capacity);
+    defer trial.deinit(alloc);
+    trial.top = mgr.top;
+    try trial.free_list.appendSlice(alloc, mgr.free_list.items);
+    for (plans) |plan| {
+        if (plan.release_old) try releaseDescriptorExtent(alloc, &trial, plan.old_desc, spec.elem, &geom);
+    }
+    for (plans) |*plan| {
+        if (plan.len == 0) continue;
+        plan.heap_off = try trial.alloc(plan.bytes);
+        const heap_end = std.math.add(u64, plan.heap_off, plan.bytes) catch return error.HeapOverflow;
+        if (heap_end > geom.heap_size) return error.HeapOverflow;
+        if (!descriptorValueFits(spec.width, plan.heap_off)) return error.BadDescriptor;
+        plan.abs = try limits.add(geom.heap_abs_off, plan.heap_off);
+    }
+
+    try validateWriteValues(T, spec.elem, in, column);
+
+    // Guarantee the real manager will not allocate while applying the already-proven frees.
+    const reserve = std.math.add(usize, mgr.free_list.items.len, plans.len) catch return error.LimitExceeded;
+    try mgr.free_list.ensureTotalCapacity(alloc, reserve);
+
+    for (plans) |plan| {
+        if (plan.release_old) try releaseDescriptorExtent(alloc, mgr, plan.old_desc, spec.elem, &geom);
+    }
+    for (plans, 0..) |plan, i| {
+        if (plan.len == 0) {
+            try writeDescAt(table, column, plan.row, .{ .len = 0, .off = 0 });
+            continue;
+        }
+
+        const heap_off = try mgr.alloc(plan.bytes);
+        // The manager was cloned exactly and applied in the same order; disagreement means its
+        // public bookkeeping was modified concurrently or is internally inconsistent.
+        if (heap_off != plan.heap_off) return error.HeapOverflow;
+        const start: usize = @intCast(offsets[i]);
+        const end: usize = @intCast(offsets[i + 1]);
+        try drainToHeap(T, table.fits.dev, plan.abs.?, spec.elem, in[start..end], column);
+        try writeDescAt(table, column, plan.row, .{
+            .len = @intCast(plan.len),
+            .off = @intCast(plan.heap_off),
+        });
+    }
+}
+
 /// Mark the variable-length cell at (`row`, `col`) empty: free its heap extent through `mgr`
 /// and zero its descriptor. A subsequent `readVlaCell` returns an empty slice. `compact` will
 /// then skip the cell. `error.NotWritable` on a read-only handle.
@@ -385,13 +682,15 @@ pub fn freeVlaCell(alloc: Allocator, table: *BinTable, mgr: *HeapManager, col: C
 // region. A corrupt descriptor is ignored (not trusted to free arbitrary bytes).
 fn freeExisting(alloc: Allocator, table: *BinTable, mgr: *HeapManager, column: *const Column, row: u64, elem: BinaryType, geom: *const HeapGeometry) WriteError!void {
     const d = try readDescAt(table, column, row);
-    if (d.len > 0 and d.off >= 0) {
-        const old_len: u64 = @intCast(d.len);
-        const old_off: u64 = @intCast(d.off);
-        const old_bytes = byteLen(elem, old_len) catch return;
-        const end = std.math.add(u64, old_off, old_bytes) catch return;
-        if (end <= geom.heap_size) try mgr.free(alloc, old_off, old_bytes);
-    }
+    try releaseDescriptorExtent(alloc, mgr, d, elem, geom);
+}
+
+// Return the valid in-heap extent described by `d` to `mgr`. Corrupt old descriptors are
+// deliberately ignored, matching legacy rewrite behavior: they are never trusted as free-space
+// authority, but a caller may still replace the cell with a valid descriptor.
+fn releaseDescriptorExtent(alloc: Allocator, mgr: *HeapManager, d: Descriptor, elem: BinaryType, geom: *const HeapGeometry) Allocator.Error!void {
+    const extent = descriptorExtent(d, elem, geom) orelse return;
+    try mgr.free(alloc, extent.off, extent.len);
 }
 
 fn drainToHeap(comptime T: type, dev: Device, abs: u64, elem: BinaryType, in: []const T, column: *const Column) (errors.IoError || errors.ConvError)!void {
@@ -418,8 +717,9 @@ fn drainToHeap(comptime T: type, dev: Device, abs: u64, elem: BinaryType, in: []
 /// `capacity` (the heap size), and a free list holds released extents for reuse. Compaction
 /// repacks the live payloads to the front of the heap and rewrites their descriptors.
 ///
-/// Create one from an empty table with `initForTable` and route every VLA write through
-/// `writeVlaCell`/`freeVlaCell` so the accounting matches the on-disk descriptors.
+/// Create one with `initForTable` and route every VLA write through
+/// `writeVlaCell`/`writeVlaColumn`/`freeVlaCell` so the accounting matches the on-disk
+/// descriptors.
 pub const HeapManager = struct {
     /// Released extents available for reuse (offsets relative to the heap start).
     free_list: std.ArrayList(Extent) = .empty,
@@ -433,11 +733,43 @@ pub const HeapManager = struct {
         return .{ .capacity = capacity };
     }
 
-    /// A manager sized to `table`'s heap (`capacity = heap_size`), assuming the heap starts
-    /// empty. Resolves the geometry, so a bad `THEAP`/`PCOUNT` surfaces here.
-    pub fn initForTable(table: *const BinTable) GeomError!HeapManager {
+    /// Seed a manager from `table`'s current heap. Every live VLA descriptor in every column is
+    /// validated, and `top` is placed at the greatest referenced payload end. Bytes below `top`
+    /// that are not referenced remain conservatively unavailable until explicitly freed or the
+    /// heap is compacted; trailing capacity remains available to bump allocation. An all-empty
+    /// freshly reserved table therefore still starts at zero.
+    pub fn initForTable(table: *const BinTable) ManagerInitError!HeapManager {
         const geom = try heapGeometry(table);
-        return .{ .capacity = geom.heap_size };
+        var top: u64 = 0;
+        var dev_size: ?u64 = null;
+        var live_extents: std.ArrayList(Extent) = .empty;
+        defer live_extents.deinit(table.fits.alloc);
+        for (table.columns) |*column| {
+            if (!column.tform.type.isVla()) continue;
+            const spec = try VlaSpec.of(column);
+            var row: u64 = 0;
+            while (row < table.naxis2) : (row += 1) {
+                const desc = try readDescAt(table, column, row);
+                const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+                if (plan.len == 0) continue;
+                const heap_off: u64 = @intCast(desc.off); // validated non-negative by plan
+                const heap_end = std.math.add(u64, heap_off, plan.bytes) catch return error.BadDescriptor;
+                top = @max(top, heap_end);
+                try live_extents.append(table.fits.alloc, .{ .off = heap_off, .len = plan.bytes });
+            }
+        }
+
+        // The manager has extent ownership, not reference counts. Reject aliases and partial
+        // overlaps up front: freeing either descriptor would otherwise make bytes still owned by
+        // another live cell allocatable and permit silent cross-cell corruption.
+        std.mem.sort(Extent, live_extents.items, {}, lessThanExtent);
+        if (live_extents.items.len > 1) {
+            for (live_extents.items[1..], live_extents.items[0 .. live_extents.items.len - 1]) |next, prev| {
+                const prev_end = std.math.add(u64, prev.off, prev.len) catch return error.BadDescriptor;
+                if (next.off < prev_end) return error.BadDescriptor;
+            }
+        }
+        return .{ .top = top, .capacity = geom.heap_size };
     }
 
     /// Release the free list.
@@ -912,6 +1244,25 @@ fn makeVlaHdu(f: *Fits, alloc: Allocator, tform: []const u8, nrows: u64, pcount:
     return f.appendHdu(h);
 }
 
+fn makeTwoVlaHdu(f: *Fits, alloc: Allocator, nrows: u64, pcount: u64) !*Hdu {
+    var h = Header.initEmpty();
+    errdefer h.deinit(alloc);
+    try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
+    try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+    try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+    try h.appendValue(alloc, "NAXIS1", .{ .int = 16 }, null); // two 8-byte P descriptors
+    try h.appendValue(alloc, "NAXIS2", .{ .int = @intCast(nrows) }, null);
+    try h.appendValue(alloc, "PCOUNT", .{ .int = @intCast(pcount) }, null);
+    try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "TFIELDS", .{ .int = 2 }, null);
+    try h.appendValue(alloc, "TFORM1", .{ .string = "1PJ" }, null);
+    try h.appendValue(alloc, "TTYPE1", .{ .string = "A" }, null);
+    try h.appendValue(alloc, "TFORM2", .{ .string = "1PJ" }, null);
+    try h.appendValue(alloc, "TTYPE2", .{ .string = "B" }, null);
+    try h.ensureEnd(alloc);
+    return f.appendHdu(h);
+}
+
 // A handle + memory device packaged so tests can build a one-column VLA table quickly.
 const Fixture = struct {
     mem: *MemoryDevice,
@@ -932,6 +1283,192 @@ const Fixture = struct {
         alloc.destroy(self.mem);
     }
 };
+
+test "packed VLA layout and read preserve row boundaries (1PJ)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 3, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 10, 20, 30 });
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 1, i32, &[_]i32{7});
+    // Empty offsets are undefined and must remain ignored by both packed operations.
+    try setDescriptor(&t, .{ .index = 0 }, 2, .{ .len = 0, .off = -999 });
+
+    var offsets: [4]u64 = undefined;
+    try testing.expectEqual(@as(u64, 4), try vlaColumnLayout(&t, .{ .index = 0 }, 0, &offsets));
+    try testing.expectEqualSlices(u64, &[_]u64{ 0, 3, 4, 4 }, &offsets);
+
+    var flat: [4]i32 = undefined;
+    try readVlaColumnInto(i32, &t, .{ .index = 0 }, 0, 3, &flat);
+    try testing.expectEqualSlices(i32, &[_]i32{ 10, 20, 30, 7 }, &flat);
+
+    // Ranges rebase their layout at zero, including zero rows at the one-past-end position.
+    var sub_offsets: [3]u64 = undefined;
+    try testing.expectEqual(@as(u64, 1), try vlaColumnLayout(&t, .{ .index = 0 }, 1, &sub_offsets));
+    try testing.expectEqualSlices(u64, &[_]u64{ 0, 1, 1 }, &sub_offsets);
+    var empty_layout = [_]u64{999};
+    try testing.expectEqual(@as(u64, 0), try vlaColumnLayout(&t, .{ .index = 0 }, 3, &empty_layout));
+    try testing.expectEqualSlices(u64, &[_]u64{0}, &empty_layout);
+    try readVlaColumnInto(i32, &t, .{ .index = 0 }, 3, 0, &.{});
+
+    // Both too-small and too-large flat buffers are rejected; the guard values prove the
+    // undersized case did not write beyond its slice.
+    var guarded = [_]i32{ -1, -1, -1, -1, 0x12345678 };
+    try testing.expectError(error.CellOutOfRange, readVlaColumnInto(i32, &t, .{ .index = 0 }, 0, 3, guarded[0..3]));
+    try testing.expectEqual(@as(i32, 0x12345678), guarded[4]);
+    try testing.expectError(error.CellOutOfRange, readVlaColumnInto(i32, &t, .{ .index = 0 }, 0, 3, guarded[0..5]));
+    try testing.expectError(error.CellOutOfRange, vlaColumnLayout(&t, .{ .index = 0 }, 0, &.{}));
+    try testing.expectError(error.RowOutOfRange, vlaColumnLayout(&t, .{ .index = 0 }, 2, &sub_offsets));
+}
+
+test "packed VLA write round-trips through Q descriptors and legacy reads" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1QK", 3, 128, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    const offsets = [_]u64{ 0, 3, 4, 4 };
+    const values = [_]i64{ 1, -2, 1 << 40, std.math.maxInt(i64) };
+    try writeVlaColumn(i64, alloc, &t, &mgr, .{ .index = 0 }, 0, &offsets, &values);
+
+    var measured: [4]u64 = undefined;
+    try testing.expectEqual(@as(u64, values.len), try vlaColumnLayout(&t, .{ .index = 0 }, 0, &measured));
+    try testing.expectEqualSlices(u64, &offsets, &measured);
+    var flat_values: [values.len]i64 = undefined;
+    try readVlaColumnInto(i64, &t, .{ .index = 0 }, 0, 3, &flat_values);
+    try testing.expectEqualSlices(i64, &values, &flat_values);
+
+    const row0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i64);
+    defer alloc.free(row0);
+    const row1 = try readVlaCell(alloc, &t, .{ .index = 0 }, 1, i64);
+    defer alloc.free(row1);
+    const row2 = try readVlaCell(alloc, &t, .{ .index = 0 }, 2, i64);
+    defer alloc.free(row2);
+    try testing.expectEqualSlices(i64, values[0..3], row0);
+    try testing.expectEqualSlices(i64, values[3..4], row1);
+    try testing.expectEqual(@as(usize, 0), row2.len);
+}
+
+test "packed VLA complex slots and rejected writes are preflighted" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PC", 2, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    const offsets = [_]u64{ 0, 4, 4 };
+    const values = [_]f32{ 1.5, -2.5, 3.0, 4.0 };
+    try writeVlaColumn(f32, alloc, &t, &mgr, .{ .index = 0 }, 0, &offsets, &values);
+    try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 0, .off = 9999 });
+
+    var measured: [3]u64 = undefined;
+    try testing.expectEqual(@as(u64, 4), try vlaColumnLayout(&t, .{ .index = 0 }, 0, &measured));
+    try testing.expectEqualSlices(u64, &offsets, &measured);
+    var flat_values: [4]f32 = undefined;
+    try readVlaColumnInto(f32, &t, .{ .index = 0 }, 0, 2, &flat_values);
+    try testing.expectEqualSlices(f32, &values, &flat_values);
+
+    const before = try alloc.dupe(u8, fx.mem.bytes());
+    defer alloc.free(before);
+    const top_before = mgr.top;
+    const odd_offsets = [_]u64{ 0, 3, 4 };
+    try testing.expectError(error.CellOutOfRange, writeVlaColumn(f32, alloc, &t, &mgr, .{ .index = 0 }, 0, &odd_offsets, &values));
+    try testing.expectEqualSlices(u8, before, fx.mem.bytes());
+    try testing.expectEqual(top_before, mgr.top);
+
+    const decreasing = [_]u64{ 0, 4, 3 };
+    try testing.expectError(error.CellOutOfRange, writeVlaColumn(f32, alloc, &t, &mgr, .{ .index = 0 }, 0, &decreasing, values[0..3]));
+    try testing.expectEqualSlices(u8, before, fx.mem.bytes());
+    try testing.expectEqual(top_before, mgr.top);
+}
+
+test "packed VLA rewrite seeds populated multi-column heap without overlap" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // The heap is exactly full: A owns [0,24), B owns [24,36), and there is no trailing room.
+    // Rewriting A changes row lengths from [3,0,1,2] to [2,0,3,1] with the same total bytes.
+    // A row-at-a-time release cannot fit the growing third row and would try to bump past 36;
+    // releasing the complete A range first coalesces [0,24) and succeeds in place.
+    const hdu = try makeTwoVlaHdu(&fx.f, alloc, 4, 36);
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+
+    // Seed a populated heap, then discard its manager to model opening a file authored by
+    // Astropy/CFITSIO. Write all of A first so its old target extents are contiguous.
+    var seed_mgr = try HeapManager.initForTable(&t);
+    try testing.expectEqual(@as(u64, 0), seed_mgr.top);
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 1, 2, 3 }); // [0,12)
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 0 }, 2, i32, &[_]i32{4}); // [12,16)
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 0 }, 3, i32, &[_]i32{ 5, 6 }); // [16,24)
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 1 }, 0, i32, &[_]i32{ 101, 102 }); // [24,32)
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 1 }, 2, i32, &[_]i32{201}); // [32,36)
+    try testing.expectEqual(@as(u64, 36), seed_mgr.top);
+    seed_mgr.deinit(alloc);
+
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try testing.expectEqual(@as(u64, 36), mgr.top);
+
+    const offsets = [_]u64{ 0, 2, 2, 5, 6 };
+    const values = [_]i32{ 9, 8, 7, 6, 5, 4 };
+    try writeVlaColumn(i32, alloc, &t, &mgr, .{ .index = 0 }, 0, &offsets, &values);
+
+    var a_flat: [values.len]i32 = undefined;
+    try readVlaColumnInto(i32, &t, .{ .index = 0 }, 0, 4, &a_flat);
+    try testing.expectEqualSlices(i32, &values, &a_flat);
+
+    var b_offsets: [5]u64 = undefined;
+    try testing.expectEqual(@as(u64, 3), try vlaColumnLayout(&t, .{ .index = 1 }, 0, &b_offsets));
+    var b_flat: [3]i32 = undefined;
+    try readVlaColumnInto(i32, &t, .{ .index = 1 }, 0, 4, &b_flat);
+    try testing.expectEqualSlices(i32, &[_]i32{ 101, 102, 201 }, &b_flat);
+
+    // Re-seeding validates that every final descriptor across both columns is disjoint.
+    var rebuilt = try HeapManager.initForTable(&t);
+    defer rebuilt.deinit(alloc);
+    try testing.expectEqual(@as(u64, 36), rebuilt.top);
+}
+
+test "packed VLA preflight and manager initialization reject overlapping live extents" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 1, 2 });
+    // Forge row 1 as [4,8), partially overlapping row 0's [0,8).
+    try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 1, .off = 4 });
+    const before = try alloc.dupe(u8, fx.mem.bytes());
+    defer alloc.free(before);
+    const offsets = [_]u64{ 0, 1, 2 };
+    try testing.expectError(error.BadDescriptor, writeVlaColumn(i32, alloc, &t, &mgr, .{ .index = 0 }, 0, &offsets, &[_]i32{ 9, 8 }));
+    try testing.expectEqualSlices(u8, before, fx.mem.bytes());
+    try testing.expectEqual(@as(u64, 8), mgr.top);
+
+    try testing.expectError(error.BadDescriptor, HeapManager.initForTable(&t));
+}
 
 test "round-trip: write heap, set descriptor, read VLA cell (1PJ)" {
     const alloc = testing.allocator;
