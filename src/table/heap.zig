@@ -278,7 +278,7 @@ fn validateRowRange(table: *const BinTable, first_row: u64, nrows: u64) errors.T
 // ── descriptors ──────────────────────────────────────────────────────────────────────────
 
 fn descAbsOffset(table: *const BinTable, column: *const Column, row: u64) DescriptorError!u64 {
-    if (!column.tform.type.isVla()) return error.BadDescriptor;
+    if (!column.tform.type.isVla() or column.tform.repeat == 0) return error.BadDescriptor;
     if (row >= table.naxis2) return error.RowOutOfRange;
     const row_off = try limits.mul(row, table.naxis1);
     const base = try limits.add(table.hdu.data_off, row_off);
@@ -323,15 +323,17 @@ fn writeDescAt(table: *BinTable, column: *const Column, row: u64, desc: Descript
 }
 
 /// Read the raw (unvalidated) descriptor stored at (`row`, `col`). `error.BadDescriptor` if the
-/// column is not a `P`/`Q` column; `error.RowOutOfRange` if `row` is past `NAXIS2`.
+/// column is not a `P`/`Q` column or its repeat is zero (an empty field with no descriptor);
+/// `error.RowOutOfRange` if `row` is past `NAXIS2`.
 pub fn readDescriptor(table: *BinTable, col: ColumnRef, row: u64) DescriptorError!Descriptor {
     const column = &table.columns[try table.resolve(col)];
     return readDescAt(table, column, row);
 }
 
 /// Write `desc` into the row descriptor at (`row`, `col`). For a `P` column the length and
-/// offset must fit in `i32` (else `error.BadDescriptor`). `error.NotWritable` on a read-only
-/// handle. This is a low-level primitive; prefer `writeVlaCell` for payload + descriptor.
+/// offset must fit in `i32` (else `error.BadDescriptor`). A zero-repeat P/Q field also returns
+/// `error.BadDescriptor` because it has no descriptor. `error.NotWritable` on a read-only handle.
+/// This is a low-level primitive; prefer `writeVlaCell` for payload + descriptor.
 pub fn setDescriptor(table: *BinTable, col: ColumnRef, row: u64, desc: Descriptor) DescriptorError!void {
     const column = &table.columns[try table.resolve(col)];
     return writeDescAt(table, column, row, desc);
@@ -395,10 +397,10 @@ fn planDescriptor(
 /// fixed columns (FR-VLA-3). For a complex element type the result holds `2×len` slots (real,
 /// imaginary); for a `bit` array, `len` slots (one per bit); otherwise `len` slots.
 ///
-/// `error.BadDescriptor` for a non-VLA column, a negative length/offset, or a payload that
-/// escapes the heap / data unit / device; `error.BadTform` for a `P`/`Q` column without an
-/// element type; `error.LimitExceeded` when the element count or byte length exceeds the
-/// configured limits (checked before allocating).
+/// `error.BadDescriptor` for a non-VLA or zero-repeat column, a negative length/offset, or a
+/// payload that escapes the heap / data unit / device; `error.BadTform` for a `P`/`Q` column
+/// without an element type; `error.LimitExceeded` when the element count or byte length exceeds
+/// the configured limits (checked before allocating).
 pub fn readVlaCell(alloc: Allocator, table: *BinTable, col: ColumnRef, row: u64, comptime T: type) ReadError![]T {
     const column = &table.columns[try table.resolve(col)];
     const spec = try VlaSpec.of(column);
@@ -492,8 +494,9 @@ fn fillFromHeap(comptime T: type, dev: Device, abs: u64, elem: BinaryType, out: 
 /// `TSCALn`/`TZEROn` scaling under the bulk policy (FR-VLA-3). For a complex element type
 /// `in.len` must be even (`2×len` real/imaginary slots).
 ///
-/// `error.NotWritable` on a read-only handle; `error.HeapOverflow` when the heap has no room;
-/// `error.LimitExceeded` when the element count or byte length exceeds the configured limits.
+/// `error.BadDescriptor` for a zero-repeat P/Q field; `error.NotWritable` on a read-only handle;
+/// `error.HeapOverflow` when the heap has no room; `error.LimitExceeded` when the element count
+/// or byte length exceeds the configured limits.
 pub fn writeVlaCell(alloc: Allocator, table: *BinTable, mgr: *HeapManager, col: ColumnRef, row: u64, comptime T: type, in: []const T) WriteError!void {
     if (table.fits.mode == .read_only or !table.fits.dev.isWritable()) return error.NotWritable;
     const column = &table.columns[try table.resolve(col)];
@@ -754,7 +757,8 @@ pub fn writeVlaColumn(
 
 /// Mark the variable-length cell at (`row`, `col`) empty: free its heap extent through `mgr`
 /// and zero its descriptor. A subsequent `readVlaCell` returns an empty slice. `compact` will
-/// then skip the cell. `error.NotWritable` on a read-only handle.
+/// then skip the cell. `error.BadDescriptor` for a zero-repeat P/Q field; `error.NotWritable` on
+/// a read-only handle.
 pub fn freeVlaCell(alloc: Allocator, table: *BinTable, mgr: *HeapManager, col: ColumnRef, row: u64) WriteError!void {
     if (table.fits.mode == .read_only or !table.fits.dev.isWritable()) return error.NotWritable;
     const column = &table.columns[try table.resolve(col)];
@@ -832,7 +836,7 @@ pub const HeapManager = struct {
         var live_extents: std.ArrayList(Extent) = .empty;
         defer live_extents.deinit(table.fits.alloc);
         for (table.columns) |*column| {
-            if (!column.tform.type.isVla()) continue;
+            if (!column.tform.type.isVla() or column.tform.repeat == 0) continue;
             const spec = try VlaSpec.of(column);
             var row: u64 = 0;
             while (row < table.naxis2) : (row += 1) {
@@ -985,7 +989,7 @@ pub const HeapManager = struct {
         defer relocs.deinit(gpa);
 
         for (table.columns) |*column| {
-            if (!column.tform.type.isVla()) continue;
+            if (!column.tform.type.isVla() or column.tform.repeat == 0) continue;
             const elem = column.tform.vla_elem orelse continue;
             var row: u64 = 0;
             while (row < table.naxis2) : (row += 1) {
@@ -1889,6 +1893,59 @@ test "compaction repacks live cells, drops the gap, preserves data" {
     try testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, r0);
     try testing.expectEqual(@as(usize, 0), r1.len); // freed → empty
     try testing.expectEqualSlices(i32, &[_]i32{ 100, 200, 300, 400 }, r2);
+}
+
+test "zero-repeat VLA has no descriptor and compaction skips it" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const header = header: {
+        var h = Header.initEmpty();
+        errdefer h.deinit(alloc);
+        try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
+        try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+        try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+        try h.appendValue(alloc, "NAXIS1", .{ .int = 12 }, null);
+        try h.appendValue(alloc, "NAXIS2", .{ .int = 2 }, null);
+        try h.appendValue(alloc, "PCOUNT", .{ .int = 64 }, null);
+        try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "TFIELDS", .{ .int = 3 }, null);
+        try h.appendValue(alloc, "TFORM1", .{ .string = "0PJ" }, null);
+        try h.appendValue(alloc, "TTYPE1", .{ .string = "EMPTY" }, null);
+        try h.appendValue(alloc, "TFORM2", .{ .string = "1PJ" }, null);
+        try h.appendValue(alloc, "TTYPE2", .{ .string = "VALUES" }, null);
+        try h.appendValue(alloc, "TFORM3", .{ .string = "1J" }, null);
+        try h.appendValue(alloc, "TTYPE3", .{ .string = "COUNT" }, null);
+        try h.ensureEnd(alloc);
+        break :header h;
+    };
+    const hdu = try fx.f.appendHdu(header);
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    try testing.expectEqual(@as(u64, 0), t.columns[0].byte_offset);
+    try testing.expectEqual(@as(u64, 0), t.columns[1].byte_offset);
+    try testing.expectEqual(@as(u64, 8), t.columns[2].byte_offset);
+    try testing.expectError(error.BadDescriptor, readDescriptor(&t, .{ .index = 0 }, 0));
+
+    const counts = [_]i32{ 11, 22 };
+    try t.writeColumn(i32, .{ .name = "COUNT" }, 0, &counts, .{});
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try writeVlaCell(alloc, &t, &mgr, .{ .name = "VALUES" }, 0, i32, &[_]i32{ 1, 2, 3 });
+    try writeVlaCell(alloc, &t, &mgr, .{ .name = "VALUES" }, 1, i32, &[_]i32{ 4, 5 });
+    try freeVlaCell(alloc, &t, &mgr, .{ .name = "VALUES" }, 0);
+
+    try mgr.compact(alloc, &t);
+    try testing.expectEqual(@as(u64, 8), mgr.top);
+    const descriptor = try readDescriptor(&t, .{ .name = "VALUES" }, 1);
+    try testing.expectEqual(@as(i64, 0), descriptor.off);
+    const values = try readVlaCell(alloc, &t, .{ .name = "VALUES" }, 1, i32);
+    defer alloc.free(values);
+    try testing.expectEqualSlices(i32, &[_]i32{ 4, 5 }, values);
+    var out: [2]i32 = undefined;
+    try t.readColumn(i32, .{ .name = "COUNT" }, 0, &out, .{});
+    try testing.expectEqualSlices(i32, &counts, &out);
 }
 
 test "TSCAL/TZERO scaling applies on VLA read/write (1PE)" {

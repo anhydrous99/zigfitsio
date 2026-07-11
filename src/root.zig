@@ -99,6 +99,13 @@ pub const BinTable = @import("table/binary.zig").BinTable;
 pub const AsciiTable = @import("table/ascii.zig").AsciiTable;
 /// Column reference (by index or name) shared by the table views.
 pub const ColumnRef = @import("table/binary.zig").ColumnRef;
+const table_schema = @import("table/schema.zig");
+/// One compile-time binary-table column descriptor.
+pub const BinaryColumnSpec = table_schema.BinaryColumnSpec;
+/// Runtime row/heap/name options for a compile-time binary-table schema.
+pub const BinaryTableOpts = table_schema.BinaryTableOpts;
+/// Build a compile-time-validated binary-table schema and its append helpers.
+pub const BinarySchema = table_schema.BinarySchema;
 /// Variable-length-array heap access (FR-VLA-*).
 pub const heap = @import("table/heap.zig");
 
@@ -213,6 +220,7 @@ test {
     _ = @import("compress/gzip.zig");
     _ = @import("table/common.zig");
     _ = @import("table/binary.zig");
+    _ = @import("table/schema.zig");
     _ = @import("table/ascii.zig");
     _ = @import("table/heap.zig");
     _ = @import("checksum.zig");

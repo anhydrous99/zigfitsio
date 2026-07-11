@@ -3,6 +3,7 @@
 //! Steps:
 //!   zig build              — install the static library artifact (NFR-BUILD-2)
 //!   zig build test         — run the unit/integration suite (NFR-BUILD-2)
+//!   zig build compile-errors — check expected public comptime diagnostics
 //!   zig build bench        — run throughput benchmarks (NFR-PERF-1)
 //!   zig build fitsverify   — run the structural-validation CLI demo (X-TOOL)
 //!   zig build fuzz         — run the header/table fuzz harnesses (NFR-SAFE-2)
@@ -79,6 +80,85 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the unit/integration test suite");
     test_step.dependOn(&run_tests.step);
+
+    // Public comptime APIs deliberately reject malformed declarations during semantic
+    // analysis. Exercise those contracts with separate compiler invocations: each case must
+    // fail compilation and emit its API-level diagnostic. Keep this as a standalone step for
+    // quick iteration, and include it in the full test suite so the negative cases cannot rot.
+    const compile_errors_step = b.step("compile-errors", "Check expected comptime diagnostics");
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_invalid_tform.zig",
+        "BinarySchema: column 1 has invalid TFORM",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_duplicate_names.zig",
+        "BinarySchema: columns 1 and 2 have duplicate names",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_bad_tdim.zig",
+        "BinarySchema: column 1 TDIM exceeds its TFORM repeat",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_bad_vla_tdim.zig",
+        "BinarySchema: column 1 TDIM exceeds its VLA TFORM emax",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_zero_tscal.zig",
+        "BinarySchema: column 1 TSCAL must be finite and non-zero",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_bad_tdisp.zig",
+        "BinarySchema: column 1 has unsupported TDISP code",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_incompatible_tdisp.zig",
+        "BinarySchema: column 1 TDISP is incompatible with its TFORM",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_invalid_tdisp_syntax.zig",
+        "BinarySchema: column 1 has invalid TDISP",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_bad_scaling.zig",
+        "BinarySchema: column 1 TSCAL/TZERO are invalid for its TFORM",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/binary_schema_lowercase_tform.zig",
+        "BinarySchema: column 1 TFORM codes must be uppercase",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/iterator_non_slice.zig",
+        "Iterator: field 'x' must be a mutable slice",
+    );
+    addCompileErrorCase(
+        b,
+        compile_errors_step,
+        "test/compile_errors/iterator_sentinel_slice.zig",
+        "Iterator: field 'x' must be a plain mutable slice",
+    );
+    test_step.dependOn(compile_errors_step);
 
     // The C-ABI shim's own round-trip tests (`bindings/capi/test_capi.zig`) are wired into the
     // default `test` step too (test-plan Phase 4): previously `capi-test` only ran in one Linux
@@ -234,4 +314,27 @@ pub fn build(b: *std.Build) void {
     const wasm_install = b.addInstallArtifact(wasm_reactor, .{});
     const wasm_build_step = b.step("wasm", "Build the wasm32-freestanding C-ABI reactor (zigfitsio.wasm)");
     wasm_build_step.dependOn(&wasm_install.step);
+}
+
+/// Compile one deliberately-invalid public API consumer and check its stable diagnostic.
+fn addCompileErrorCase(
+    b: *std.Build,
+    parent: *std.Build.Step,
+    source_path: []const u8,
+    expected_diagnostic: []const u8,
+) void {
+    const check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "test",
+        "--dep",
+        "zigfitsio",
+    });
+    check.addPrefixedFileArg("-Mroot=", b.path(source_path));
+    check.addPrefixedFileArg("-Mzigfitsio=", b.path("src/root.zig"));
+    // A system command is opaque to the build graph, so it cannot discover root.zig's
+    // transitive imports. Always rerun to observe diagnostic changes in any imported source.
+    check.has_side_effects = true;
+    check.expectExitCode(1);
+    check.expectStdErrMatch(expected_diagnostic);
+    parent.dependOn(&check.step);
 }

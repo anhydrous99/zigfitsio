@@ -139,16 +139,16 @@ pub const BinTform = struct {
     }
 
     /// Number of bytes this field occupies within a table row. `X` packs `repeat` bits into
-    /// `ceil(repeat/8)` bytes; `P`/`Q` occupy one descriptor (8 or 16 bytes); others occupy
-    /// `repeat × elemBytes`.
+    /// `ceil(repeat/8)` bytes; `P`/`Q` occupy one descriptor (8 or 16 bytes) when repeated once
+    /// and zero bytes when repeated zero times; others occupy `repeat × elemBytes`.
     pub fn fieldBytes(self: BinTform) TableError!u64 {
         return switch (self.type) {
             // `repeat` is parsed straight from TFORMn and can reach u64 max, so `repeat + 7`
             // must not overflow (was an integer-overflow panic on a crafted bit count). Divide
             // first, then add the partial-byte, which cannot overflow.
             .bit => (self.repeat / 8) + @intFromBool(self.repeat % 8 != 0),
-            .vla32 => 8,
-            .vla64 => 16,
+            .vla32 => if (self.repeat == 0) 0 else 8,
+            .vla64 => if (self.repeat == 0) 0 else 16,
             else => std.math.mul(u64, self.repeat, self.type.elemBytes()) catch return error.BadTform,
         };
     }
@@ -505,6 +505,8 @@ test "binary VLA descriptors P/Q with element type and emax" {
     // Leading repeat > 1 on P/Q is invalid.
     try testing.expectError(error.BadTform, BinTform.parse("2PJ"));
     try testing.expectEqual(@as(u64, 0), (try BinTform.parse("0PJ")).repeat);
+    try testing.expectEqual(@as(u64, 0), try (try BinTform.parse("0PJ")).fieldBytes());
+    try testing.expectEqual(@as(u64, 0), try (try BinTform.parse("0QD")).fieldBytes());
 }
 
 test "invalid binary TFORM" {

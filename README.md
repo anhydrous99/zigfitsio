@@ -74,6 +74,27 @@ defer allocator.free(buf);
 try view.readAll(f32, buf, .{ .null_sentinel = 0.0 });
 ```
 
+Compile-time schemas make programmatic binary tables structurally safe without hiding their FITS
+representation. Invalid `TFORM` strings, duplicate names, inconsistent `TDIM`, and row-width
+overflow fail during compilation; the dynamic `BinTable` APIs remain available for runtime data.
+
+```zig
+const Events = fits.BinarySchema(&.{
+    .{ .name = "TIME", .tform = "1D", .unit = "s" },
+    .{ .name = "FLUX", .tform = "1E" },
+    .{ .name = "QUALITY", .tform = "1J", .tnull = -1 },
+});
+
+// FITS files need an image-like primary HDU before table extensions.
+var file = try fits.createFile(allocator, "events.fits", .{});
+defer file.deinit();
+_ = try file.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+
+var events = try Events.append(&file, .{ .rows = 3, .extname = "EVENTS" });
+defer events.deinit(allocator);
+try events.writeColumn(f32, .{ .name = "FLUX" }, 0, &.{ 1.5, 2.5, 3.5 }, .{});
+```
+
 ### Python
 
 ```python

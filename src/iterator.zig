@@ -116,13 +116,29 @@ fn castSentinel(comptime Elem: type, value: anytype) ?Elem {
 /// Build a binary-table column iterator over a caller-defined `Cols` struct of typed column
 /// slices, threading the caller's error set `E` (so no public function returns `anyerror`).
 ///
-/// `Cols` must be a struct whose every field is a slice type (`[]T`); each field is matched to
-/// a `Binding` by name. `E` is the work function's error set; `run` returns `Error || E`.
+/// `Cols` must be a struct whose every field is a canonical mutable `[]T`, where `T` is an
+/// integer, float, or bool; each field is matched to a `Binding` by name. `E` is the work
+/// function's error set; `run` returns `Error || E`.
 pub fn Iterator(comptime Cols: type, comptime E: type) type {
     const ti = @typeInfo(Cols);
     if (ti != .@"struct") @compileError("Iterator: Cols must be a struct of typed column slices");
+    if (@typeInfo(E) != .error_set) @compileError("Iterator: E must be an error set");
     const fields = ti.@"struct".fields;
     if (fields.len == 0) @compileError("Iterator: Cols must have at least one field");
+    for (fields) |field| {
+        const field_info = @typeInfo(field.type);
+        if (field_info != .pointer or field_info.pointer.size != .slice or field_info.pointer.is_const) {
+            @compileError("Iterator: field '" ++ field.name ++ "' must be a mutable slice, got " ++ @typeName(field.type));
+        }
+        const Elem = field_info.pointer.child;
+        if (field.type != []Elem) {
+            @compileError("Iterator: field '" ++ field.name ++ "' must be a plain mutable slice, got " ++ @typeName(field.type));
+        }
+        switch (@typeInfo(Elem)) {
+            .int, .float, .bool => {},
+            else => @compileError("Iterator: field '" ++ field.name ++ "' has unsupported element type " ++ @typeName(Elem)),
+        }
+    }
 
     return struct {
         const Self = @This();

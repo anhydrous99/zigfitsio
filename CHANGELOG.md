@@ -12,6 +12,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
   `zf_read_col_vla_layout`, `zf_read_col_vla_packed`, and `zf_write_col_vla_packed`
   exports. A row range is measured once and moved through one flat scalar buffer, including
   P/Q descriptors, empty cells, scaling, and interleaved complex values.
+- **Core / Zig**: compile-time `BinarySchema` table builders validate `TFORM`/column metadata,
+  reject ambiguous names, derive `TFIELDS`/`NAXIS1`/column offsets, and append a normal
+  `BinTable` view while preserving the existing dynamic table APIs. Public comptime contracts
+  now have expected-diagnostic compile-fail coverage, including eager `Iterator` field checks.
 
 ### Changed
 - **Python / TypeScript**: VLA columns now use packed core transfers instead of one descriptor
@@ -24,6 +28,8 @@ All notable changes to `zigfitsio` are documented here. The format follows
   that are still live.
 
 ### Fixed
+- **Core / binary tables**: zero-repeat `P`/`Q` fields now contribute zero row bytes, and VLA
+  descriptor operations reject these empty fields while heap compaction safely skips them.
 - **Python & TypeScript**: duplicate effective table-column names now fail loud with
   `FitsTableError` (status 219) at every name-keyed high-level boundary instead of allowing
   update-mode write-back to overwrite the wrong physical column or reconstruction to duplicate /

@@ -157,6 +157,7 @@ zigfitsio/
 │   │   ├── common.zig        # Column model, TFORM/TDISP parse (FR-UTL-2)
 │   │   ├── ascii.zig         # ASCII TABLE
 │   │   ├── binary.zig        # BINTABLE
+│   │   ├── schema.zig        # comptime BINTABLE schemas/builders
 │   │   └── heap.zig          # VLA descriptors + heap manager
 │   ├── groups.zig            # random groups (P2)
 │   ├── checksum.zig          # DATASUM/CHECKSUM (FR-SUM-*)
@@ -849,7 +850,14 @@ pub const BinColumn = struct {
 ```
 
 `X` (bit) columns pack/unpack MSB-first into bytes. `TDIMn` (`FR-BTB-3`) reshapes a field's
-repeat count into an N-D array (`(w,h,…)` parsing, product must equal `repeat`).
+repeat count into an N-D array (`(w,h,…)` parsing, product must not exceed `repeat`).
+
+Programmatic writers may define an additive `BinarySchema(comptime columns)` using explicit
+`TFORM` spellings plus optional column metadata. The schema validates the descriptors and
+`TDIM` bounds during compilation, derives `TFIELDS`/`NAXIS1`/column offsets, and appends a
+regular runtime `BinTable`; arbitrary on-disk tables continue through `BinTable.of`. Explicit
+`TFORM` remains necessary because a Zig type alone cannot distinguish, for example, `2E` from
+the complex `1C` representation.
 
 ### 13.2 Scaling, nulls, unsigned/signed codes (`FR-BTB-4`)
 

@@ -39,6 +39,7 @@ comptime {
     // Tables.
     _ = @import("table/common.zig");
     _ = @import("table/binary.zig");
+    _ = @import("table/schema.zig");
     _ = @import("table/ascii.zig");
     _ = @import("table/heap.zig");
 
