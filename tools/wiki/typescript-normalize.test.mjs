@@ -149,7 +149,7 @@ test("normalizes a miniature two-entrypoint project and validates symbol/prototy
       normalized.manifest.symbols.typedoc.find((symbol) => symbol.qualifiedName === "index.Box.value")?.page,
       "TypeScript-API-High-Level.Class.Box.md",
     );
-    assert.match(normalized.pages.get(TYPESCRIPT_ENTRY_PAGE), /v0\.1\.4/);
+    assert.match(normalized.pages.get(TYPESCRIPT_ENTRY_PAGE), /v0\.1\.5/);
     assert.match(normalized.pages.get(TYPESCRIPT_PROTOS_PAGE), /lib\.zf_close\(arg0: bigint \| number \| null\): undefined/);
 
     await writeFile(
