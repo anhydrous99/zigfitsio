@@ -168,6 +168,114 @@ describe("headers", () => {
       reopened.close();
     }
   });
+
+  test("commentary and HIERARCH batch text retain ASCII-with-replacement compatibility", () => {
+    const p = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU()]).writeTo(p);
+    const hdul = zf.open(p, "update");
+    try {
+      const hdr = hdul.get(0).header;
+      hdr.transaction((tx) => {
+        tx.set("ESO CAFÉ DET", "José", "café");
+        tx.set("ESO CAFÉ DEL", "José");
+        tx.addComment("café");
+      });
+      hdr.delete("ESO CAFÉ DEL");
+      // Standard keywords stay on their strict UTF-8 path, including a padded spelling that must
+      // not be mistaken for HIERARCH merely because it contains trailing spaces.
+      expect(() => hdr.set("OBSERVER", "José")).toThrow(zf.FitsHeaderError);
+      expect(() => hdr.set("KEY     ", "José")).toThrow(zf.FitsHeaderError);
+      expect(hdr.has("OBSERVER")).toBe(false);
+    } finally {
+      hdul.close();
+    }
+
+    const reopened = zf.open(p);
+    try {
+      const hdr = reopened.get(0).header;
+      expect(hdr.get("ESO CAF? DET")).toBe("Jos?");
+      expect(hdr.commentOf("ESO CAF? DET")).toBe("caf?");
+      expect(hdr.comments).toContain("caf?");
+      expect(hdr.has("OBSERVER")).toBe(false);
+      expect(hdr.has("ESO CAF? DEL")).toBe(false);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test("detached reconstruction replaces non-ASCII commentary and HIERARCH text", () => {
+    const header = new zf.Header();
+    header.set("ESO CAFÉ DET", "José", "café");
+    header.addComment("café");
+    const rebuilt = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU({ header })]).toBytes());
+    try {
+      const hdr = rebuilt.get(0).header;
+      expect(hdr.get("ESO CAF? DET")).toBe("Jos?");
+      expect(hdr.commentOf("ESO CAF? DET")).toBe("caf?");
+      expect(hdr.comments).toContain("caf?");
+    } finally {
+      rebuilt.close();
+    }
+
+    const strict = new zf.Header();
+    strict.set("OBSERVER", "José");
+    expect(() => new zf.HDUList([new zf.PrimaryHDU({ header: strict })]).toBytes()).toThrow(zf.FitsHeaderError);
+  });
+
+  const checksumRevisionBoundaries: readonly [string, (hdul: zf.HDUList, copy: string) => void][] = [
+    ["flush", (hdul) => hdul.flush()],
+    ["toBytes", (hdul) => void hdul.toBytes()],
+    ["writeTo pristine source path", (hdul, copy) => hdul.writeTo(copy, { overwrite: true })],
+  ];
+  for (const [label, crossBoundary] of checksumRevisionBoundaries) {
+    test(`checksum-on-close ${label} invalidates cached revisions for eager and transactional edits`, () => {
+      const p = tmp.path();
+      const copy = tmp.path();
+      // Seed real checksum cards: checksumOnClose only rewrites existing CHECKSUM/DATASUM cards.
+      new zf.HDUList([new zf.PrimaryHDU()]).writeTo(p, { checksum: true });
+      const hdul = zf.open(p, "update", { checksumOnClose: true });
+      try {
+        const hdu = hdul.get(0);
+        const hdr = hdu.header;
+        expect(hdu._headerRevision).not.toBeNull();
+        crossBoundary(hdul, copy);
+        expect(hdu._headerRevision).toBeNull();
+
+        hdr.set("EAGER", label);
+        hdr.transaction((tx) => tx.set("BATCHED", label));
+        expect(hdr.get("EAGER")).toBe(label);
+        expect(hdr.get("BATCHED")).toBe(label);
+      } finally {
+        hdul.close();
+      }
+      const reopened = zf.open(p);
+      try {
+        expect(reopened.get(0).header.get("EAGER")).toBe(label);
+        expect(reopened.get(0).header.get("BATCHED")).toBe(label);
+      } finally {
+        reopened.close();
+      }
+    });
+  }
+
+  test("ordinary flush preserves cached header revisions", () => {
+    const p = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU()]).writeTo(p);
+    const hdul = zf.open(p, "update");
+    try {
+      const hdu = hdul.get(0);
+      const hdr = hdu.header;
+      const revision = hdu._headerRevision;
+      expect(revision).not.toBeNull();
+      const key = new TextEncoder().encode("LOWLEVEL");
+      ll.check(ll.lib.zf_write_key_lng(hdul._handle as bigint, key, key.length, 1n, null, 0));
+      hdul.flush();
+      expect(hdu._headerRevision).toBe(revision);
+      expect(() => hdr.transaction((tx) => tx.set("AFTER", 1))).toThrow(zf.FitsOverflowError);
+    } finally {
+      hdul.close();
+    }
+  });
 });
 
 describe("tables", () => {

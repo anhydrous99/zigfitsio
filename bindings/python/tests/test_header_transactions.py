@@ -87,3 +87,64 @@ def test_header_edit_body_exception_never_calls_backend(tmp_fits):
                 raise RuntimeError("stop")
         assert not called
         assert "TEMP" not in header
+
+
+def test_checksum_flush_invalidates_materialized_header_revision(tmp_fits):
+    """A checksum-updating flush must not strand the Python header on an old revision."""
+
+    path = tmp_fits("checksum-revision.fits")
+    zf.writeto(path, np.arange(4, dtype="i2"), overwrite=True, checksum=True)
+    opts = ll.ZfOpenOpts()
+    opts.checksum_on_close = 1
+
+    with zf.open(path, mode="update", opts=opts) as hdul:
+        header = hdul[0].header
+        assert header._revision is not None
+
+        hdul.flush()  # native checksum replacement advances the HDU's header revision
+        assert header._revision is None
+        header["EAGER"] = 1
+
+        hdul.flush()
+        assert header._revision is None
+        with header.edit():
+            header["BATCHED"] = 2
+
+    with zf.open(path) as hdul:
+        assert hdul[0].header["EAGER"] == 1
+        assert hdul[0].header["BATCHED"] == 2
+
+    with zf.open(path, mode="update") as hdul:
+        header = hdul[0].header
+        revision = header._revision
+        hdul.flush()  # an ordinary flush does not mutate headers or weaken revision checks
+        assert header._revision == revision
+
+
+def test_plain_image_reconstruction_preserves_context_structural_cards():
+    """Table-looking extras remain metadata on an image; real image layout stays data-derived."""
+
+    hdu = zf.PrimaryHDU(np.arange(3, dtype="u1"))
+    hdu.header["BEFORE"] = 1
+    hdu.header["TFIELDS"] = (7, "context-inapplicable image metadata")
+    hdu.header["MIDDLE"] = 2
+    hdu.header["ZTABLE"] = True
+    hdu.header["ZFORM1"] = "1J"
+    hdu.header["ZCTYP1"] = "PIXEL"
+    hdu.header["ZTILELEN"] = 32
+    hdu.header["AFTER"] = 3
+    hdu.header["BITPIX"] = 64  # a real image structural override must still be ignored
+
+    with zf.from_bytes(zf.HDUList([hdu]).to_bytes()) as reopened:
+        header = reopened[0].header
+        assert header["TFIELDS"] == 7
+        assert header.comment_of("TFIELDS") == "context-inapplicable image metadata"
+        assert header["ZTABLE"] is True
+        assert header["ZFORM1"] == "1J"
+        assert header["ZCTYP1"] == "PIXEL"
+        assert header["ZTILELEN"] == 32
+        assert header["BITPIX"] == 8
+        extras = {"BEFORE", "TFIELDS", "MIDDLE", "ZTABLE", "ZFORM1", "ZCTYP1", "ZTILELEN", "AFTER"}
+        assert [key for key in header.keys() if key in extras] == [
+            "BEFORE", "TFIELDS", "MIDDLE", "ZTABLE", "ZFORM1", "ZCTYP1", "ZTILELEN", "AFTER",
+        ]

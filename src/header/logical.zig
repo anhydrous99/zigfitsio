@@ -290,7 +290,16 @@ const StringDecoder = struct {
             self.pending_quote = false;
             try self.emit(alloc, '\'');
         }
-        // pending_spaces intentionally remain unmaterialized: FITS strings ignore trailing blanks.
+        // FITS ignores trailing blanks, except that a present, non-empty string containing only
+        // blanks denotes one space. Keep `''` distinct from `'        '`, matching
+        // value.parseString's single-card semantics without materializing an arbitrarily large
+        // blank suffix.
+        if (self.out.items.len == 0 and self.pending_spaces != 0) {
+            if (self.max_len == 0) return error.LimitExceeded;
+            if (self.out.capacity == 0) try self.out.ensureTotalCapacityPrecise(alloc, 1);
+            self.out.appendAssumeCapacity(' ');
+        }
+        self.pending_spaces = 0;
     }
 
     fn emit(self: *StringDecoder, alloc: Allocator, c: u8) (errors.LimitError || Allocator.Error)!void {
@@ -312,6 +321,16 @@ const StringDecoder = struct {
     }
 };
 
+/// Index of a continuation sentinel in already-isolated quoted content. FITS trailing blanks
+/// inside the quotes are insignificant, so `abc&   ` continues at the ampersand rather than
+/// treating the final blank as the fragment's last character.
+fn continuationSentinel(escaped: []const u8) ?usize {
+    var end = escaped.len;
+    while (end > 0 and escaped[end - 1] == ' ') end -= 1;
+    if (end > 0 and escaped[end - 1] == '&') return end - 1;
+    return null;
+}
+
 fn parseValued(alloc: Allocator, arena: *std.ArrayList(u8), cards: []const Card, first: usize, is_hierarch: bool, max_string: u32, max_arena: u64) !struct { entry: TempEntry, consumed: usize } {
     const base = &cards[first];
     const keyword_bytes = if (is_hierarch) hierarchName(base) else base.name.text();
@@ -325,10 +344,11 @@ fn parseValued(alloc: Allocator, arena: *std.ArrayList(u8), cards: []const Card,
         var comment = sf.comment;
         var malformed = sf.malformed;
         var consumed: usize = 1;
-        const starts_run = sf.escaped.len > 0 and sf.escaped[sf.escaped.len - 1] == '&' and
-            first + 1 < cards.len and cards[first + 1].kind == .continuation;
+        const base_sentinel = if (sf.malformed) null else continuationSentinel(sf.escaped);
+        const starts_run = base_sentinel != null and first + 1 < cards.len and
+            cards[first + 1].kind == .continuation;
         if (starts_run) {
-            try decoded.feed(alloc, sf.escaped[0 .. sf.escaped.len - 1]);
+            try decoded.feed(alloc, sf.escaped[0..base_sentinel.?]);
             var j = first + 1;
             while (j < cards.len and cards[j].kind == .continuation) : (j += 1) {
                 const frag = stringField(cards[j].raw[8..]);
@@ -339,10 +359,11 @@ fn parseValued(alloc: Allocator, arena: *std.ArrayList(u8), cards: []const Card,
                 consumed += 1;
                 malformed = malformed or frag.malformed;
                 if (frag.comment) |c| comment = c;
-                const more = frag.escaped.len > 0 and frag.escaped[frag.escaped.len - 1] == '&' and
-                    j + 1 < cards.len and cards[j + 1].kind == .continuation;
+                const frag_sentinel = if (frag.malformed) null else continuationSentinel(frag.escaped);
+                const more = frag_sentinel != null and j + 1 < cards.len and
+                    cards[j + 1].kind == .continuation;
                 if (more) {
-                    try decoded.feed(alloc, frag.escaped[0 .. frag.escaped.len - 1]);
+                    try decoded.feed(alloc, frag.escaped[0..frag_sentinel.?]);
                 } else {
                     try decoded.feed(alloc, frag.escaped);
                     break;
@@ -504,6 +525,64 @@ test "logical snapshot folds HIERARCH plus CONTINUE" {
     try testing.expectEqualStrings("alphabeta", snap.entries[0].value.string);
     try testing.expect(snap.entries[0].hierarch);
     try testing.expectEqualStrings("provenance", snap.entries[0].comment.?);
+}
+
+test "logical snapshot recognizes blank-padded continuation sentinels in every fragment" {
+    const cards = [_]Card{
+        card80("LONGSTR = 'abc&   '"),
+        card80("CONTINUE  'def&   '"),
+        card80("CONTINUE  'ghi' / final"),
+        card80("END"),
+    };
+    var snap = try Snapshot.build(testing.allocator, &cards, .{});
+    defer snap.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), snap.entries.len);
+    try testing.expect(snap.entries[0].continued);
+    try testing.expectEqual(@as(usize, 3), snap.entries[0].physical_count);
+    try testing.expectEqualStrings("abcdefghi", snap.entries[0].value.string);
+    try testing.expectEqualStrings("final", snap.entries[0].comment.?);
+}
+
+test "logical snapshot never continues through unterminated string fragments" {
+    const malformed_base = [_]Card{
+        card80("BROKEN  = 'abc&"),
+        card80("CONTINUE  'orphan'"),
+        card80("END"),
+    };
+    var base_snap = try Snapshot.build(testing.allocator, &malformed_base, .{});
+    defer base_snap.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), base_snap.entries.len);
+    try testing.expect(base_snap.entries[0].malformed);
+    try testing.expect(!base_snap.entries[0].continued);
+    try testing.expectEqual(@as(usize, 1), base_snap.entries[0].physical_count);
+    try testing.expectEqual(@as(usize, 1), base_snap.entries[1].physical_first);
+
+    const malformed_fragment = [_]Card{
+        card80("LONGSTR = 'abc&'"),
+        card80("CONTINUE  'def&"),
+        card80("CONTINUE  'orphan'"),
+        card80("END"),
+    };
+    var fragment_snap = try Snapshot.build(testing.allocator, &malformed_fragment, .{});
+    defer fragment_snap.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), fragment_snap.entries.len);
+    try testing.expect(fragment_snap.entries[0].malformed);
+    try testing.expect(fragment_snap.entries[0].continued);
+    try testing.expectEqual(@as(usize, 2), fragment_snap.entries[0].physical_count);
+    try testing.expectEqual(@as(usize, 2), fragment_snap.entries[1].physical_first);
+}
+
+test "logical snapshot distinguishes empty and all-blank quoted strings" {
+    const cards = [_]Card{
+        card80("EMPTY   = ''"),
+        card80("BLANKS  = '        '"),
+        card80("END"),
+    };
+    var snap = try Snapshot.build(testing.allocator, &cards, .{});
+    defer snap.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), snap.entries.len);
+    try testing.expectEqualStrings("", snap.entries[0].value.string);
+    try testing.expectEqualStrings(" ", snap.entries[1].value.string);
 }
 
 test "parseAt enforces string limit before allocating a long escaped run" {

@@ -27,6 +27,7 @@ const STRUCTURAL = new Set([
   "EXTEND",
   "PCOUNT",
   "GCOUNT",
+  "GROUPS",
   "XTENSION",
   "END",
   "BSCALE",
@@ -65,6 +66,38 @@ export function isCompStructuralKeyword(up: string): boolean {
     isTableStructuralKeyword(up) ||
     /^Z(IMAGE|SIMPLE|EXTEND|BITPIX|NAXIS\d*|PCOUNT|GCOUNT|TILE\d+|CMPTYPE|NAME\d+|VAL\d+|MASKCMP|QUANTIZ|DITHER0|BLANK|HECKSUM|DATASUM|THEAP)$/.test(up)
   );
+}
+
+// The transaction engine conservatively guards these table/compression names for every HDU kind.
+// On a plain image they are context-inapplicable extra cards, so reconstruction preserves their
+// fixed-format spellings through the legacy typed writer. Keep this synchronized with the engine.
+const CONTEXT_STRUCTURAL = new Set([
+  "TFIELDS",
+  "THEAP",
+  "ZIMAGE",
+  "ZSIMPLE",
+  "ZEXTEND",
+  "ZBITPIX",
+  "ZNAXIS",
+  "ZPCOUNT",
+  "ZGCOUNT",
+  "ZTABLE",
+  "ZTILELEN",
+  "ZCMPTYPE",
+  "ZMASKCMP",
+  "ZQUANTIZ",
+  "ZDITHER0",
+  "ZBLANK",
+  "ZHECKSUM",
+  "ZDATASUM",
+  "ZTHEAP",
+]);
+
+function isContextStructuralKeyword(keyword: string): boolean {
+  const up = keyword.trim().toUpperCase();
+  if (up.length > 8 || up.includes(" ")) return false;
+  if (CONTEXT_STRUCTURAL.has(up)) return true;
+  return /^(TFORM|TBCOL|ZNAXIS|ZTILE|ZFORM|ZCTYP|ZNAME|ZVAL)\d+$/.test(up);
 }
 
 const INT64_MIN = -(2n ** 63n);
@@ -254,14 +287,26 @@ interface ArenaRef {
   len: bigint;
 }
 
+/** FITS header text is ASCII; preserve the legacy TypeScript replacement behavior. */
+function asciiWithReplacement(text: string): Uint8Array {
+  // Iterate UTF-16 code units, matching the pre-batch TypeScript serializer exactly (including
+  // its two replacement bytes for an astral surrogate pair).
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    bytes[i] = code <= 0x7f ? code : 0x3f;
+  }
+  return bytes;
+}
+
 function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
   descriptors: Uint8Array;
   arena: Uint8Array;
 } {
   const chunks: Uint8Array[] = [];
   let arenaLength = 0;
-  const add = (text: string): ArenaRef => {
-    const bytes = enc(text);
+  const add = (text: string, asciiReplace = false): ArenaRef => {
+    const bytes = asciiReplace ? asciiWithReplacement(text) : enc(text);
     if (arenaLength + bytes.length >= 0x1_0000_0000) {
       throw new FitsOverflowError(412, "header transaction arena exceeds the Wasm address space");
     }
@@ -273,8 +318,10 @@ function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
   const descriptors: ll.HeaderOpV1[] = [];
 
   for (const mutation of mutations) {
-    const name = add(mutation.key);
     if (mutation.type === "delete_first" || mutation.type === "delete_all") {
+      const trimmedKey = mutation.key.trim();
+      const hierarch = trimmedKey.length > 8 || trimmedKey.includes(" ");
+      const name = add(hierarch ? trimmedKey : mutation.key, hierarch);
       descriptors.push({
         opcode: mutation.type === "delete_first" ? ll.ZF_HEADER_OP_DELETE_FIRST : ll.ZF_HEADER_OP_DELETE_ALL,
         nameOff: name.off,
@@ -283,7 +330,8 @@ function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
       continue;
     }
     if (mutation.type === "append_commentary") {
-      const text = add(mutation.value === null || mutation.value === undefined ? "" : String(mutation.value));
+      const name = add(mutation.key, true);
+      const text = add(mutation.value === null || mutation.value === undefined ? "" : String(mutation.value), true);
       descriptors.push({
         opcode: ll.ZF_HEADER_OP_APPEND_COMMENTARY,
         nameOff: name.off,
@@ -294,6 +342,9 @@ function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
       continue;
     }
 
+    const trimmedKey = mutation.key.trim();
+    const hierarch = trimmedKey.length > 8 || trimmedKey.includes(" ");
+    const name = add(hierarch ? trimmedKey : mutation.key, hierarch);
     const op: ll.HeaderOpV1 = {
       opcode: ll.ZF_HEADER_OP_UPSERT,
       nameOff: name.off,
@@ -301,7 +352,7 @@ function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
       flags: 0,
     };
     if (mutation.comment !== null) {
-      const comment = add(mutation.comment);
+      const comment = add(mutation.comment, hierarch);
       op.flags = ll.ZF_HEADER_OP_COMMENT_PRESENT;
       op.commentOff = comment.off;
       op.commentLen = comment.len;
@@ -330,7 +381,7 @@ function encodeHeaderMutations(mutations: readonly HeaderMutation[]): {
         op.floatValue = value;
       }
     } else if (typeof value === "string") {
-      const text = add(value);
+      const text = add(value, hierarch);
       op.valueType = ll.ZF_HEADER_VALUE_STRING;
       op.valueOff = text.off;
       op.valueLen = text.len;
@@ -581,7 +632,14 @@ export abstract class BaseHDU {
    * double-applied; it receives the uppercased keyword.
    */
   _applyUserKeys(handle: bigint, skip?: (up: string) => boolean): void {
-    const mutations: HeaderMutation[] = [];
+    let mutations: HeaderMutation[] = [];
+    const flushMutations = (): void => {
+      if (mutations.length === 0) return;
+      const current = ll.newLongArray(1);
+      ll.check(ll.lib.zf_current_hdu(handle, current));
+      applyHeaderMutations(handle, BigInt(ll.readLongAt(current, 0)), mutations, null);
+      mutations = [];
+    };
     for (const [kw, value, comment] of this.header.cards()) {
       const up = kw.toUpperCase();
       if (isStructuralKeyword(kw)) continue;
@@ -597,16 +655,21 @@ export abstract class BaseHDU {
         continue;
       }
       if (value === undefined) continue;
+      // The transaction engine guards table/compression layout names globally, but on a plain
+      // image those names are context-inapplicable and FITS permits them as extra cards. Preserve
+      // them through the legacy typed writer while reconstruction targets a brand-new image HDU;
+      // attached edits still go through the guarded transaction API.
+      if ((this.kind === "primary" || this.kind === "image") && isContextStructuralKeyword(up)) {
+        flushMutations();
+        writeKeyValue(handle, kw, value, comment || null);
+        continue;
+      }
       mutations.push({ type: "upsert", key: kw, value, comment: comment || null });
     }
     if (this._name) {
       mutations.push({ type: "upsert", key: "EXTNAME", value: this._name, comment: null });
     }
-    if (mutations.length > 0) {
-      const current = ll.newLongArray(1);
-      ll.check(ll.lib.zf_current_hdu(handle, current));
-      applyHeaderMutations(handle, BigInt(ll.readLongAt(current, 0)), mutations, null);
-    }
+    flushMutations();
   }
 }
 

@@ -239,13 +239,13 @@ pub fn isStructural(name: []const u8) bool {
         "GROUPS",  "XTENSION", "END",      "BSCALE",   "BZERO",    "TFIELDS",
         "THEAP",   "ZIMAGE",   "ZSIMPLE",  "ZEXTEND",  "ZBITPIX",  "ZNAXIS",
         "ZPCOUNT", "ZGCOUNT",  "ZCMPTYPE", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0",
-        "ZBLANK",  "ZHECKSUM", "ZDATASUM", "ZTHEAP",
+        "ZBLANK",  "ZHECKSUM", "ZDATASUM", "ZTHEAP",   "ZTABLE",   "ZTILELEN",
     };
     for (exact) |kw| if (std.ascii.eqlIgnoreCase(n, kw)) return true;
     // NAXIS historically rejects every prefixed spelling, not only a numeric suffix. The other
     // families are indexed physical-layout descriptors and require at least one decimal digit.
     if (std.ascii.startsWithIgnoreCase(n, "NAXIS")) return true;
-    const indexed = [_][]const u8{ "TFORM", "TBCOL", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL" };
+    const indexed = [_][]const u8{ "TFORM", "TBCOL", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "ZFORM", "ZCTYP" };
     for (indexed) |prefix| if (hasNumericSuffix(n, prefix)) return true;
     return false;
 }
@@ -971,7 +971,10 @@ test "any later failure discards prior staged edits and structural keywords are 
         error.StructuralKeyword,
         apply(testing.allocator, &source, &.{.{ .rename = .{ .old = "USER", .new = "NAXISFOO" } }}),
     );
-    inline for (.{ "GROUPS", "TFIELDS", "THEAP", "TFORM1", "TBCOL2", "ZBITPIX", "ZNAXIS3", "ZTILE1", "ZCMPTYPE" }) |name| {
+    inline for (.{
+        "GROUPS", "TFIELDS",  "THEAP",  "TFORM1",   "TBCOL2", "ZBITPIX", "ZNAXIS3",
+        "ZTILE1", "ZCMPTYPE", "ZTABLE", "ZTILELEN", "ZFORM1", "ZCTYP2",
+    }) |name| {
         try testing.expect(isStructural(name));
         try testing.expectError(
             error.StructuralKeyword,

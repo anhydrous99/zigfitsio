@@ -978,11 +978,24 @@ pub export fn zf_key_comment(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: u
     return 0;
 }
 
+/// Serialize a legacy in-place header mutation and keep snapshot generations honest on every
+/// exit. `rewriteHeaderInPlace` advances the revision on success; if serialization fails after
+/// the caller already changed live cards, advance it here and discard any cached pre-mutation
+/// snapshot before returning the error.
+fn rewriteChangedHeader(h: *Handle, hdu: *fits.Hdu) c_int {
+    h.fits.rewriteHeaderInPlace(hdu) catch |e| {
+        hdu.bumpHeaderRevision();
+        h.clearHeaderSnapshot();
+        return abi.fail(&h.diag, e);
+    };
+    h.clearHeaderSnapshot();
+    return 0;
+}
+
 fn writeKey(h: *Handle, name: []const u8, v: fits.KeywordValue, comment: ?[]const u8) c_int {
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.update(gpa, name, v, comment) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Create or update an integer keyword.
@@ -1014,16 +1027,34 @@ pub export fn zf_write_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const name = name_ptr[0..name_len];
-    hdu.header.delete(name) catch {}; // replace if present
+    // Build and reserve the complete replacement before deleting the old logical run. In
+    // particular, an unrepresentable final comment must not delete the existing keyword and
+    // leave a same-revision snapshot cache describing cards that are no longer live.
     const cards = fits.continuation.split(gpa, name, value_ptr[0..value_len], commentOf(comment_ptr, comment_len)) catch |e| return abi.fail(&h.diag, e);
     defer gpa.free(cards);
+    const reserve = std.math.add(usize, hdu.header.cards.items.len, cards.len) catch return abi.fail(&h.diag, error.LimitExceeded);
+    hdu.header.cards.ensureTotalCapacityPrecise(gpa, reserve) catch |e| return abi.fail(&h.diag, e);
+
+    const count_before_delete = hdu.header.count();
+    var mutated = false;
+    hdu.header.delete(name) catch |e| switch (e) {
+        error.KeywordNotFound => {}, // create when absent
+        else => return abi.fail(&h.diag, e),
+    };
+    mutated = hdu.header.count() != count_before_delete;
     var idx = endIndex(&hdu.header);
     for (cards) |c| {
-        hdu.header.insert(gpa, idx, c) catch |e| return abi.fail(&h.diag, e);
+        hdu.header.insert(gpa, idx, c) catch |e| {
+            if (mutated) {
+                hdu.bumpHeaderRevision();
+                h.clearHeaderSnapshot();
+            }
+            return abi.fail(&h.diag, e);
+        };
+        mutated = true;
         idx += 1;
     }
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Create or update a keyword with an undefined (blank) value field (FITS 4.0 §4.1.2.3).
@@ -1037,8 +1068,7 @@ pub export fn zf_delete_key(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: us
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.delete(name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Rename keyword `old` to `new`.
@@ -1046,8 +1076,7 @@ pub export fn zf_rename_key(h_opt: ?*Handle, old_ptr: [*]const u8, old_len: usiz
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.rename(old_ptr[0..old_len], new_ptr[0..new_len]) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Insert a raw 80-byte card before END. Like CFITSIO's `ffprec`, the value field is NOT
@@ -1058,8 +1087,7 @@ pub export fn zf_write_record(h_opt: ?*Handle, card80: [*]const u8) c_int {
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const card = fits.Card.parse(card80[0..80]) catch |e| return abi.fail(&h.diag, e);
     hdu.header.insert(gpa, endIndex(&hdu.header), card) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Insert a raw 80-byte card at `index` (0-based).
@@ -1069,8 +1097,7 @@ pub export fn zf_insert_record(h_opt: ?*Handle, index: c_long, card80: [*]const 
     if (index < 0 or @as(usize, @intCast(index)) > hdu.header.count()) return abi.fail(&h.diag, error.KeywordNotFound);
     const card = fits.Card.parse(card80[0..80]) catch |e| return abi.fail(&h.diag, e);
     hdu.header.insert(gpa, @intCast(index), card) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1863,8 +1890,19 @@ pub export fn zf_copy_hdu(h_opt: ?*Handle, src_n: c_long) c_int {
 pub export fn zf_write_chksum(h_opt: ?*Handle) c_int {
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
-    fits.checksum.ensureCards(&hdu.header, gpa) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
+    const had_datasum = hdu.header.has("DATASUM");
+    const had_checksum = hdu.header.has("CHECKSUM");
+    fits.checksum.ensureCards(&hdu.header, gpa) catch |e| {
+        // ensureCards adds the two placeholders separately. If the second allocation fails after
+        // the first succeeded, that partial live mutation must invalidate a retained snapshot.
+        if (hdu.header.has("DATASUM") != had_datasum or hdu.header.has("CHECKSUM") != had_checksum) {
+            hdu.bumpHeaderRevision();
+            h.clearHeaderSnapshot();
+        }
+        return abi.fail(&h.diag, e);
+    };
+    const rewrite_status = rewriteChangedHeader(h, hdu);
+    if (rewrite_status != 0) return rewrite_status;
     fits.checksum.update(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }

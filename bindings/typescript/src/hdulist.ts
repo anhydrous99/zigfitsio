@@ -21,6 +21,8 @@ export class HDUList implements Iterable<AnyHDU> {
   /** @internal */ _handle: bigint | null = null;
   /** @internal */ _mode: number = ll.READONLY;
   /** @internal */ _owns = false;
+  /** @internal Whether `zf_flush` may rewrite checksum cards and advance header revisions. */
+  _checksumOnClose = false;
   /**
    * @internal The on-disk path this list was opened from, or null when it was
    * opened from bytes / built in memory. A writable open writes the updated
@@ -44,11 +46,12 @@ export class HDUList implements Iterable<AnyHDU> {
 
   // ── opening ──
   /** @internal */
-  static _fromHandle(handle: bigint, mode: number): HDUList {
+  static _fromHandle(handle: bigint, mode: number, checksumOnClose = false): HDUList {
     const hl = new HDUList();
     hl._handle = handle;
     hl._mode = mode;
     hl._owns = true;
+    hl._checksumOnClose = checksumOnClose;
     try {
       hl._scan();
     } catch (e) {
@@ -179,7 +182,18 @@ export class HDUList implements Iterable<AnyHDU> {
         }
       }
     }
-    ll.check(ll.lib.zf_flush(this._handle));
+    try {
+      ll.check(ll.lib.zf_flush(this._handle));
+    } finally {
+      // checksumOnClose may rewrite CHECKSUM/DATASUM and advance native header generations. It
+      // can mutate earlier HDUs before a later flush error, so invalidate even on failure; the next
+      // eager edit must establish a fresh generation instead of presenting a stale revision.
+      if (this._checksumOnClose) {
+        for (const hdu of this.hdus) {
+          if (hdu._hdulist === this) hdu._headerRevision = null;
+        }
+      }
+    }
   }
 
   /** @internal Whether list position `i` still holds the HDU attached to this file's slot `i + 1`. */

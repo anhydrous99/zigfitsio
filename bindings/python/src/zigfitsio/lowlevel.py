@@ -240,6 +240,8 @@ class ZfHeaderOpV1(_c.Structure):
 
 
 class ZfHeaderApplyOptsV1(_c.Structure):
+    """Optimistic-revision options for one logical-header edit batch."""
+
     _fields_ = [
         ("expected_revision", U64),
         ("flags", U32),
@@ -248,6 +250,8 @@ class ZfHeaderApplyOptsV1(_c.Structure):
 
 
 class ZfHeaderApplyResultV1(_c.Structure):
+    """Revision, failure index, and physical-card counts returned by a header edit batch."""
+
     _fields_ = [
         ("new_revision", U64),
         ("failed_op", U64),

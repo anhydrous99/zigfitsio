@@ -1221,6 +1221,124 @@ test "zf_write_key_longstr replace does not orphan the old CONTINUE run (BUGHUNT
     try testing.expectEqualStrings(short, out_ptr.?[0..out_len]);
 }
 
+test "failed long-string replacement preserves the live header and pending snapshot" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const name = "LONGSTR";
+    const original = "original 'quoted' value " ** 6;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        capi.zf_write_key_longstr(hh, name, name.len, original, original.len, null, 0),
+    );
+
+    // Retain a query/fill cache, then fail while preparing the replacement's final card. The old
+    // implementation deleted the live run before split rejected this unrepresentable comment,
+    // leaving the cache falsely current at the unchanged revision.
+    var queried: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &queried));
+    const entries = try testing.allocator.alloc(abi.ZfHeaderEntryV1, @intCast(queried.logical_count));
+    defer testing.allocator.free(entries);
+    const arena = try testing.allocator.alloc(u8, @intCast(queried.arena_bytes));
+    defer testing.allocator.free(arena);
+
+    const replacement = "replacement" ** 12;
+    const oversized_comment = "c" ** 80;
+    try testing.expectEqual(
+        @as(c_int, 207),
+        capi.zf_write_key_longstr(
+            hh,
+            name,
+            name.len,
+            replacement,
+            replacement.len,
+            oversized_comment,
+            oversized_comment.len,
+        ),
+    );
+    try testing.expectEqual(queried.revision, hh.fits.current().header_revision);
+
+    var filled: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_fill_v1(
+        hh,
+        1,
+        0,
+        queried.revision,
+        entries.ptr,
+        entries.len,
+        arena.ptr,
+        arena.len,
+        null,
+        0,
+        &filled,
+    ));
+    try testing.expectEqual(queried.revision, filled.revision);
+
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_longstr(hh, name, name.len, &out_ptr, &out_len));
+    defer capi.zf_free(out_ptr, out_len);
+    try testing.expectEqualStrings(std.mem.trimEnd(u8, original, " "), out_ptr.?[0..out_len]);
+}
+
+test "failed legacy rewrite invalidates the old snapshot generation" {
+    var source: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    defer capi.zf_close(source);
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const serialized = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(serialized);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, serialized.ptr, serialized.len, &got));
+    try testing.expectEqual(serialized.len, got);
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(serialized.ptr, serialized.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+
+    var before: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(ro, 1, 0, &before));
+
+    // Header.update changes the in-memory cards before the read-only device rejects serialization.
+    // The failed rewrite must still advance the observable generation and discard `before`'s
+    // retained snapshot.
+    const name = "MUTATED";
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_key_lng(ro, name, name.len, 7, null, 0));
+    try testing.expect(before.revision != ro.fits.current().header_revision);
+
+    var untouched: abi.ZfHeaderSnapshotInfoV1 = .{ .revision = 0xfeed_beef };
+    try testing.expectEqual(@as(c_int, 412), capi.zf_header_snapshot_fill_v1(
+        ro,
+        1,
+        0,
+        before.revision,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        &untouched,
+    ));
+    try testing.expectEqual(@as(u64, 0xfeed_beef), untouched.revision);
+
+    var after: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(ro, 1, 0, &after));
+    try testing.expect(after.revision != before.revision);
+    try testing.expectEqual(before.logical_count + 1, after.logical_count);
+    var value: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(ro, name, name.len, &value));
+    try testing.expectEqual(@as(c_longlong, 7), value);
+}
+
 test "zf_delete_key removes a HIERARCH+CONTINUE run inserted via zf_write_record" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

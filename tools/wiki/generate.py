@@ -245,6 +245,14 @@ def _header_python_abi() -> list[dict[str, Any]]:
         "double": "f64_ptr",
         "float": "f32_ptr",
     }
+    structure_pointers = {
+        "ZfColInfo": "col_info_ptr",
+        "ZfHeaderSnapshotInfoV1": "header_snapshot_info_ptr",
+        "ZfHeaderEntryV1": "header_entry_ptr",
+        "ZfHeaderApplyOptsV1": "header_apply_opts_ptr",
+        "ZfHeaderOpV1": "header_op_ptr",
+        "ZfHeaderApplyResultV1": "header_apply_result_ptr",
+    }
 
     def normalize(
         value: str, *, returns: bool = False, function: str = "", index: int = -1
@@ -260,8 +268,8 @@ def _header_python_abi() -> list[dict[str, Any]]:
             return "char_ptr" if depth == 1 else "char_ptr_ptr" if depth == 2 else ""
         if base == "uint8_t":
             return "char_ptr" if depth == 1 else "void_ptr_ptr" if depth == 2 else ""
-        if base == "ZfColInfo" and depth == 1:
-            return "col_info_ptr"
+        if depth == 1 and base in structure_pointers:
+            return structure_pointers[base]
         if base in {"void", "ZfFits", "ZfTable", "ZfFindings", "ZfOpenOpts", "ZfScaling"}:
             return "void_ptr" if depth == 1 else "void_ptr_ptr" if depth == 2 else ""
         if depth == 1 and base in pointer_scalars:
@@ -346,6 +354,16 @@ def _normalize_python_abi(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "PCHARP": "char_ptr_ptr",
         "ctypes.POINTER(ZfColInfo)": "col_info_ptr",
         "_c.POINTER(ZfColInfo)": "col_info_ptr",
+        "ctypes.POINTER(ZfHeaderSnapshotInfoV1)": "header_snapshot_info_ptr",
+        "_c.POINTER(ZfHeaderSnapshotInfoV1)": "header_snapshot_info_ptr",
+        "ctypes.POINTER(ZfHeaderEntryV1)": "header_entry_ptr",
+        "_c.POINTER(ZfHeaderEntryV1)": "header_entry_ptr",
+        "ctypes.POINTER(ZfHeaderApplyOptsV1)": "header_apply_opts_ptr",
+        "_c.POINTER(ZfHeaderApplyOptsV1)": "header_apply_opts_ptr",
+        "ctypes.POINTER(ZfHeaderOpV1)": "header_op_ptr",
+        "_c.POINTER(ZfHeaderOpV1)": "header_op_ptr",
+        "ctypes.POINTER(ZfHeaderApplyResultV1)": "header_apply_result_ptr",
+        "_c.POINTER(ZfHeaderApplyResultV1)": "header_apply_result_ptr",
     }
 
     def normalize(value: Any, *, returns: bool = False) -> str:

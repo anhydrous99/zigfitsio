@@ -425,8 +425,61 @@ def _apply_header_batch(handle, hdu_index: int, abstract_ops, expected_revision=
 
 # Structural keywords the library derives from the data; user header edits must not overwrite them.
 _STRUCTURAL = {
-    "SIMPLE", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "XTENSION", "END", "BSCALE", "BZERO",
+    "SIMPLE", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "GROUPS", "XTENSION", "END", "BSCALE", "BZERO",
 }
+
+# The V1 edit engine conservatively treats table/compression layout names as structural for every
+# HDU kind. On a plain IMAGE/primary HDU those names are context-inapplicable extra cards, however,
+# and the reconstruction path must preserve them just as the legacy writer did. These are all
+# fixed-format (<=8-character) spellings; true image structural cards are filtered by `_STRUCTURAL`
+# before this classifier is consulted.
+_CONTEXT_STRUCTURAL = {
+    "TFIELDS", "THEAP", "ZIMAGE", "ZSIMPLE", "ZEXTEND", "ZBITPIX", "ZNAXIS", "ZPCOUNT",
+    "ZGCOUNT", "ZCMPTYPE", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0", "ZBLANK", "ZHECKSUM",
+    "ZDATASUM", "ZTHEAP", "ZTABLE", "ZTILELEN",
+}
+_CONTEXT_STRUCTURAL_INDEXED = (
+    "TFORM", "TBCOL", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "ZFORM", "ZCTYP",
+)
+
+
+def _is_context_structural_keyword(keyword: str) -> bool:
+    """Whether V1 rejects this fixed-format name although it is not structural for an image."""
+
+    up = keyword.strip().upper()
+    if len(up) > 8 or " " in up:
+        return False
+    if up in _CONTEXT_STRUCTURAL:
+        return True
+    return any(up.startswith(prefix) and up[len(prefix):].isdigit() for prefix in _CONTEXT_STRUCTURAL_INDEXED)
+
+
+def _write_legacy_key(handle, key: str, value: Any, comment: str | None) -> None:
+    """Write one fixed-format key through the legacy typed ABI.
+
+    Used only while reconstructing an image card whose name the kind-agnostic V1 transaction
+    policy classifies as structural. The freshly built destination HDU remains authoritative for
+    its real image-layout cards; this path preserves context-inapplicable extras such as TFIELDS.
+    """
+
+    value = _coerce_kw_value(value)
+    kb = _enc(key)
+    cb = _enc(comment) if comment else None
+    cl = len(cb) if cb else 0
+    if value is None:
+        ll.check(ll.lib.zf_write_key_undef(handle, kb, len(kb), cb, cl))
+    elif isinstance(value, bool):
+        ll.check(ll.lib.zf_write_key_log(handle, kb, len(kb), 1 if value else 0, cb, cl))
+    elif isinstance(value, int):
+        ll.check(ll.lib.zf_write_key_lng(handle, kb, len(kb), value, cb, cl))
+    elif isinstance(value, float):
+        ll.check(ll.lib.zf_write_key_dbl(handle, kb, len(kb), value, cb, cl))
+    else:
+        vb = _enc(str(value))
+        if len(vb) <= 68:
+            ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), vb, len(vb), cb, cl))
+        else:
+            ll.check(ll.lib.zf_write_key_longstr(handle, kb, len(kb), vb, len(vb), cb, cl))
 
 
 def _blank_defined(header) -> bool:
@@ -799,6 +852,12 @@ class ImageHDU(_HDU):
 
     def _apply_user_keys(self, handle, skip=None):
         ops = []
+
+        def apply_pending():
+            if ops:
+                _apply_header_batch(handle, _header_current_index(handle), ops)
+                ops.clear()
+
         for kw, value, comment in self.header.cards():
             up = kw.upper()
             if up in _STRUCTURAL or up.startswith("NAXIS"):
@@ -820,11 +879,16 @@ class ImageHDU(_HDU):
                 for chunk in _wrap_commentary(value):
                     ops.append(("append_commentary", up, chunk))
                 continue
+            if _is_context_structural_keyword(up):
+                # V1 rejects this name, so commit the preceding batch before using the legacy typed
+                # writer. Flushing at the boundary preserves the user's original card order.
+                apply_pending()
+                _write_legacy_key(handle, kw, value, comment)
+                continue
             ops.append(("upsert", kw, value, comment))
         if self._name:
             ops.append(("upsert", "EXTNAME", self._name, ""))
-        if ops:
-            _apply_header_batch(handle, _header_current_index(handle), ops)
+        apply_pending()
 
 
 class PrimaryHDU(ImageHDU):
@@ -1401,6 +1465,7 @@ class HDUList(list):
         self._handle = None
         self._mode = ll.READONLY
         self._owns = False
+        self._checksum_on_close = False
         self._scanned_count = 0  # HDUs scanned from the source (for the pristine-copy fast path)
         # Set when an in-memory edit is NOT reflected in the open C handle's bytes (a data
         # replacement, or a header edit in read-only mode where nothing is persisted). Such an edit
@@ -1410,11 +1475,12 @@ class HDUList(list):
 
     # ── opening ───────────────────────────────────────────────────────────────────────────
     @classmethod
-    def _from_handle(cls, handle, mode):
+    def _from_handle(cls, handle, mode, checksum_on_close=False):
         hl = cls()
         hl._handle = handle
         hl._mode = mode
         hl._owns = True
+        hl._checksum_on_close = bool(checksum_on_close)
         hl._scan()
         return hl
 
@@ -1486,7 +1552,18 @@ class HDUList(list):
                         )
                 elif isinstance(hdu, (ImageHDU, _TableHDU)):
                     hdu._flush_data()
-        ll.check(ll.lib.zf_flush(self._handle))
+        try:
+            ll.check(ll.lib.zf_flush(self._handle))
+        finally:
+            # checksum_on_close recomputes DATASUM/CHECKSUM inside zf_flush and advances the native
+            # header revisions. There is no cheap revision-only query, so invalidate materialized
+            # snapshots; the next successful edit commits without a stale check and establishes the
+            # current revision from ZfHeaderApplyResultV1. Do this even on failure because checksum
+            # processing can mutate an earlier HDU before a later device error is reported.
+            if self._checksum_on_close:
+                for hdu in self:
+                    if hdu._hdulist is self and hdu._header is not None:
+                        hdu._header._revision = None
 
     def _attached_at(self, hdu, i: int) -> bool:
         """Whether list position ``i`` still holds the HDU attached to this file's slot ``i + 1``."""
@@ -1739,7 +1816,11 @@ def open(path, mode: str = "readonly", opts: ll.ZfOpenOpts | None = None) -> HDU
         ll.check(ll.lib.zf_open_gzip(raw, len(raw), optref, c.byref(handle)))
     else:
         ll.check(ll.lib.zf_open_file(pb, len(pb), mode_code, optref, c.byref(handle)))
-    return HDUList._from_handle(handle, mode_code)
+    return HDUList._from_handle(
+        handle,
+        mode_code,
+        checksum_on_close=opts is not None and opts.checksum_on_close != 0,
+    )
 
 
 def from_bytes(data: bytes, mode: str = "readonly") -> HDUList:

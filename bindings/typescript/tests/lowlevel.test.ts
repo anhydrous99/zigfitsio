@@ -433,7 +433,8 @@ describe("wasm buf-direction map", () => {
   test("prototype count and packed VLA directions match the ABI", () => {
     expect(PROTOS).toHaveLength(92);
     expect(BUF_DIRS.zf_header_snapshot_query_v1).toEqual({ 3: "out" });
-    expect(BUF_DIRS.zf_header_snapshot_fill_v1).toEqual({ 4: "out", 6: "out", 8: "out", 10: "out" });
+    // Failure-atomic fill buffers intentionally retain the safe default "inout" staging.
+    expect(BUF_DIRS.zf_header_snapshot_fill_v1).toBeUndefined();
     expect(BUF_DIRS.zf_header_apply_v1).toEqual({ 2: "in", 3: "in", 5: "in", 7: "out" });
     expect(BUF_DIRS.zf_read_col_vla_layout).toEqual({ 4: "out", 6: "out" });
     expect(BUF_DIRS.zf_read_col_vla_packed).toEqual({ 5: "out" });
@@ -448,6 +449,49 @@ describe("wasm buf-direction map", () => {
       }
     });
   }
+});
+
+describe("wasm failure-atomic copy-back", () => {
+  test("zf_header_snapshot_fill_v1 preserves every caller buffer on failure", () => {
+    let next = 64;
+    const ex = {
+      memory: new WebAssembly.Memory({ initial: 1 }),
+      zf_walloc: (len: number) => {
+        const out = next;
+        next += Math.max(len, 1);
+        return out;
+      },
+      zf_wfree: () => undefined,
+      // BUFFER_TOO_SMALL (status 412): the C ABI guarantees no output buffer is modified.
+      zf_header_snapshot_fill_v1: () => 412,
+    } as unknown as WasmExports;
+    const proto = PROTOS.find((p) => p.name === "zf_header_snapshot_fill_v1")!;
+    const lib = openWasmLibrary(ex, [proto]);
+    const entries = Uint8Array.from([1, 2, 3, 4, 5]);
+    const arena = Uint8Array.from([11, 12, 13, 14]);
+    const physical = Uint8Array.from([21, 22, 23]);
+    const result = Uint8Array.from([31, 32, 33, 34, 35, 36]);
+
+    expect(
+      lib.fn.zf_header_snapshot_fill_v1(
+        1n,
+        1n,
+        0,
+        7n,
+        entries,
+        1,
+        arena,
+        arena.length,
+        physical,
+        1,
+        result,
+      ),
+    ).toBe(412);
+    expect(Array.from(entries)).toEqual([1, 2, 3, 4, 5]);
+    expect(Array.from(arena)).toEqual([11, 12, 13, 14]);
+    expect(Array.from(physical)).toEqual([21, 22, 23]);
+    expect(Array.from(result)).toEqual([31, 32, 33, 34, 35, 36]);
+  });
 });
 
 describe("wasm32 marshalling limits", () => {
