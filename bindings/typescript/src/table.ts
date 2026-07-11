@@ -8,7 +8,8 @@
 import { FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
-import { BaseHDU, DATA_UNSET, writeConventionOffset, writeKeyValue, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
+import { BaseHDU, DATA_UNSET, writeConventionOffset, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
+import type { HeaderMutation } from "./header.js";
 import type { ElementOf } from "./fitsarray.js";
 import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
 
@@ -1022,8 +1023,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     // reorder/subset would leave them labeling the wrong column (a TNULLn on a
     // float column is even spec-invalid). They are re-emitted below at each
     // column's new position instead.
-    const indexedMeta = /^T(NULL|DISP|DIM)\d+$/;
-    this._applyUserKeys(handle, (up) => isTableStructuralKeyword(up) || (srcIndex !== null && indexedMeta.test(up)));
+    const remappedMetadata: HeaderMutation[] = [];
     if (srcIndex !== null) {
       for (let i = 0; i < srcIndex.length; i++) {
         const j = srcIndex[i];
@@ -1031,10 +1031,21 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
         for (const base of ["TNULL", "TDISP", "TDIM"] as const) {
           const v = this.header.get(`${base}${j + 1}`);
           if (v === undefined || v === null) continue;
-          writeKeyValue(handle, `${base}${i + 1}`, v, this.header.commentOf(`${base}${j + 1}`) || null);
+          remappedMetadata.push({
+            type: "upsert",
+            key: `${base}${i + 1}`,
+            value: v,
+            comment: this.header.commentOf(`${base}${j + 1}`) || null,
+          });
         }
       }
     }
+    const indexedMeta = /^T(NULL|DISP|DIM)\d+$/;
+    this._applyUserKeys(
+      handle,
+      (up) => isTableStructuralKeyword(up) || (srcIndex !== null && indexedMeta.test(up)),
+      remappedMetadata,
+    );
 
     withTable(handle, (t) => {
       for (let i = 0; i < cols.length; i++) {

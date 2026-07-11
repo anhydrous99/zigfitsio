@@ -31,7 +31,7 @@ class GenerateWikiTests(unittest.TestCase):
 
     def test_c_header_has_ordered_neutral_abi(self) -> None:
         prototypes = _header_zf_prototypes()
-        self.assertEqual(len(prototypes), 89)
+        self.assertEqual(len(prototypes), 92)
         self.assertEqual(
             prototypes[0],
             {"name": "zf_version", "returns": "cstring_ret", "args": []},
@@ -50,6 +50,26 @@ class GenerateWikiTests(unittest.TestCase):
         self.assertEqual(typescript["zf_open_file"]["args"][3], "buf")
         self.assertEqual(typescript["zf_create_tbl"]["args"][-4], "cstr_arr")
         self.assertEqual(typescript["zf_create_tbl"]["args"][-1], "cstr")
+        self.assertEqual(
+            python["zf_header_snapshot_query_v1"]["args"],
+            ["void_ptr", "u64", "u32", "header_snapshot_info_ptr"],
+        )
+        self.assertEqual(
+            python["zf_header_snapshot_fill_v1"]["args"],
+            [
+                "void_ptr", "u64", "u32", "u64", "header_entry_ptr", "usize",
+                "char_ptr", "usize", "char_ptr", "usize", "header_snapshot_info_ptr",
+            ],
+        )
+        self.assertEqual(
+            python["zf_header_apply_v1"]["args"],
+            [
+                "void_ptr", "u64", "header_apply_opts_ptr", "header_op_ptr", "usize",
+                "char_ptr", "usize", "header_apply_result_ptr",
+            ],
+        )
+        self.assertEqual(typescript["zf_header_snapshot_query_v1"]["args"][-1], "buf")
+        self.assertEqual(typescript["zf_header_apply_v1"]["args"][2:4], ["buf", "buf"])
 
         wrong = [dict(item) for item in _header_python_abi()]
         wrong[17] = {**wrong[17], "args": ["void_ptr", "i64_ptr"]}

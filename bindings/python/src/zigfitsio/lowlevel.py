@@ -18,15 +18,27 @@ __all__ = [
     # ctypes aliases used to construct calls to ``lib.zf_*``.
     "VOID", "INT", "LONG", "LL", "SZ", "FLT", "DBL", "U32", "U64", "I64", "CHARP",
     "PSZ", "PVOID", "PINT", "PLONG", "PLL", "PDBL", "PU64", "PCHARP",
-    # Datatype, mode, HDU, and table constants.
+    # Datatype, mode, HDU, table, and logical-header constants.
     "ZF_UINT8", "ZF_INT8", "ZF_INT16", "ZF_UINT16", "ZF_INT32", "ZF_UINT32",
     "ZF_INT64", "ZF_UINT64", "ZF_FLOAT32", "ZF_FLOAT64", "ZF_BOOL", "ZF_BIT",
     "ZF_STRING", "ZF_COMPLEX64", "ZF_COMPLEX128",
     "READONLY", "READWRITE", "CREATE",
     "HDU_PRIMARY", "HDU_IMAGE", "HDU_ASCII_TABLE", "HDU_BINARY_TABLE", "HDU_RANDOM_GROUPS",
     "BINARY_TBL", "ASCII_TBL",
+    "ZF_HEADER_SNAPSHOT_INCLUDE_RAW",
+    "ZF_HEADER_ENTRY_VALUE", "ZF_HEADER_ENTRY_COMMENTARY", "ZF_HEADER_ENTRY_BLANK", "ZF_HEADER_ENTRY_OTHER",
+    "ZF_HEADER_VALUE_NONE", "ZF_HEADER_VALUE_UNDEFINED", "ZF_HEADER_VALUE_LOGICAL",
+    "ZF_HEADER_VALUE_INT64", "ZF_HEADER_VALUE_INTEGER_TEXT", "ZF_HEADER_VALUE_FLOAT64",
+    "ZF_HEADER_VALUE_STRING", "ZF_HEADER_VALUE_RAW_TOKEN",
+    "ZF_HEADER_ENTRY_HIERARCH", "ZF_HEADER_ENTRY_CONTINUED", "ZF_HEADER_ENTRY_MALFORMED",
+    "ZF_HEADER_OP_UPSERT", "ZF_HEADER_OP_DELETE_FIRST", "ZF_HEADER_OP_DELETE_ALL",
+    "ZF_HEADER_OP_RENAME", "ZF_HEADER_OP_APPEND_COMMENTARY", "ZF_HEADER_OP_APPEND_RAW_RUN",
+    "ZF_HEADER_OP_INSERT_RAW_RUN", "ZF_HEADER_OP_RESERVE_BLANKS",
+    "ZF_HEADER_OP_COMMENT_PRESENT", "ZF_HEADER_OP_STRICT", "ZF_HEADER_OP_FORCE_HIERARCH",
+    "ZF_HEADER_APPLY_CHECK_REVISION",
     # C-compatible structures.
-    "ZfOpenOpts", "ZfScaling", "ZfColInfo",
+    "ZfOpenOpts", "ZfScaling", "ZfColInfo", "ZfHeaderSnapshotInfoV1", "ZfHeaderEntryV1",
+    "ZfHeaderOpV1", "ZfHeaderApplyOptsV1", "ZfHeaderApplyResultV1",
     # Exceptions and helpers.
     "FitsError", "FitsIOError", "FitsMemoryError", "FitsHeaderError", "KeywordNotFound",
     "FitsStructError", "FitsTableError", "FitsTypeError", "FitsOverflowError",
@@ -90,6 +102,41 @@ HDU_RANDOM_GROUPS = 4
 BINARY_TBL = 0
 ASCII_TBL = 1
 
+# Logical-header snapshot/edit V1 constants.
+ZF_HEADER_SNAPSHOT_INCLUDE_RAW = 0x00000001
+
+ZF_HEADER_ENTRY_VALUE = 1
+ZF_HEADER_ENTRY_COMMENTARY = 2
+ZF_HEADER_ENTRY_BLANK = 3
+ZF_HEADER_ENTRY_OTHER = 4
+
+ZF_HEADER_VALUE_NONE = 0
+ZF_HEADER_VALUE_UNDEFINED = 1
+ZF_HEADER_VALUE_LOGICAL = 2
+ZF_HEADER_VALUE_INT64 = 3
+ZF_HEADER_VALUE_INTEGER_TEXT = 4
+ZF_HEADER_VALUE_FLOAT64 = 5
+ZF_HEADER_VALUE_STRING = 6
+ZF_HEADER_VALUE_RAW_TOKEN = 7
+
+ZF_HEADER_ENTRY_HIERARCH = 0x00000001
+ZF_HEADER_ENTRY_CONTINUED = 0x00000002
+ZF_HEADER_ENTRY_MALFORMED = 0x00000004
+
+ZF_HEADER_OP_UPSERT = 1
+ZF_HEADER_OP_DELETE_FIRST = 2
+ZF_HEADER_OP_DELETE_ALL = 3
+ZF_HEADER_OP_RENAME = 4
+ZF_HEADER_OP_APPEND_COMMENTARY = 5
+ZF_HEADER_OP_APPEND_RAW_RUN = 6
+ZF_HEADER_OP_INSERT_RAW_RUN = 7
+ZF_HEADER_OP_RESERVE_BLANKS = 8
+
+ZF_HEADER_OP_COMMENT_PRESENT = 0x00000001
+ZF_HEADER_OP_STRICT = 0x00000002
+ZF_HEADER_OP_FORCE_HIERARCH = 0x00000004
+ZF_HEADER_APPLY_CHECK_REVISION = 0x00000001
+
 
 # ── C structs (must match bindings/c/zigfitsio.h) ────────────────────────────────────────────
 class ZfOpenOpts(_c.Structure):
@@ -134,6 +181,81 @@ class ZfColInfo(_c.Structure):
         ("tzero", DBL),
         ("tnull", I64),
         ("has_tnull", INT),
+    ]
+
+
+class ZfHeaderSnapshotInfoV1(_c.Structure):
+    """Exact capacities and generation for a logical-header snapshot."""
+
+    _fields_ = [
+        ("revision", U64),
+        ("logical_count", U64),
+        ("physical_count", U64),
+        ("arena_bytes", U64),
+        ("raw_bytes", U64),
+        ("flags", U64),
+    ]
+
+
+class ZfHeaderEntryV1(_c.Structure):
+    """One logical snapshot entry; byte ranges are offsets into the snapshot arena."""
+
+    _fields_ = [
+        ("kind", U32),
+        ("value_type", U32),
+        ("flags", U32),
+        ("reserved", U32),
+        ("physical_first", U64),
+        ("physical_count", U64),
+        ("keyword_off", U64),
+        ("keyword_len", U64),
+        ("value_off", U64),
+        ("value_len", U64),
+        ("comment_off", U64),
+        ("comment_len", U64),
+        ("int_value", I64),
+        ("float_value", DBL),
+    ]
+
+
+class ZfHeaderOpV1(_c.Structure):
+    """One staged edit whose byte ranges reference a caller-owned input arena."""
+
+    _fields_ = [
+        ("opcode", U32),
+        ("value_type", U32),
+        ("flags", U32),
+        ("reserved", U32),
+        ("name_off", U64),
+        ("name_len", U64),
+        ("value_off", U64),
+        ("value_len", U64),
+        ("comment_off", U64),
+        ("comment_len", U64),
+        ("int_value", I64),
+        ("float_value", DBL),
+        ("position", I64),
+    ]
+
+
+class ZfHeaderApplyOptsV1(_c.Structure):
+    """Optimistic-revision options for one logical-header edit batch."""
+
+    _fields_ = [
+        ("expected_revision", U64),
+        ("flags", U32),
+        ("reserved", U32),
+    ]
+
+
+class ZfHeaderApplyResultV1(_c.Structure):
+    """Revision, failure index, and physical-card counts returned by a header edit batch."""
+
+    _fields_ = [
+        ("new_revision", U64),
+        ("failed_op", U64),
+        ("cards_before", U64),
+        ("cards_after", U64),
     ]
 
 
@@ -298,6 +420,15 @@ _PROTOS = [
     ("zf_rename_key", INT, [VOID, CHARP, SZ, CHARP, SZ]),
     ("zf_write_record", INT, [VOID, CHARP]),
     ("zf_insert_record", INT, [VOID, LONG, CHARP]),
+    ("zf_header_snapshot_query_v1", INT, [VOID, U64, U32, _c.POINTER(ZfHeaderSnapshotInfoV1)]),
+    ("zf_header_snapshot_fill_v1", INT, [
+        VOID, U64, U32, U64, _c.POINTER(ZfHeaderEntryV1), SZ, CHARP, SZ, CHARP, SZ,
+        _c.POINTER(ZfHeaderSnapshotInfoV1),
+    ]),
+    ("zf_header_apply_v1", INT, [
+        VOID, U64, _c.POINTER(ZfHeaderApplyOptsV1), _c.POINTER(ZfHeaderOpV1), SZ, CHARP, SZ,
+        _c.POINTER(ZfHeaderApplyResultV1),
+    ]),
     # hdu management
     ("zf_delete_hdu", INT, [VOID, LONG]),
     ("zf_copy_hdu", INT, [VOID, LONG]),

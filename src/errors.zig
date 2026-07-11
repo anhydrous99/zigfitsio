@@ -30,6 +30,15 @@ pub const HeaderError = error{
     CardOverflow,
 };
 
+/// Logical snapshot/edit transaction failures. These are kept separate from physical card
+/// syntax so callers can distinguish a rejected staged operation from malformed FITS bytes.
+pub const HeaderEditError = error{
+    StructuralKeyword,
+    InvalidHeaderOperation,
+    TransactionConflict,
+    BufferTooSmall,
+};
+
 /// Keyword value lookup/typing failures (§9.2). The three-way null/empty/undefined
 /// distinction of FR-HDR-3 surfaces here: an absent keyword is `KeywordNotFound`; a present
 /// indicator with a blank value field is `ValueUndefined`.
@@ -99,7 +108,7 @@ pub const LimitError = error{LimitExceeded};
 
 /// The umbrella set, for callers who want one catch-all. Library functions still declare
 /// the narrowest set they actually produce (FR-ERR-1).
-pub const Error = IoError || HeaderError || ValueError || StructError || TableError ||
+pub const Error = IoError || HeaderError || HeaderEditError || ValueError || StructError || TableError ||
     ConvError || ChecksumError || CompressError || WcsError || LimitError ||
     std.mem.Allocator.Error;
 
@@ -128,6 +137,11 @@ pub fn cfitsioStatus(err: Error) c_int {
         error.MissingEnd => 210, // NO_END
         error.BadContinue => 207, // BAD_KEYCHAR
         error.CardOverflow => 207, // BAD_KEYCHAR
+        // Logical header snapshot/edit transaction
+        error.StructuralKeyword => 207, // BAD_KEYCHAR (high-level policy rejection)
+        error.InvalidHeaderOperation => 207, // BAD_KEYCHAR (nearest staged-edit error)
+        error.TransactionConflict => 412, // OVERFLOW_ERR (retryable generation mismatch)
+        error.BufferTooSmall => 412, // OVERFLOW_ERR (caller-provided capacity)
         // Value typing
         error.WrongValueType => 410, // BAD_DATATYPE
         error.ValueUndefined => 204, // VALUE_UNDEFINED

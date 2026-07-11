@@ -476,6 +476,13 @@ pub const Fits = struct {
     // copy never overwrites a not-yet-read source byte, then zero-fill the vacated gap
     // [from_off, from_off+delta). SHRINK (delta<0): copy front-to-back, then shrink the device.
     fn shiftTail(self: *Fits, from_off: u64, delta: i64) FitsError!void {
+        return self.shiftTailImpl(from_off, delta, true);
+    }
+
+    // Header replacement overwrites the complete inserted gap immediately, so skipping the normal
+    // zero-fill removes a partial-I/O failure window: until the move completes, every original tail
+    // byte remains at its old offset and a rollback only has to restore size/header bytes.
+    fn shiftTailImpl(self: *Fits, from_off: u64, delta: i64, fill_gap: bool) FitsError!void {
         if (delta == 0) return;
         if (!self.dev.isWritable()) return error.NotWritable;
         const size = try self.dev.getSize();
@@ -492,14 +499,16 @@ pub const Fits = struct {
                 try self.dev.writeAll(buf[0..n], src + d);
                 remaining -= n;
             }
-            @memset(buf[0..], 0); // zero-fill the vacated gap [from_off, from_off+d)
-            var z = d;
-            var zo = from_off;
-            while (z > 0) {
-                const n: usize = @intCast(@min(@as(u64, buf.len), z));
-                try self.dev.writeAll(buf[0..n], zo);
-                zo += n;
-                z -= n;
+            if (fill_gap) {
+                @memset(buf[0..], 0); // zero-fill the vacated gap [from_off, from_off+d)
+                var z = d;
+                var zo = from_off;
+                while (z > 0) {
+                    const n: usize = @intCast(@min(@as(u64, buf.len), z));
+                    try self.dev.writeAll(buf[0..n], zo);
+                    zo += n;
+                    z -= n;
+                }
             }
         } else {
             const d: u64 = @intCast(-delta);
@@ -706,6 +715,79 @@ pub const Fits = struct {
         } else {
             try self.reinitReader();
         }
+        hdu.bumpHeaderRevision();
+    }
+
+    /// Commit a fully staged, non-structural replacement header with one serialization and at
+    /// most one following-tail move. On success `staged` receives the former live header (the
+    /// caller must deinit it) and the HDU owns the staged cards. On any failure detected before
+    /// device mutation, both values are untouched. Same-block write failures restore the saved
+    /// header bytes; a completed block-count shift is best-effort reversed before returning.
+    ///
+    /// This deliberately does not recompute image/table geometry. Callers must reject edits to
+    /// geometry-defining keywords before entering this method; structural builders continue to
+    /// use `rewriteHeaderInPlace`.
+    pub fn replaceHeaderInPlace(self: *Fits, hdu: *Hdu, staged: *Header) FitsError!void {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        try self.ensureScannedAll();
+        try staged.ensureEnd(self.alloc);
+        try hdu_mod.validate(staged, hdu.kind);
+
+        const old_header_bytes_u64 = hdu.data_off - hdu.header_off;
+        const new_header_bytes_u64 = block.roundUpBlocks(@as(u64, staged.count()) * block.CARD);
+        const old_len = std.math.cast(usize, old_header_bytes_u64) orelse return error.LimitExceeded;
+        const new_len = std.math.cast(usize, new_header_bytes_u64) orelse return error.LimitExceeded;
+
+        // Allocate and serialize everything before shifting a byte. This also makes the commit a
+        // single contiguous header write instead of one buffered write per card.
+        const old_bytes = try self.alloc.alloc(u8, old_len);
+        defer self.alloc.free(old_bytes);
+        try self.dev.readAll(old_bytes, hdu.header_off);
+
+        const new_bytes = try self.alloc.alloc(u8, new_len);
+        defer self.alloc.free(new_bytes);
+        @memset(new_bytes, ' ');
+        for (staged.cards.items, 0..) |*card, i| {
+            @memcpy(new_bytes[i * block.CARD ..][0..block.CARD], card.bytes());
+        }
+
+        // Reader creation allocates; do it before physical mutation so OOM is strongly atomic.
+        var fresh_reader = try block.BlockReader.init(self.alloc, self.dev, 0);
+        var fresh_owned = true;
+        defer if (fresh_owned) fresh_reader.deinit();
+
+        const delta: i64 = @as(i64, @intCast(new_header_bytes_u64)) -
+            @as(i64, @intCast(old_header_bytes_u64));
+        const old_size = try self.dev.getSize();
+        const new_data_off = applyDelta(hdu.data_off, delta);
+        var shifted = false;
+        var device_started = false;
+        errdefer if (device_started) {
+            if (shifted and delta != 0) self.shiftTailImpl(new_data_off, -delta, false) catch {};
+            self.dev.writeAll(old_bytes, hdu.header_off) catch {};
+            self.dev.setSize(old_size) catch {};
+        };
+
+        if (delta != 0) {
+            device_started = true;
+            try self.shiftTailImpl(hdu.data_off, delta, false);
+            shifted = true;
+        }
+        device_started = true;
+        try self.dev.writeAll(new_bytes, hdu.header_off);
+
+        if (delta != 0) {
+            self.shiftFollowing(hdu, delta);
+            hdu.data_off = new_data_off;
+        }
+        const old_header = hdu.header;
+        hdu.header = staged.*;
+        staged.* = old_header;
+
+        self.reader.deinit();
+        self.reader = fresh_reader;
+        fresh_owned = false;
+        hdu.bumpHeaderRevision();
     }
 
     /// Delete HDU `n` (1-based): shift the tail down over its bytes, drop and free it, and fix the
@@ -975,7 +1057,6 @@ test "saveGzipFile then openFile('.fits.gz') round-trips on disk" {
     // Creating into a .gz path is refused (build uncompressed, then saveGzipFile).
     try testing.expectError(error.NotWritable, Fits.openFile(testing.allocator, path, .create, .{}));
 }
-
 
 // ── X-CONC: distinct handles are usable concurrently (NFR-CONC-1, NFR-TEST-5a) ────────────
 // NOTE: a single `Fits` handle is NOT thread-safe (it mutates its block cache, CHDU index,

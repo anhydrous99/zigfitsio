@@ -55,8 +55,12 @@ pub const hierarch = @import("header/hierarch.zig");
 /// `CONTINUE` long-string convention helpers — assemble/split (FR-HDR-8). (`continue` is a Zig
 /// keyword, so the module is exported as `continuation`.)
 pub const continuation = @import("header/continue.zig");
+/// Binding-facing, lossless logical projection of physical header cards.
+pub const logical_header = @import("header/logical.zig");
 /// The ordered cards of one HDU header (FR-HDR-5/7/11).
 pub const Header = @import("header/header.zig").Header;
+/// Transactional non-structural header edits over an allocator-owned staged clone.
+pub const header_edit = @import("header/edit.zig");
 
 // ── HDU model & file handle (§10) ──────────────────────────────────────────────────────
 const fits_mod = @import("fits.zig");
@@ -201,7 +205,9 @@ test {
     _ = @import("header/card.zig");
     _ = @import("header/header.zig");
     _ = @import("header/continue.zig");
+    _ = @import("header/logical.zig");
     _ = @import("header/hierarch.zig");
+    _ = @import("header/edit.zig");
     _ = @import("hdu.zig");
     _ = @import("fits.zig");
     _ = @import("image.zig");

@@ -33,11 +33,34 @@ const TOOLCHAIN = {
 
 test("parses every literal PROTOS declaration in source order", async () => {
   const protos = parseTypeScriptProtos(await readFile(PROTOS_SOURCE, "utf8"));
-  assert.equal(protos.length, 89);
+  assert.equal(protos.length, 92);
   assert.equal(protos[0].name, "zf_version");
   assert.equal(protos.at(-1).name, "zf_write_compressed3");
   assert.equal(new Set(protos.map((proto) => proto.name)).size, protos.length);
   assert.equal(formatTypeScriptProtoSignature(protos[0]), "lib.zf_version(): string");
+  assert.equal(protos[32].name, "zf_key_exists");
+  assert.deepEqual(
+    protos.slice(48, 53).map((proto) => proto.name),
+    [
+      "zf_insert_record",
+      "zf_header_snapshot_query_v1",
+      "zf_header_snapshot_fill_v1",
+      "zf_header_apply_v1",
+      "zf_delete_hdu",
+    ],
+  );
+  assert.deepEqual(
+    protos.find((proto) => proto.name === "zf_header_snapshot_query_v1")?.args,
+    ["handle", "u64", "u32", "buf"],
+  );
+  assert.deepEqual(
+    protos.find((proto) => proto.name === "zf_header_snapshot_fill_v1")?.args,
+    ["handle", "u64", "u32", "u64", "buf", "usize", "buf", "usize", "buf", "usize", "buf"],
+  );
+  assert.deepEqual(
+    protos.find((proto) => proto.name === "zf_header_apply_v1")?.args,
+    ["handle", "u64", "buf", "buf", "usize", "buf", "usize", "buf"],
+  );
   assert.match(formatTypeScriptProtoSignature(protos.at(-1)), /^lib\.zf_write_compressed3\(/);
 });
 

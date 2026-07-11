@@ -18,7 +18,7 @@ import numpy as np
 
 from . import _dtypes as dt
 from . import lowlevel as ll
-from .header import Header, _wrap_commentary, parse_cards
+from .header import Header, _Card, _wrap_commentary
 
 _VOID = c.c_void_p
 
@@ -211,94 +211,6 @@ def _carr(values: Sequence[int]):
     return (c.c_long * len(values))(*[int(v) for v in values])
 
 
-def _fits_value_literal(value) -> str:
-    """Serialize a header value to its FITS card literal (for HIERARCH cards written raw)."""
-    if isinstance(value, bool):
-        return "T" if value else "F"
-    if value is None:
-        return ""
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value).replace("e", "E")  # FITS exponents are uppercase (§4.2.4)
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def _commentary_card(kw: str, value) -> bytes:
-    """An 80-byte COMMENT/HISTORY/blank card: keyword in cols 1-8, free text in cols 9-80."""
-    text = "" if value is None else str(value)
-    return (kw.upper().ljust(8) + text)[:80].ljust(80).encode("ascii", "replace")
-
-
-def _pair_safe_take(esc: str, want: int) -> int:
-    """Largest cut ≤ ``want`` that does not split a ``''`` escape pair.
-
-    ``esc`` always starts on a pair boundary (callers only advance by pair-safe takes), so a
-    left-to-right walk decides pair membership unambiguously; a cut that would land between the
-    two quotes of a pair backs off one column.
-    """
-    j = 0
-    while j < want:
-        if esc[j] == "'":
-            if j + 1 == want:
-                return want - 1
-            j += 2
-        else:
-            j += 1
-    return want
-
-
-def _hierarch_cards(kw: str, value, comment) -> "list[bytes]":
-    """The 80-byte card run for a HIERARCH keyword: one card when it fits, else HIERARCH+CONTINUE.
-
-    Long string values are continued across CONTINUE cards in astropy's layout: the base fragment
-    fills to column 80 with the ``&`` sentinel inside the quotes, continuations carry the value
-    from column 11, and the comment rides the last fragment or a dedicated
-    ``CONTINUE  '' / comment`` card. The escaped text is chunked so a ``''`` escape pair is never
-    split across cards. A non-string value never continues (the convention applies to strings
-    only, FITS 4.0 §4.2.1.2): its comment may be truncated, but a value that cannot fit raises
-    ValueError instead of being silently cut (the old single-card builder truncated at 80 bytes).
-    """
-    tokens = kw.strip()
-    if tokens[:9].upper() == "HIERARCH ":  # never double the prefix
-        tokens = tokens[9:].lstrip()
-    prefix = "HIERARCH " + tokens + " = "
-    lit = _fits_value_literal(value)
-    body = prefix + lit + ((" / " + comment) if comment else "")
-    if len(body) <= 80:  # fast path: bytes identical to the single-card form
-        return [body.ljust(80).encode("ascii", "replace")]
-    is_string = not isinstance(value, (bool, int, float)) and value is not None
-    if not is_string:
-        if len(prefix + lit) <= 80:  # keep the value exact; only the comment is cut
-            return [body[:80].ljust(80).encode("ascii", "replace")]
-        raise ValueError(f"HIERARCH card for {tokens!r} does not fit in 80 columns")
-    esc = str(value).replace("'", "''")
-    if not esc:  # empty string value: only the comment overflows — truncate it
-        return [(prefix + "'' / " + comment)[:80].ljust(80).encode("ascii", "replace")]
-    ccost = (3 + len(comment)) if comment else 0
-    cards: "list[str]" = []
-    pos, first, comment_done = 0, True, not comment
-    while pos < len(esc):
-        head = prefix if first else "CONTINUE  "
-        cap = 80 - len(head) - 2  # columns between the quotes (incl. a possible '&')
-        remaining = len(esc) - pos
-        terminal = remaining <= cap - ccost
-        take = remaining if terminal else _pair_safe_take(esc[pos:], min(cap - 1, remaining))
-        if take <= 0:
-            raise ValueError(f"HIERARCH keyword {tokens!r} leaves no room for a value")
-        frag = esc[pos : pos + take]
-        pos += take
-        first = False
-        if terminal:
-            cards.append(head + "'" + frag + "'" + ((" / " + comment) if comment else ""))
-            comment_done = True
-            break
-        cards.append(head + "'" + frag + "&'")
-    if not comment_done:  # astropy's dedicated comment card
-        cards.append(("CONTINUE  '' / " + comment)[:80])
-    return [t.ljust(80).encode("ascii", "replace") for t in cards]
-
-
 def _ptr(arr: np.ndarray) -> _VOID:
     return arr.ctypes.data_as(_VOID)
 
@@ -320,9 +232,8 @@ _INT64_MAX = 2**63 - 1
 def _coerce_kw_value(value: Any) -> Any:
     """Normalize a header value for the C ABI: numpy scalars → Python scalars, reject integers
     that would silently wrap the ``c_longlong`` keyword slot (ctypes masks out-of-range ints), and
-    reject non-finite floats — the FITS real grammar has no NaN/Inf spelling, so they would produce
-    cards no reader (including this library) can parse. This guard also covers the HIERARCH paths,
-    which build raw 80-byte cards client-side and bypass the Zig-core rejection."""
+    reject non-finite floats before descriptor packing. The Zig core validates the same constraints,
+    but these host-side checks prevent ctypes narrowing from changing a value before Zig sees it."""
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, np.integer):
@@ -337,9 +248,183 @@ def _coerce_kw_value(value: Any) -> Any:
     return value
 
 
+def _snapshot_header(handle, hdu_index: int):
+    """Read one logical header through the two-pass V1 snapshot ABI.
+
+    The returned ``_Card`` values retain the existing high-level Header semantics while replacing
+    one ctypes call per physical card with one capacity query and one fill call. The explicit HDU
+    index means this read does not disturb the handle's current-HDU selection.
+    """
+
+    for _attempt in range(3):
+        info = ll.ZfHeaderSnapshotInfoV1()
+        ll.check(ll.lib.zf_header_snapshot_query_v1(handle, int(hdu_index), 0, c.byref(info)))
+        count = int(info.logical_count)
+        arena_len = int(info.arena_bytes)
+        entries = (ll.ZfHeaderEntryV1 * count)()
+        arena = c.create_string_buffer(max(arena_len, 1))
+        filled = ll.ZfHeaderSnapshotInfoV1()
+        status = ll.lib.zf_header_snapshot_fill_v1(
+            handle,
+            int(hdu_index),
+            0,
+            int(info.revision),
+            entries if count else None,
+            count,
+            arena if arena_len else None,
+            arena_len,
+            None,
+            0,
+            c.byref(filled),
+        )
+        if status == 0:
+            break
+        # The only retryable V1 fill failures map to status 412: the header changed between passes,
+        # or the just-queried capacities became stale. Re-query before surfacing a persistent error.
+        if status != 412 or _attempt == 2:
+            ll.check(status)
+    else:  # pragma: no cover - loop either succeeds or raises above
+        raise RuntimeError("unreachable header snapshot retry state")
+
+    def arena_text(offset, length) -> str:
+        off = int(offset)
+        n = int(length)
+        return bytes(arena[off : off + n]).decode("ascii", "replace")
+
+    cards = []
+    for entry in entries:
+        keyword = arena_text(entry.keyword_off, entry.keyword_len)
+        comment = arena_text(entry.comment_off, entry.comment_len)
+        value_type = int(entry.value_type)
+        if value_type == ll.ZF_HEADER_VALUE_NONE:
+            value = arena_text(entry.value_off, entry.value_len)
+        elif value_type == ll.ZF_HEADER_VALUE_UNDEFINED:
+            value = None
+        elif value_type == ll.ZF_HEADER_VALUE_LOGICAL:
+            value = bool(entry.int_value)
+        elif value_type == ll.ZF_HEADER_VALUE_INT64:
+            value = int(entry.int_value)
+        elif value_type == ll.ZF_HEADER_VALUE_INTEGER_TEXT:
+            value = int(arena_text(entry.value_off, entry.value_len))
+        elif value_type == ll.ZF_HEADER_VALUE_FLOAT64:
+            value = float(entry.float_value)
+        elif value_type in (ll.ZF_HEADER_VALUE_STRING, ll.ZF_HEADER_VALUE_RAW_TOKEN):
+            value = arena_text(entry.value_off, entry.value_len)
+        else:
+            raise ll.FitsHeaderError(207, f"unknown logical-header value type {value_type}")
+        cards.append(
+            _Card(
+                keyword,
+                value,
+                comment,
+                commentary=int(entry.kind) != ll.ZF_HEADER_ENTRY_VALUE,
+            )
+        )
+    return cards, int(filled.revision)
+
+
+def _header_current_index(handle) -> int:
+    out = c.c_long()
+    ll.check(ll.lib.zf_current_hdu(handle, c.byref(out)))
+    return int(out.value)
+
+
+def _encode_header_batch(abstract_ops):
+    """Encode binding-neutral edit tuples as V1 descriptors plus one contiguous byte arena."""
+
+    arena = bytearray()
+    encoded = []
+
+    def put(value, *, ascii_replace=False):
+        if isinstance(value, bytes):
+            data = value
+        else:
+            text = str(value)
+            data = text.encode("ascii", "replace") if ascii_replace else _enc(text)
+        off = len(arena)
+        arena.extend(data)
+        return off, len(data)
+
+    for abstract in abstract_ops:
+        kind = abstract[0]
+        op = ll.ZfHeaderOpV1()
+        op.position = -1
+        if kind == "upsert":
+            _, key, value, comment = abstract
+            value = _coerce_kw_value(value)
+            key_s = str(key).strip()
+            hierarch = " " in key_s or len(key_s) > 8
+            op.opcode = ll.ZF_HEADER_OP_UPSERT
+            op.name_off, op.name_len = put(key_s, ascii_replace=hierarch)
+            op.flags = ll.ZF_HEADER_OP_COMMENT_PRESENT
+            comment_text = "" if comment is None else str(comment)
+            op.comment_off, op.comment_len = put(comment_text, ascii_replace=hierarch)
+            if value is None:
+                op.value_type = ll.ZF_HEADER_VALUE_UNDEFINED
+            elif isinstance(value, bool):
+                op.value_type = ll.ZF_HEADER_VALUE_LOGICAL
+                op.int_value = 1 if value else 0
+            elif isinstance(value, int):
+                op.value_type = ll.ZF_HEADER_VALUE_INT64
+                op.int_value = value
+            elif isinstance(value, float):
+                op.value_type = ll.ZF_HEADER_VALUE_FLOAT64
+                op.float_value = value
+            else:
+                op.value_type = ll.ZF_HEADER_VALUE_STRING
+                op.value_off, op.value_len = put(str(value), ascii_replace=hierarch)
+        elif kind in ("delete_first", "delete_all"):
+            _, key = abstract
+            op.opcode = (
+                ll.ZF_HEADER_OP_DELETE_FIRST if kind == "delete_first" else ll.ZF_HEADER_OP_DELETE_ALL
+            )
+            op.name_off, op.name_len = put(str(key))
+        elif kind == "append_commentary":
+            _, key, text = abstract
+            op.opcode = ll.ZF_HEADER_OP_APPEND_COMMENTARY
+            op.name_off, op.name_len = put(str(key).upper(), ascii_replace=True)
+            op.value_off, op.value_len = put("" if text is None else text, ascii_replace=True)
+        elif kind == "append_raw":
+            _, raw = abstract
+            op.opcode = ll.ZF_HEADER_OP_APPEND_RAW_RUN
+            op.value_off, op.value_len = put(raw)
+        else:
+            raise ValueError(f"unknown header batch operation {kind!r}")
+        encoded.append(op)
+    return encoded, bytes(arena)
+
+
+def _apply_header_batch(handle, hdu_index: int, abstract_ops, expected_revision=None) -> int:
+    """Apply a sequence of logical header operations with one Zig validation/commit cycle."""
+
+    encoded, arena_bytes = _encode_header_batch(abstract_ops)
+    if not encoded:
+        return int(expected_revision or 0)
+    op_array = (ll.ZfHeaderOpV1 * len(encoded))(*encoded)
+    arena = c.create_string_buffer(arena_bytes, len(arena_bytes)) if arena_bytes else None
+    opts = ll.ZfHeaderApplyOptsV1()
+    if expected_revision is not None:
+        opts.expected_revision = int(expected_revision)
+        opts.flags = ll.ZF_HEADER_APPLY_CHECK_REVISION
+    result = ll.ZfHeaderApplyResultV1()
+    ll.check(
+        ll.lib.zf_header_apply_v1(
+            handle,
+            int(hdu_index),
+            c.byref(opts),
+            op_array,
+            len(encoded),
+            arena,
+            len(arena_bytes),
+            c.byref(result),
+        )
+    )
+    return int(result.new_revision)
+
+
 # Structural keywords the library derives from the data; user header edits must not overwrite them.
 _STRUCTURAL = {
-    "SIMPLE", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "XTENSION", "END", "BSCALE", "BZERO",
+    "SIMPLE", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "GROUPS", "XTENSION", "END", "BSCALE", "BZERO",
 }
 
 
@@ -461,93 +546,61 @@ class _HDU:
         return self._header
 
     def _read_header(self) -> Header:
-        h = self._select()
-        n = c.c_long()
-        ll.check(ll.lib.zf_card_count(h, c.byref(n)))
-        raws = []
-        buf = c.create_string_buffer(80)
-        for i in range(n.value):
-            ll.check(ll.lib.zf_read_card(h, i, buf))
-            raws.append(buf.raw[:80])
-        cards = parse_cards(raws)
+        hl = self._hdulist
+        if hl is None or hl._handle is None:
+            raise ll.FitsIOError(104, "operation on a detached or closed HDU")
+        cards, revision = _snapshot_header(hl._handle, self._index)
         hdr = Header._from_cards(cards)
+        hdr._revision = revision
         if self._writable():
             hdr._persist = self._write_key
             hdr._delete = self._delete_key
             hdr._resync = self._resync_commentary
+            hdr._batch_apply = self._apply_header_edits
         # A read-only header edit is not persisted to the handle; flag it so save reconstructs.
         hdr._dirty_cb = self._mark_dirty
         return hdr
 
+    def _apply_header_edits(self, ops, expected_revision=None):
+        hl = self._hdulist
+        if hl is None or hl._handle is None:
+            raise ll.FitsIOError(104, "operation on a detached or closed HDU")
+        return _apply_header_batch(hl._handle, self._index, ops, expected_revision)
+
     def _write_key(self, key: str, value: Any, comment: str | None):
         up = key.upper()
         if up in ("COMMENT", "HISTORY", ""):
-            # Commentary cards are appended verbatim (insert-before-END) as raw records, never
-            # written as valued keywords. Callers pre-split long text into ≤72-char chunks.
-            ll.check(ll.lib.zf_write_record(self._select(), _commentary_card(up, value)))
-            return
+            return self._apply_header_edits(
+                [("append_commentary", up, value)],
+                self._header._revision if self._header is not None else None,
+            )
         if up in _STRUCTURAL or up.startswith("NAXIS"):
             raise ll.FitsHeaderError(207, f"cannot set structural keyword {key!r} on an open header")
-        value = _coerce_kw_value(value)
-        key_s = key.strip()
-        if " " in key_s or len(key_s) > 8:
-            # HIERARCH-convention keyword: the fixed-format ABI cannot express it (>8 chars fails
-            # Name.parse; an embedded space would stamp a spec-invalid keyword). Build the cards
-            # FIRST so a bad value cannot delete the old card and then fail; the Zig-side delete
-            # also removes an old CONTINUE run, so replacement never orphans continuations.
-            cards = _hierarch_cards(key_s, value, comment)
-            h = self._select()
-            kb = _enc(key_s)
-            try:
-                ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))  # matches HIERARCH names in Zig
-            except ll.KeywordNotFound:
-                pass
-            for card in cards:
-                ll.check(ll.lib.zf_write_record(h, card))  # sequential insert-before-END keeps order
-            return
-        h = self._select()
-        kb = _enc(key)
-        cb = _enc(comment) if comment else None
-        cl = len(cb) if cb else 0
-        if value is None:
-            # An undefined-value card (blank value field), never the literal string 'None'.
-            ll.check(ll.lib.zf_write_key_undef(h, kb, len(kb), cb, cl))
-        elif isinstance(value, bool):
-            ll.check(ll.lib.zf_write_key_log(h, kb, len(kb), 1 if value else 0, cb, cl))
-        elif isinstance(value, int):
-            ll.check(ll.lib.zf_write_key_lng(h, kb, len(kb), value, cb, cl))
-        elif isinstance(value, float):
-            ll.check(ll.lib.zf_write_key_dbl(h, kb, len(kb), value, cb, cl))
-        else:
-            vb = _enc(str(value))
-            if len(vb) <= 68:
-                ll.check(ll.lib.zf_write_key_str(h, kb, len(kb), vb, len(vb), cb, cl))
-            else:
-                ll.check(ll.lib.zf_write_key_longstr(h, kb, len(kb), vb, len(vb), cb, cl))
+        return self._apply_header_edits(
+            [("upsert", key, value, comment)],
+            self._header._revision if self._header is not None else None,
+        )
 
     def _delete_key(self, key: str):
-        h = self._select()
-        kb = _enc(key)
-        ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))
+        return self._apply_header_edits(
+            [("delete_first", key)],
+            self._header._revision if self._header is not None else None,
+        )
 
     def _resync_commentary(self, keyword: str, texts):
-        """Rewrite every commentary card of ``keyword`` in the open handle to ``texts``: delete all
-        by name, then re-append (before END) as raw records. Used for in-place commentary edits,
-        deletions, and list replace-all, where a single append cannot express the new state. Same
-        delete-then-write-records idiom as the HIERARCH replacement path in ``_write_key``. Rewritten
-        cards migrate to the header end (spec-legal); exact placement holds via reconstruction. For
-        the blank keyword this also rewrites blank *separator* cards (they share the empty name), so
-        an in-place edit/delete of blank commentary reorders every blank card — same as astropy."""
-        h = self._select()
-        kb = _enc(keyword)
-        while True:
-            try:
-                ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))
-            except ll.KeywordNotFound:
-                break
+        """Replace every commentary entry of ``keyword`` with one delete-all plus append batch.
+
+        Rewritten cards migrate to the header end (spec-legal); exact placement holds through full
+        reconstruction. For the blank keyword this also rewrites blank separator cards, so an
+        in-place edit/delete reorders every blank card — matching astropy.
+        """
         up = keyword.upper()
-        for t in texts:
-            ll.check(ll.lib.zf_write_record(h, _commentary_card(up, t)))
+        ops = [("delete_all", up)]
+        ops.extend(("append_commentary", up, text) for text in texts)
+        return self._apply_header_edits(
+            ops,
+            self._header._revision if self._header is not None else None,
+        )
 
     @property
     def name(self) -> str:
@@ -743,6 +796,7 @@ class ImageHDU(_HDU):
         self._data_fingerprint = fp
 
     def _apply_user_keys(self, handle, skip=None):
+        ops = []
         for kw, value, comment in self.header.cards():
             up = kw.upper()
             if up in _STRUCTURAL or up.startswith("NAXIS"):
@@ -755,42 +809,17 @@ class ImageHDU(_HDU):
             # writeto(checksum=True) is requested. Mirrors the TS _applyUserKeys behavior.
             if up in ("CHECKSUM", "DATASUM"):
                 continue
-            # Commentary and HIERARCH/spaced/>8-char keys can't be written as standard 8-char
-            # keywords; reconstruct their 80-byte card and write it verbatim so COMMENT/HISTORY
-            # provenance and HIERARCH keywords survive the reconstruction (non-pristine) path.
             if up in ("COMMENT", "HISTORY", ""):
                 # Wrap so a >72-char commentary card (e.g. built via Header._from_cards) spans
                 # multiple records instead of truncating; set-time cards are already ≤72.
                 for chunk in _wrap_commentary(value):
-                    ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, chunk)))
+                    ops.append(("append_commentary", up, chunk))
                 continue
-            value = _coerce_kw_value(value)  # before the HIERARCH branch: numpy scalars normalize too
-            if " " in kw or len(kw) > 8:
-                for card in _hierarch_cards(kw, value, comment):
-                    ll.check(ll.lib.zf_write_record(handle, card))
-                continue
-            kb = _enc(kw)
-            cb = _enc(comment) if comment else None
-            cl = len(cb) if cb else 0
-            if isinstance(value, bool):
-                ll.check(ll.lib.zf_write_key_log(handle, kb, len(kb), 1 if value else 0, cb, cl))
-            elif isinstance(value, int):
-                ll.check(ll.lib.zf_write_key_lng(handle, kb, len(kb), value, cb, cl))
-            elif isinstance(value, float):
-                ll.check(ll.lib.zf_write_key_dbl(handle, kb, len(kb), value, cb, cl))
-            elif value is None:
-                # Undefined-value card: reconstruct it instead of silently dropping it.
-                ll.check(ll.lib.zf_write_key_undef(handle, kb, len(kb), cb, cl))
-            else:
-                vb = _enc(str(value))
-                if len(vb) <= 68:
-                    ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), vb, len(vb), cb, cl))
-                else:
-                    ll.check(ll.lib.zf_write_key_longstr(handle, kb, len(kb), vb, len(vb), cb, cl))
+            ops.append(("upsert", kw, value, comment))
         if self._name:
-            nb = _enc(self._name)
-            kb = _enc("EXTNAME")
-            ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), nb, len(nb), None, 0))
+            ops.append(("upsert", "EXTNAME", self._name, ""))
+        if ops:
+            _apply_header_batch(handle, _header_current_index(handle), ops)
 
 
 class PrimaryHDU(ImageHDU):
@@ -1367,6 +1396,7 @@ class HDUList(list):
         self._handle = None
         self._mode = ll.READONLY
         self._owns = False
+        self._checksum_on_close = False
         self._scanned_count = 0  # HDUs scanned from the source (for the pristine-copy fast path)
         # Set when an in-memory edit is NOT reflected in the open C handle's bytes (a data
         # replacement, or a header edit in read-only mode where nothing is persisted). Such an edit
@@ -1376,11 +1406,12 @@ class HDUList(list):
 
     # ── opening ───────────────────────────────────────────────────────────────────────────
     @classmethod
-    def _from_handle(cls, handle, mode):
+    def _from_handle(cls, handle, mode, checksum_on_close=False):
         hl = cls()
         hl._handle = handle
         hl._mode = mode
         hl._owns = True
+        hl._checksum_on_close = bool(checksum_on_close)
         hl._scan()
         return hl
 
@@ -1452,7 +1483,18 @@ class HDUList(list):
                         )
                 elif isinstance(hdu, (ImageHDU, _TableHDU)):
                     hdu._flush_data()
-        ll.check(ll.lib.zf_flush(self._handle))
+        try:
+            ll.check(ll.lib.zf_flush(self._handle))
+        finally:
+            # checksum_on_close recomputes DATASUM/CHECKSUM inside zf_flush and advances the native
+            # header revisions. There is no cheap revision-only query, so invalidate materialized
+            # snapshots; the next successful edit commits without a stale check and establishes the
+            # current revision from ZfHeaderApplyResultV1. Do this even on failure because checksum
+            # processing can mutate an earlier HDU before a later device error is reported.
+            if self._checksum_on_close:
+                for hdu in self:
+                    if hdu._hdulist is self and hdu._header is not None:
+                        hdu._header._revision = None
 
     def _attached_at(self, hdu, i: int) -> bool:
         """Whether list position ``i`` still holds the HDU attached to this file's slot ``i + 1``."""
@@ -1555,7 +1597,13 @@ class HDUList(list):
                 hdu._header._persist = hdu._write_key
                 hdu._header._delete = hdu._delete_key
                 hdu._header._resync = hdu._resync_commentary
+                hdu._header._batch_apply = hdu._apply_header_edits
                 hdu._header._dirty_cb = hdu._mark_dirty
+            if hdu._header is not None:
+                # Copy/delete reconciliation creates new core HDU objects with their own revision
+                # counters. The next edit may commit without a stale optimistic check; its result
+                # establishes the new revision for subsequent transactions.
+                hdu._header._revision = None
         self._scanned_count = len(self)
 
     def _is_pristine_attached(self) -> bool:
@@ -1699,7 +1747,11 @@ def open(path, mode: str = "readonly", opts: ll.ZfOpenOpts | None = None) -> HDU
         ll.check(ll.lib.zf_open_gzip(raw, len(raw), optref, c.byref(handle)))
     else:
         ll.check(ll.lib.zf_open_file(pb, len(pb), mode_code, optref, c.byref(handle)))
-    return HDUList._from_handle(handle, mode_code)
+    return HDUList._from_handle(
+        handle,
+        mode_code,
+        checksum_on_close=opts is not None and opts.checksum_on_close != 0,
+    )
 
 
 def from_bytes(data: bytes, mode: str = "readonly") -> HDUList:

@@ -80,6 +80,23 @@ zf.writeTo("check.fits", new zf.FitsArray(new Float32Array(24), [4, 6]), { overw
 console.log(zf.verify("check.fits")); // [] when clean
 ```
 
+### Atomic header edits
+
+Header setters remain eager by default. Group related changes in `transaction()` to validate and
+serialize them with one Wasm call and one header commit. The callback is synchronous; callback,
+validation, and revision-conflict failures leave the file unchanged. Device I/O failures restore
+the JavaScript header and trigger the core's best-effort disk rollback, but this is not a
+crash-safe/on-disk journaling transaction.
+
+```ts
+using hdul = zf.open("image.fits", "update");
+hdul.image(0).header.transaction((header) => {
+  header.set("OBSERVER", "Hubble", "who");
+  header.set("ESO DET CHIP ID", 42); // HIERARCH is serialized by the Zig core
+  header.addHistory("calibrated");
+});
+```
+
 ### WCS
 
 ```ts

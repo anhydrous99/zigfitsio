@@ -103,7 +103,7 @@ pub const Header = struct {
         const n = std.mem.trimEnd(u8, name, " ");
         if (n.len == 0) return false; // blank
         const exact = [_][]const u8{
-            "SIMPLE",  "XTENSION", "BITPIX", "NAXIS",  "PCOUNT", "GCOUNT",
+            "SIMPLE",  "XTENSION", "BITPIX", "NAXIS",   "PCOUNT",  "GCOUNT",
             "TFIELDS", "EXTEND",   "END",    "COMMENT", "HISTORY", "GROUPS",
         };
         for (exact) |e| if (std.ascii.eqlIgnoreCase(n, e)) return false;
@@ -259,10 +259,23 @@ pub const Header = struct {
     /// The parsed `/ comment` of keyword `name`, borrowed from the card's bytes, or `null` if
     /// the keyword is absent or has no comment (FR-HDR-5).
     pub fn comment(self: *const Header, name: []const u8) ?[]const u8 {
-        const card = self.get(name) catch return null;
-        // A HIERARCH card's comment follows its value after the `=`, not at fixed columns 11–80.
-        const vf = if (hierarch.isHierarch(card)) (hierarch.valueField(card) orelse return null) else card.valueField();
-        return value.parseComment(vf);
+        if (self.findFirst(name)) |idx| {
+            const card = &self.cards.items[idx];
+            // A HIERARCH card's comment follows its value after the `=`, not at fixed columns
+            // 11–80. For a continued value the effective comment belongs to the last fragment.
+            const vf = if (hierarch.isHierarch(card)) (hierarch.valueField(card) orelse return null) else card.valueField();
+            var out = value.parseComment(vf);
+            var continues = continuation.endsWithSentinel(vf);
+            var i = idx + 1;
+            while (continues and i < self.cards.items.len and self.cards.items[i].kind == .continuation) : (i += 1) {
+                const next = &self.cards.items[i];
+                if (value.parseComment(next.valueField())) |c| out = c;
+                continues = continuation.endsWithSentinel(next.valueField());
+            }
+            return out;
+        }
+        if (self.inherit) |parent| if (isInheritable(name)) return parent.comment(name);
+        return null;
     }
 
     /// Fill `out` with the indices of all cards whose names match the wildcard `pattern`
@@ -416,10 +429,12 @@ pub const Header = struct {
     /// Reserve `n` blank cards just before `END` so later `update` calls can fill them in
     /// place without rewriting following HDUs (FR-HDR-12, header-space pre-allocation).
     pub fn reserveSpace(self: *Header, alloc: Allocator, n: usize) (HeaderError || Allocator.Error)!void {
+        if (n == 0) return;
         const pos = self.endIndex() orelse self.cards.items.len;
         const blank: [80]u8 = [_]u8{' '} ** 80;
-        var k: usize = 0;
-        while (k < n) : (k += 1) try self.cards.insert(alloc, pos, try Card.parse(&blank));
+        const card = try Card.parse(&blank);
+        const slots = try self.cards.addManyAt(alloc, pos, n);
+        @memset(slots, card);
     }
 
     /// Serialize all cards into `writer` (80 bytes each), padding the header unit to a block
@@ -613,6 +628,22 @@ test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)"
     try testing.expectEqual(before, h.count()); // filled a blank, no net growth
 }
 
+test "reserveSpace bulk-inserts a large contiguous blank run" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendValue(testing.allocator, "A", .{ .int = 1 }, null);
+    try h.ensureEnd(testing.allocator);
+
+    try h.reserveSpace(testing.allocator, 4096);
+    try testing.expectEqual(@as(usize, 4098), h.count());
+    for (h.cards.items[1 .. h.count() - 1]) |card| try testing.expectEqual(Card.Kind.blank, card.kind);
+    try testing.expectEqual(Card.Kind.end, h.cards.items[h.count() - 1].kind);
+
+    const before = h.count();
+    try h.reserveSpace(testing.allocator, 0);
+    try testing.expectEqual(before, h.count());
+}
+
 test "long-string CONTINUE: append then getLongString round-trips through the Header (FR-HDR-8)" {
     var h = Header.initEmpty();
     defer h.deinit(testing.allocator);
@@ -695,14 +726,36 @@ test "delete of a HIERARCH long-string base removes its CONTINUE run" {
     defer h.deinit(testing.allocator);
     try h.appendRaw(testing.allocator, &raw80("HIERARCH ESO LONG STR = 'aaaa&'"));
     try h.appendRaw(testing.allocator, &raw80("CONTINUE  'bbbb&'"));
-    try h.appendRaw(testing.allocator, &raw80("CONTINUE  'cccc'"));
+    try h.appendRaw(testing.allocator, &raw80("CONTINUE  'cccc' / final"));
     try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
     try h.ensureEnd(testing.allocator);
+
+    const joined = try h.getLongString(testing.allocator, "ESO LONG STR");
+    defer testing.allocator.free(joined);
+    try testing.expectEqualStrings("aaaabbbbcccc", joined);
+    try testing.expectEqualStrings("final", h.comment("ESO LONG STR").?);
 
     try h.delete("ESO LONG STR"); // HIERARCH name resolved via matchName
     for (h.cards.items) |c| try testing.expect(c.kind != .continuation);
     try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "AFTER"));
     try testing.expectEqual(@as(usize, 2), h.count()); // AFTER + END
+}
+
+test "Astropy split quote pair is assembled, commented, and deleted as one logical run" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendRaw(testing.allocator, &raw80("LONGSTR = 'abc'&'"));
+    try h.appendRaw(testing.allocator, &raw80("CONTINUE  ''def' / split"));
+    try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
+    try h.ensureEnd(testing.allocator);
+
+    const joined = try h.getLongString(testing.allocator, "LONGSTR");
+    defer testing.allocator.free(joined);
+    try testing.expectEqualStrings("abc'def", joined);
+    try testing.expectEqualStrings("split", h.comment("LONGSTR").?);
+    try h.delete("LONGSTR");
+    for (h.cards.items) |card| try testing.expect(card.kind != .continuation);
+    try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "AFTER"));
 }
 
 test "update of a long-string base to a short value removes its CONTINUE run (BUGHUNT 24)" {

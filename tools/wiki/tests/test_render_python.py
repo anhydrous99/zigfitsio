@@ -45,10 +45,10 @@ def test_generates_complete_static_contract(tmp_path):
         "python-symbols.json",
     ]
     assert manifest["counts"]["public_exports"] == 25
-    assert manifest["counts"]["lowlevel_exports"] == 62
-    assert manifest["counts"]["lowlevel_functions"] == 89
+    assert manifest["counts"]["lowlevel_exports"] == 95
+    assert manifest["counts"]["lowlevel_functions"] == 92
     assert manifest["coverage"]["missing"] == []
-    assert len(manifest["abi_prototypes"]) == 89
+    assert len(manifest["abi_prototypes"]) == 92
     assert manifest["abi_prototypes"][0] == {
         "name": "zf_version",
         "returns": "CHARP",
@@ -67,6 +67,11 @@ def test_generates_complete_static_contract(tmp_path):
     assert "zigfitsio.HDUList.__enter__" in symbols
     assert "zigfitsio.HDUList.__exit__" in symbols
     assert "zigfitsio.lowlevel.ZfOpenOpts.max_open_alloc" in symbols
+    assert "zigfitsio.lowlevel.ZfHeaderSnapshotInfoV1.revision" in symbols
+    assert "zigfitsio.lowlevel.ZfHeaderApplyResultV1.failed_op" in symbols
+    assert "zigfitsio.lowlevel.lib.zf_header_snapshot_query_v1" in symbols
+    assert "zigfitsio.lowlevel.lib.zf_header_snapshot_fill_v1" in symbols
+    assert "zigfitsio.lowlevel.lib.zf_header_apply_v1" in symbols
     assert "zigfitsio.lowlevel.lib.zf_write_compressed3" in symbols
 
     highlevel = (tmp_path / "Python-API.md").read_text(encoding="utf-8")
@@ -75,6 +80,9 @@ def test_generates_complete_static_contract(tmp_path):
     assert f"`{SHA}`" in highlevel
     assert "BinTableHDU.from_columns" in highlevel
     assert "lib.zf_version() -> CHARP" in lowlevel
+    assert "lib.zf_header_snapshot_query_v1" in lowlevel
+    assert "lib.zf_header_snapshot_fill_v1" in lowlevel
+    assert "lib.zf_header_apply_v1" in lowlevel
     assert "lib.zf_write_compressed3" in lowlevel
     assert str(REPO_ROOT) not in highlevel
     assert str(REPO_ROOT) not in lowlevel
@@ -118,9 +126,11 @@ def test_lowlevel_all_is_literal_and_hides_loader_internals():
     )
     exports = ast.literal_eval(all_node.value)
 
-    assert len(exports) == len(set(exports)) == 62
+    assert len(exports) == len(set(exports)) == 95
     assert "lib" in exports
     assert "ZfOpenOpts" in exports
+    assert "ZfHeaderSnapshotInfoV1" in exports
+    assert "ZfHeaderApplyResultV1" in exports
     assert "version" in exports
     assert "load_library" not in exports
     assert "_PROTOS" not in exports

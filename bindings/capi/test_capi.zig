@@ -27,6 +27,12 @@ test "ABI constants stay in sync with bindings/c/zigfitsio.h" {
     try testing.expect(@typeInfo(abi.ZfOpenOpts).@"struct".layout == .@"extern");
     try testing.expect(@typeInfo(abi.ZfScaling).@"struct".layout == .@"extern");
     try testing.expect(@typeInfo(abi.ZfColInfo).@"struct".layout == .@"extern");
+    try testing.expect(@typeInfo(abi.ZfHeaderSnapshotInfoV1).@"struct".layout == .@"extern");
+    try testing.expect(@typeInfo(abi.ZfHeaderEntryV1).@"struct".layout == .@"extern");
+    try testing.expect(@typeInfo(abi.ZfHeaderOpV1).@"struct".layout == .@"extern");
+    try testing.expectEqual(@as(usize, 48), @sizeOf(abi.ZfHeaderSnapshotInfoV1));
+    try testing.expectEqual(@as(usize, 96), @sizeOf(abi.ZfHeaderEntryV1));
+    try testing.expectEqual(@as(usize, 88), @sizeOf(abi.ZfHeaderOpV1));
 }
 
 test "create in-memory image, write and read back f32" {
@@ -868,6 +874,381 @@ fn countContinueCards(hh: *Handle) !usize {
     return found;
 }
 
+test "logical header snapshot is bulk, lossless, retryable, and generation checked" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+    const long_name = "LONGSTR";
+    const long_value = "alpha 'quoted' value " ** 8;
+    const long_comment = "final comment";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, long_name, long_name.len, long_value, long_value.len, long_comment, long_comment.len));
+    try putRecord(hh, "HIERARCH ESO DET GAIN = 2.5 / detector");
+    try putRecord(hh, "COMMENT snapshot commentary");
+
+    var info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, abi.header_snapshot_include_raw, &info));
+    try testing.expect(info.logical_count > 0);
+    try testing.expectEqual(info.physical_count * 80, info.raw_bytes);
+
+    const entries = try testing.allocator.alloc(abi.ZfHeaderEntryV1, @intCast(info.logical_count));
+    defer testing.allocator.free(entries);
+    const arena = try testing.allocator.alloc(u8, @intCast(info.arena_bytes));
+    defer testing.allocator.free(arena);
+    const raw = try testing.allocator.alloc(u8, @intCast(info.raw_bytes));
+    defer testing.allocator.free(raw);
+    @memset(arena, 0xa5);
+    @memset(raw, 0x5a);
+    @memset(std.mem.sliceAsBytes(entries), 0x3c);
+    var untouched: abi.ZfHeaderSnapshotInfoV1 = .{ .revision = 0xfeed_beef };
+    try testing.expectEqual(@as(c_int, 412), capi.zf_header_snapshot_fill_v1(
+        hh,
+        1,
+        abi.header_snapshot_include_raw,
+        info.revision,
+        entries.ptr,
+        entries.len - 1,
+        arena.ptr,
+        arena.len,
+        raw.ptr,
+        raw.len,
+        &untouched,
+    ));
+    try testing.expectEqual(@as(u64, 0xfeed_beef), untouched.revision);
+    try testing.expectEqual(@as(u8, 0xa5), arena[0]);
+    try testing.expectEqual(@as(u8, 0x5a), raw[0]);
+    try testing.expectEqual(@as(u8, 0x3c), std.mem.sliceAsBytes(entries)[0]);
+
+    var filled: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_fill_v1(
+        hh,
+        1,
+        abi.header_snapshot_include_raw,
+        info.revision,
+        entries.ptr,
+        entries.len,
+        arena.ptr,
+        arena.len,
+        raw.ptr,
+        raw.len,
+        &filled,
+    ));
+    try testing.expectEqual(info.logical_count, filled.logical_count);
+    try testing.expect(std.mem.eql(u8, raw[raw.len - 80 ..][0..3], "END"));
+
+    var found_long = false;
+    var found_hierarch = false;
+    var found_comment = false;
+    for (entries) |entry| {
+        const no: usize = @intCast(entry.keyword_off);
+        const nl: usize = @intCast(entry.keyword_len);
+        const vo: usize = @intCast(entry.value_off);
+        const vl: usize = @intCast(entry.value_len);
+        const keyword = arena[no .. no + nl];
+        if (std.mem.eql(u8, keyword, long_name)) {
+            found_long = true;
+            try testing.expectEqual(@intFromEnum(abi.HeaderValueType.string), entry.value_type);
+            try testing.expectEqualStrings(std.mem.trimEnd(u8, long_value, " "), arena[vo .. vo + vl]);
+            try testing.expect(entry.flags & abi.header_entry_continued != 0);
+        } else if (std.mem.eql(u8, keyword, "ESO DET GAIN")) {
+            found_hierarch = true;
+            try testing.expect(entry.flags & abi.header_entry_hierarch != 0);
+            try testing.expectEqual(@intFromEnum(abi.HeaderValueType.float64), entry.value_type);
+            try testing.expectEqual(@as(f64, 2.5), entry.float_value);
+        } else if (std.mem.eql(u8, keyword, "COMMENT")) {
+            found_comment = true;
+            try testing.expectEqualStrings("snapshot commentary", arena[vo .. vo + vl]);
+        }
+    }
+    try testing.expect(found_long and found_hierarch and found_comment);
+
+    // A stale query/fill pair must fail before touching caller outputs.
+    const key = "NEWKEY";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, key, key.len, 7, null, 0));
+    @memset(arena, 0xa5);
+    try testing.expectEqual(@as(c_int, 412), capi.zf_header_snapshot_fill_v1(
+        hh,
+        1,
+        0,
+        info.revision,
+        entries.ptr,
+        entries.len,
+        arena.ptr,
+        arena.len,
+        null,
+        0,
+        &filled,
+    ));
+    try testing.expectEqual(@as(u8, 0xa5), arena[0]);
+}
+
+const ArenaPart = struct { off: u64, len: u64 };
+
+fn testArenaPut(arena: *std.ArrayList(u8), bytes: []const u8) !ArenaPart {
+    const off = arena.items.len;
+    try arena.appendSlice(testing.allocator, bytes);
+    return .{ .off = @intCast(off), .len = @intCast(bytes.len) };
+}
+
+test "header apply stages mixed edits and commits once" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    var info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &info));
+    const before_revision = info.revision;
+
+    var arena: std.ArrayList(u8) = .empty;
+    defer arena.deinit(testing.allocator);
+    const obs = try testArenaPut(&arena, "OBSERVER");
+    const note = try testArenaPut(&arena, "provenance");
+    const standard = try testArenaPut(&arena, "LONGSTR");
+    const hier_name = try testArenaPut(&arena, "ESO LONG KEY");
+    const long_value = try testArenaPut(&arena, "alpha 'quoted' payload " ** 8);
+    const comment_name = try testArenaPut(&arena, "COMMENT");
+    const comment_text = try testArenaPut(&arena, "batch commentary");
+
+    const ops = [_]abi.ZfHeaderOpV1{
+        .{
+            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+            .value_type = @intFromEnum(abi.HeaderValueType.int64),
+            .flags = abi.header_op_comment_present,
+            .name_off = obs.off,
+            .name_len = obs.len,
+            .comment_off = note.off,
+            .comment_len = note.len,
+            .int_value = 42,
+        },
+        .{
+            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+            .value_type = @intFromEnum(abi.HeaderValueType.string),
+            .name_off = standard.off,
+            .name_len = standard.len,
+            .value_off = long_value.off,
+            .value_len = long_value.len,
+        },
+        .{
+            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+            .value_type = @intFromEnum(abi.HeaderValueType.string),
+            .name_off = hier_name.off,
+            .name_len = hier_name.len,
+            .value_off = long_value.off,
+            .value_len = long_value.len,
+            .flags = abi.header_op_comment_present,
+            .comment_off = note.off,
+            .comment_len = note.len,
+        },
+        .{
+            .opcode = @intFromEnum(abi.HeaderOpCode.append_commentary),
+            .name_off = comment_name.off,
+            .name_len = comment_name.len,
+            .value_off = comment_text.off,
+            .value_len = comment_text.len,
+        },
+    };
+    const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = before_revision, .flags = abi.header_apply_check_revision };
+    var result: abi.ZfHeaderApplyResultV1 = .{};
+    var reserved_flag_ops = [_]abi.ZfHeaderOpV1{ops[0]};
+    reserved_flag_ops[0].flags |= abi.header_op_strict;
+    try testing.expectEqual(@as(c_int, 207), capi.zf_header_apply_v1(hh, 1, &opts, &reserved_flag_ops, 1, arena.items.ptr, arena.items.len, &result));
+    try testing.expectEqual(@as(u64, 0), result.failed_op);
+    try testing.expectEqual(before_revision, hh.fits.current().header_revision);
+
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_apply_v1(hh, 1, &opts, &ops, ops.len, arena.items.ptr, arena.items.len, &result));
+    try testing.expectEqual(before_revision + 1, result.new_revision);
+    try testing.expectEqual(std.math.maxInt(u64), result.failed_op);
+    try testing.expect(result.cards_after > result.cards_before);
+
+    var got: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(hh, "OBSERVER", 8, &got));
+    try testing.expectEqual(@as(c_longlong, 42), got);
+    var long_ptr: ?[*]u8 = null;
+    var long_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_longstr(hh, "LONGSTR", 7, &long_ptr, &long_len));
+    defer capi.zf_free(long_ptr, long_len);
+    try testing.expectEqualStrings(std.mem.trimEnd(u8, arena.items[long_value.off .. long_value.off + long_value.len], " "), long_ptr.?[0..long_len]);
+
+    // A later invalid structural op rejects the complete batch and leaves generation/state alone.
+    const good = try testArenaPut(&arena, "GOOD");
+    const bitpix = try testArenaPut(&arena, "BITPIX");
+    const bad_ops = [_]abi.ZfHeaderOpV1{
+        .{
+            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+            .value_type = @intFromEnum(abi.HeaderValueType.int64),
+            .name_off = bitpix.off,
+            .name_len = bitpix.len,
+            .int_value = 16,
+        },
+        .{
+            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+            .value_type = @intFromEnum(abi.HeaderValueType.int64),
+            .name_off = good.off,
+            .name_len = good.len,
+            .int_value = 1,
+        },
+    };
+    const revision_after = result.new_revision;
+    const bad_opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = revision_after, .flags = abi.header_apply_check_revision };
+    try testing.expectEqual(@as(c_int, 207), capi.zf_header_apply_v1(hh, 1, &bad_opts, &bad_ops, bad_ops.len, arena.items.ptr, arena.items.len, &result));
+    try testing.expectEqual(@as(u64, 0), result.failed_op);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_exists(hh, "GOOD", 4));
+    try testing.expectEqual(revision_after, hh.fits.current().header_revision);
+}
+
+test "header apply uses HDU-aware structural policy for image metadata" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    var info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &info));
+
+    var arena: std.ArrayList(u8) = .empty;
+    defer arena.deinit(testing.allocator);
+    const before = try testArenaPut(&arena, "BEFORE");
+    const tfields = try testArenaPut(&arena, "TFIELDS");
+    const ztable = try testArenaPut(&arena, "ZTABLE");
+    const zform = try testArenaPut(&arena, "ZFORM1");
+    const form_value = try testArenaPut(&arena, "1J");
+    const after = try testArenaPut(&arena, "AFTER");
+    const ops = [_]abi.ZfHeaderOpV1{
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = before.off, .name_len = before.len, .int_value = 1 },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = tfields.off, .name_len = tfields.len, .int_value = 7 },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.logical), .name_off = ztable.off, .name_len = ztable.len, .int_value = 1 },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.string), .name_off = zform.off, .name_len = zform.len, .value_off = form_value.off, .value_len = form_value.len },
+        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = after.off, .name_len = after.len, .int_value = 2 },
+    };
+    const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = info.revision, .flags = abi.header_apply_check_revision };
+    var result: abi.ZfHeaderApplyResultV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_apply_v1(hh, 1, &opts, &ops, ops.len, arena.items.ptr, arena.items.len, &result));
+    try testing.expectEqual(info.revision + 1, result.new_revision);
+
+    const header = &hh.fits.current().header;
+    try testing.expectEqual(@as(i64, 7), try header.getValue(i64, "TFIELDS"));
+    try testing.expect(try header.getValue(bool, "ZTABLE"));
+    const got_form = try header.getString(testing.allocator, "ZFORM1");
+    defer testing.allocator.free(got_form);
+    try testing.expectEqualStrings("1J", got_form);
+    const names = [_][]const u8{ "BEFORE", "TFIELDS", "ZTABLE", "ZFORM1", "AFTER" };
+    var next: usize = 0;
+    for (header.cards.items) |*card| {
+        if (next < names.len and card.name.eqlText(names[next])) next += 1;
+    }
+    try testing.expectEqual(names.len, next);
+}
+
+test "header apply rejects table layout metadata before it can stale or corrupt a view" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+    const ttype = [_]?[*:0]const u8{"VALUE"};
+    const tform = [_]?[*:0]const u8{"1J"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(hh, 0, 1, 1, &ttype, &tform, null, "T"));
+
+    var info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 2, 0, &info));
+    const arena = "TFIELDS";
+    const op = [_]abi.ZfHeaderOpV1{.{
+        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+        .value_type = @intFromEnum(abi.HeaderValueType.int64),
+        .name_len = arena.len,
+        .int_value = 0,
+    }};
+    const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = info.revision, .flags = abi.header_apply_check_revision };
+    var result: abi.ZfHeaderApplyResultV1 = .{};
+    try testing.expectEqual(@as(c_int, 207), capi.zf_header_apply_v1(hh, 2, &opts, &op, op.len, arena, arena.len, &result));
+    try testing.expectEqual(info.revision, hh.fits.current().header_revision);
+
+    const compression_arena = "ZFORM1";
+    const compression_op = [_]abi.ZfHeaderOpV1{.{
+        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+        .value_type = @intFromEnum(abi.HeaderValueType.int64),
+        .name_len = compression_arena.len,
+        .int_value = 1,
+    }};
+    try testing.expectEqual(
+        @as(c_int, 207),
+        capi.zf_header_apply_v1(hh, 2, &opts, &compression_op, compression_op.len, compression_arena, compression_arena.len, &result),
+    );
+    try testing.expectEqual(info.revision, hh.fits.current().header_revision);
+
+    var table: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &table));
+    var columns: c_int = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_ncols(table, &columns));
+    try testing.expectEqual(@as(c_int, 1), columns);
+
+    // Non-layout column metadata may change, but a parsed-once table view must be invalidated so it
+    // cannot keep returning stale cached descriptors. A newly opened view observes the commit.
+    var metadata_info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 2, 0, &metadata_info));
+    const metadata_arena = "TTYPE1RENAMED";
+    const metadata_op = [_]abi.ZfHeaderOpV1{.{
+        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
+        .value_type = @intFromEnum(abi.HeaderValueType.string),
+        .flags = abi.header_op_comment_present,
+        .name_len = 6,
+        .value_off = 6,
+        .value_len = 7,
+    }};
+    const metadata_opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = metadata_info.revision, .flags = abi.header_apply_check_revision };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_apply_v1(hh, 2, &metadata_opts, &metadata_op, metadata_op.len, metadata_arena, metadata_arena.len, &result));
+    try testing.expect(capi.zf_table_ncols(table, &columns) != 0);
+    capi.zf_table_close(table);
+
+    var fresh: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &fresh));
+    defer capi.zf_table_close(fresh);
+    var name: [16]u8 = undefined;
+    var name_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_col_name(fresh, 0, &name, name.len, &name_len));
+    try testing.expectEqualStrings("RENAMED", name[0..name_len]);
+}
+
+test "header apply grows an earlier header once and preserves following HDU data/current selection" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+    const axes = [_]c_long{4};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 16, 1, &axes));
+    const pixels = [_]i16{ 10, 20, 30, 40 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(hh, I16, 1, pixels.len, null, null, &pixels));
+
+    var info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &info));
+    const name = "COMMENT";
+    const text = "0123456789abcdef" ** 200; // > 40 physical commentary cards / multiple blocks
+    const arena = name ++ text;
+    const ops = [_]abi.ZfHeaderOpV1{.{
+        .opcode = @intFromEnum(abi.HeaderOpCode.append_commentary),
+        .name_off = 0,
+        .name_len = name.len,
+        .value_off = name.len,
+        .value_len = text.len,
+    }};
+    const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = info.revision, .flags = abi.header_apply_check_revision };
+    var result: abi.ZfHeaderApplyResultV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_apply_v1(hh, 1, &opts, &ops, ops.len, arena.ptr, arena.len, &result));
+    try testing.expect(result.cards_after > result.cards_before + 36);
+
+    var current: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_current_hdu(hh, &current));
+    try testing.expectEqual(@as(c_long, 2), current); // explicit-index apply never changes CHDU
+    var got: [4]i16 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, I16, 1, got.len, null, null, &got));
+    try testing.expectEqualSlices(i16, &pixels, &got);
+}
+
 test "zf_write_key_longstr replace does not orphan the old CONTINUE run (BUGHUNT 24)" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
@@ -895,6 +1276,124 @@ test "zf_write_key_longstr replace does not orphan the old CONTINUE run (BUGHUNT
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_longstr(hh, name, name.len, &out_ptr, &out_len));
     defer capi.zf_free(out_ptr, out_len);
     try testing.expectEqualStrings(short, out_ptr.?[0..out_len]);
+}
+
+test "failed long-string replacement preserves the live header and pending snapshot" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const name = "LONGSTR";
+    const original = "original 'quoted' value " ** 6;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        capi.zf_write_key_longstr(hh, name, name.len, original, original.len, null, 0),
+    );
+
+    // Retain a query/fill cache, then fail while preparing the replacement's final card. The old
+    // implementation deleted the live run before split rejected this unrepresentable comment,
+    // leaving the cache falsely current at the unchanged revision.
+    var queried: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &queried));
+    const entries = try testing.allocator.alloc(abi.ZfHeaderEntryV1, @intCast(queried.logical_count));
+    defer testing.allocator.free(entries);
+    const arena = try testing.allocator.alloc(u8, @intCast(queried.arena_bytes));
+    defer testing.allocator.free(arena);
+
+    const replacement = "replacement" ** 12;
+    const oversized_comment = "c" ** 80;
+    try testing.expectEqual(
+        @as(c_int, 207),
+        capi.zf_write_key_longstr(
+            hh,
+            name,
+            name.len,
+            replacement,
+            replacement.len,
+            oversized_comment,
+            oversized_comment.len,
+        ),
+    );
+    try testing.expectEqual(queried.revision, hh.fits.current().header_revision);
+
+    var filled: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_fill_v1(
+        hh,
+        1,
+        0,
+        queried.revision,
+        entries.ptr,
+        entries.len,
+        arena.ptr,
+        arena.len,
+        null,
+        0,
+        &filled,
+    ));
+    try testing.expectEqual(queried.revision, filled.revision);
+
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_longstr(hh, name, name.len, &out_ptr, &out_len));
+    defer capi.zf_free(out_ptr, out_len);
+    try testing.expectEqualStrings(std.mem.trimEnd(u8, original, " "), out_ptr.?[0..out_len]);
+}
+
+test "failed legacy rewrite invalidates the old snapshot generation" {
+    var source: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    defer capi.zf_close(source);
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const serialized = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(serialized);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, serialized.ptr, serialized.len, &got));
+    try testing.expectEqual(serialized.len, got);
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(serialized.ptr, serialized.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+
+    var before: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(ro, 1, 0, &before));
+
+    // Header.update changes the in-memory cards before the read-only device rejects serialization.
+    // The failed rewrite must still advance the observable generation and discard `before`'s
+    // retained snapshot.
+    const name = "MUTATED";
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_key_lng(ro, name, name.len, 7, null, 0));
+    try testing.expect(before.revision != ro.fits.current().header_revision);
+
+    var untouched: abi.ZfHeaderSnapshotInfoV1 = .{ .revision = 0xfeed_beef };
+    try testing.expectEqual(@as(c_int, 412), capi.zf_header_snapshot_fill_v1(
+        ro,
+        1,
+        0,
+        before.revision,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        &untouched,
+    ));
+    try testing.expectEqual(@as(u64, 0xfeed_beef), untouched.revision);
+
+    var after: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(ro, 1, 0, &after));
+    try testing.expect(after.revision != before.revision);
+    try testing.expectEqual(before.logical_count + 1, after.logical_count);
+    var value: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(ro, name, name.len, &value));
+    try testing.expectEqual(@as(c_longlong, 7), value);
 }
 
 test "zf_delete_key removes a HIERARCH+CONTINUE run inserted via zf_write_record" {
@@ -1094,16 +1593,47 @@ test "copy_hdu duplicates a table HDU; delete_hdu removes one and preserves surv
     var out = [_]i32{ 0, 0 };
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_col(t2.?, I32, 0, 1, 2, null, &out));
     try testing.expectEqualSlices(i32, &vals, &out);
-    capi.zf_table_close(t2);
 
     // Copying/deleting the primary HDU is rejected.
     try testing.expect(capi.zf_copy_hdu(hh, 1) != 0);
     try testing.expect(capi.zf_delete_hdu(hh, 1) != 0);
 
-    // Delete the original HDU 2; HDU 3's data (now HDU 2) must survive intact.
+    // Keep a view and a pending snapshot query on the doomed HDU. Deletion must invalidate the
+    // former and make the latter conflict, never leave a freed-Hdu view or alias the survivor that
+    // shifts into the same 1-based index/revision.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(hh, 2));
+    var doomed_view: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &doomed_view));
+    var doomed_info: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 2, 0, &doomed_info));
+
+    // Delete the original HDU 2; HDU 3's data (now HDU 2) and its already-open view survive.
     try testing.expectEqual(@as(c_int, 0), capi.zf_delete_hdu(hh, 2));
+    var dead_rows: c_longlong = 0;
+    try testing.expect(capi.zf_table_nrows(doomed_view, &dead_rows) != 0);
+    capi.zf_table_close(doomed_view);
+    var stale_fill: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 412), capi.zf_header_snapshot_fill_v1(
+        hh,
+        2,
+        0,
+        doomed_info.revision,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        &stale_fill,
+    ));
+
     try testing.expectEqual(@as(c_int, 0), capi.zf_hdu_count(hh, &count));
     try testing.expectEqual(@as(c_long, 2), count);
+    @memset(out[0..], 0);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col(t2.?, I32, 0, 1, 2, null, &out));
+    try testing.expectEqualSlices(i32, &vals, &out);
+    capi.zf_table_close(t2);
+
     try testing.expectEqual(@as(c_int, 0), capi.zf_select(hh, 2));
     var t3: ?*abi.TableHandle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t3));
@@ -1367,7 +1897,23 @@ test "zf_update_chksum_all recomputes every HDU's integrity keywords; zf_datasum
     try testing.expectEqual(@as(c_int, 0), capi.zf_verify_chksum(hh, &csum, &dsum));
     try testing.expectEqual(@as(c_int, -1), dsum); // stale: mismatch after the mutation
 
+    var before_update: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &before_update));
     try testing.expectEqual(@as(c_int, 0), capi.zf_update_chksum_all(hh));
+    var stale_snapshot: abi.ZfHeaderSnapshotInfoV1 = .{};
+    try testing.expectEqual(@as(c_int, 412), capi.zf_header_snapshot_fill_v1(
+        hh,
+        1,
+        0,
+        before_update.revision,
+        null,
+        0,
+        null,
+        0,
+        null,
+        0,
+        &stale_snapshot,
+    ));
     try testing.expectEqual(@as(c_int, 0), capi.zf_verify_chksum(hh, &csum, &dsum));
     try testing.expectEqual(@as(c_int, 1), csum);
     try testing.expectEqual(@as(c_int, 1), dsum);

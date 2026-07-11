@@ -50,6 +50,11 @@ type BufDir = "in" | "out" | "inout";
 // positional heuristic) so they cannot silently mis-optimize if the ABI grows; they are pinned by
 // the tripwire test in `tests/lowlevel.test.ts` and mirror `bindings/c/zigfitsio.h`.
 export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "out">>>> = {
+  zf_header_snapshot_query_v1: { 3: "out" },
+  // snapshot_fill is deliberately left at the default "inout" direction. Its ABI is
+  // failure-atomic: BUFFER_TOO_SMALL leaves every caller buffer untouched, so staging the
+  // original bytes is required before the unconditional Wasm copy-back.
+  zf_header_apply_v1: { 2: "in", 3: "in", 5: "in", 7: "out" },
   zf_read_img: { 6: "out" }, //           (handle, dtype, first, nelem, nulval, scaling, [array])
   zf_write_img: { 6: "in" },
   zf_read_subset: { 9: "out" }, //        (…, lower, upper, inc, nelem, nulval, scaling, [array])

@@ -32,6 +32,11 @@ pub fn errorText(err: errors.Error) []const u8 {
         error.MissingEnd => "header has no END card",
         error.BadContinue => "malformed CONTINUE long-string convention",
         error.CardOverflow => "value does not fit in an 80-character card",
+        // Logical header snapshot/edit transaction
+        error.StructuralKeyword => "structural keyword is not editable in this transaction",
+        error.InvalidHeaderOperation => "invalid staged header operation",
+        error.TransactionConflict => "header changed since the snapshot was queried",
+        error.BufferTooSmall => "caller-provided header snapshot buffer is too small",
         // Value typing
         error.WrongValueType => "keyword value has a different type than requested",
         error.ValueUndefined => "keyword value is undefined (blank value field)",
@@ -86,11 +91,12 @@ test "errorText is non-empty for every error value" {
     // Exhaustively touch a representative set across all areas; the switch above is total,
     // so any missing arm is a compile error (the real guarantee).
     inline for (.{
-        error.OutOfMemory,        error.EndOfStream,  error.MissingEnd,
-        error.KeywordNotFound,    error.BadBitpix,    error.NoSuchColumn,
-        error.Overflow,           error.NanToInt,     error.ChecksumMismatch,
-        error.UnsupportedCodec,   error.BadWcs,       error.LimitExceeded,
-        error.ValueUndefined,     error.BadDescriptor,
+        error.OutOfMemory,         error.EndOfStream,    error.MissingEnd,
+        error.KeywordNotFound,     error.BadBitpix,      error.NoSuchColumn,
+        error.Overflow,            error.NanToInt,       error.ChecksumMismatch,
+        error.UnsupportedCodec,    error.BadWcs,         error.LimitExceeded,
+        error.TransactionConflict, error.BufferTooSmall, error.ValueUndefined,
+        error.BadDescriptor,
     }) |e| {
         try testing.expect(errorText(e).len > 0);
     }

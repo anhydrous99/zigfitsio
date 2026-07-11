@@ -36,6 +36,10 @@ pub const HduKind = enum {
 pub const Hdu = struct {
     kind: HduKind,
     header: Header,
+    /// Monotonic in-process generation of the logical header. Snapshot callers use this to
+    /// detect a mutation between their capacity query and fill calls. It is deliberately not
+    /// serialized into the FITS file and starts at one for every newly scanned/built HDU.
+    header_revision: u64 = 1,
     /// Byte offset of this HDU's first header card.
     header_off: u64,
     /// Byte offset of the data unit (first byte after the padded header).
@@ -53,6 +57,14 @@ pub const Hdu = struct {
     /// `GCOUNT` (group count; 1 for a plain image).
     gcount: u64,
 
+    /// Advance the in-process logical-header generation, reserving zero as an invalid/sentinel
+    /// value for foreign callers. Call this as soon as an in-memory header mutation becomes
+    /// externally observable, including an error path that leaves changed cards behind.
+    pub fn bumpHeaderRevision(self: *Hdu) void {
+        self.header_revision +%= 1;
+        if (self.header_revision == 0) self.header_revision = 1;
+    }
+
     /// Build an `Hdu` from an already-parsed `header` located at `header_off`, where the
     /// header occupied `cards_consumed` cards. Detects the kind, validates mandatory keywords,
     /// computes the data geometry (validated against `lim`), and derives `data_off`. Takes
@@ -68,6 +80,7 @@ pub const Hdu = struct {
         var self: Hdu = .{
             .kind = undefined,
             .header = header,
+            .header_revision = 1,
             .header_off = header_off,
             .data_off = 0,
             .data_bytes = 0,

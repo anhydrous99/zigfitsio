@@ -442,7 +442,7 @@ describe("HIERARCH long-string write (multi-card)", () => {
     const idCard = cards.find((c) => c.includes("ESO DET ID"))!;
     expect(idCard.split("HIERARCH").length - 1).toBe(1);
     const expCard = cards.find((c) => c.includes("ESO DET EXPTIME"))!;
-    expect(expCard).toContain("E-7");
+    expect(expCard).toContain("E-07");
     expect(expCard).not.toContain("e-7");
     const hl = zf.fromBytes(blob);
     try {
@@ -1261,6 +1261,59 @@ describe("writeTo reconstructs a reassigned TableData by column name", () => {
 // which has always called _applyUserKeys.
 describe("user header keywords survive reconstruction (table + compressed image)", () => {
   const dup = (h: zf.Header, kw: string): number => h.keys().filter((k) => k === kw).length;
+
+  test("plain-image reconstruction preserves ordered table-looking extra cards", () => {
+    const source = bytesFrom((handle) => {
+      ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+      for (const [key, value] of [
+        ["BEFORE", 1n],
+        ["TFIELDS", 0n],
+        ["MIDDLE", 2n],
+        ["ZTABLE", true],
+        ["ZFORM1", "1J"],
+        ["ZCTYP1", "PIXEL"],
+        ["ZTILELEN", 32n],
+        ["AFTER", 3n],
+      ] as const) {
+        const kb = enc(key);
+        if (typeof value === "bigint") {
+          ll.check(ll.lib.zf_write_key_lng(handle, kb, kb.length, value, null, 0));
+        } else if (typeof value === "boolean") {
+          ll.check(ll.lib.zf_write_key_log(handle, kb, kb.length, value ? 1 : 0, null, 0));
+        } else {
+          const vb = enc(value);
+          ll.check(ll.lib.zf_write_key_str(handle, kb, kb.length, vb, vb.length, null, 0));
+        }
+      }
+    });
+    const original = zf.fromBytes(source);
+    let rebuilt: Uint8Array;
+    try {
+      expect(original.get(0).header.get("TFIELDS")).toBe(0);
+      expect(zf.verify(original).filter((f) => f.severity === "error")).toEqual([]);
+      original.get(0).header.set("DIRTY", true); // read-only edit forces image reconstruction
+      rebuilt = original.toBytes();
+    } finally {
+      original.close();
+    }
+
+    const reopened = zf.fromBytes(rebuilt);
+    try {
+      const hdr = reopened.get(0).header;
+      expect(hdr.get("TFIELDS")).toBe(0);
+      expect(hdr.get("ZTABLE")).toBe(true);
+      expect(hdr.get("ZFORM1")).toBe("1J");
+      expect(hdr.get("ZCTYP1")).toBe("PIXEL");
+      expect(hdr.get("ZTILELEN")).toBe(32);
+      expect(hdr.get("DIRTY")).toBe(true);
+      const keys = hdr.keys();
+      const extras = ["BEFORE", "TFIELDS", "MIDDLE", "ZTABLE", "ZFORM1", "ZCTYP1", "ZTILELEN", "AFTER"];
+      expect(keys.filter((key) => extras.includes(key))).toEqual(extras);
+      expect(zf.verify(reopened).filter((f) => f.severity === "error")).toEqual([]);
+    } finally {
+      reopened.close();
+    }
+  });
 
   test("#1 detached table: user keyword + COMMENT + HISTORY survive writeTo", () => {
     const idx = Int32Array.from([10, 20, 30]);
@@ -2176,7 +2229,7 @@ describe("non-finite float header values are rejected on write (BUGHUNT 25/27)",
     }
   });
 
-  test("HIERARCH float -Infinity throws (raw-card path bypasses the Zig-core guard)", () => {
+  test("HIERARCH float -Infinity is rejected before batch packing", () => {
     const h = new zf.Header();
     h.set("ESO DET BAD GAIN", -Infinity);
     expect(() => new zf.HDUList([new zf.PrimaryHDU({ data: new Float32Array(4), header: h })]).toBytes()).toThrow(

@@ -1,5 +1,5 @@
 /**
- * Codecs for the three C structs the ABI passes by pointer (never by value),
+ * Codecs for the fixed-layout C structs the ABI passes by pointer (never by value),
  * so neither FFI backend needs struct support: each struct is one
  * `ArrayBuffer` written/read through native-endian typed-array views (every
  * field is naturally aligned, and the C side reads native endianness).
@@ -112,5 +112,169 @@ export function decodeColInfo(bytes: Uint8Array): ColInfo {
     tzero: f64[5], // @40
     tnull: i64[6], // @48
     hasTnull: i32[14] !== 0, // @56, tail pad @60
+  };
+}
+
+// ── Logical-header snapshot/edit V1 ──
+
+/** Fixed ABI sizes; kept explicit so Wasm marshalling never depends on JS object layout. */
+export const HEADER_SNAPSHOT_INFO_V1_SIZE = 48;
+export const HEADER_ENTRY_V1_SIZE = 96;
+export const HEADER_OP_V1_SIZE = 88;
+export const HEADER_APPLY_OPTS_V1_SIZE = 16;
+export const HEADER_APPLY_RESULT_V1_SIZE = 32;
+
+function requireBytes(bytes: Uint8Array, needed: number, what: string): DataView {
+  if (bytes.byteLength < needed) {
+    throw new RangeError(`${what} requires ${needed} bytes, got ${bytes.byteLength}`);
+  }
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+export interface HeaderSnapshotInfoV1 {
+  revision: bigint;
+  logicalCount: bigint;
+  physicalCount: bigint;
+  arenaBytes: bigint;
+  rawBytes: bigint;
+  flags: bigint;
+}
+
+export function newHeaderSnapshotInfoV1Buf(): Uint8Array {
+  return new Uint8Array(HEADER_SNAPSHOT_INFO_V1_SIZE);
+}
+
+export function decodeHeaderSnapshotInfoV1(bytes: Uint8Array): HeaderSnapshotInfoV1 {
+  const view = requireBytes(bytes, HEADER_SNAPSHOT_INFO_V1_SIZE, "ZfHeaderSnapshotInfoV1");
+  return {
+    revision: view.getBigUint64(0, true),
+    logicalCount: view.getBigUint64(8, true),
+    physicalCount: view.getBigUint64(16, true),
+    arenaBytes: view.getBigUint64(24, true),
+    rawBytes: view.getBigUint64(32, true),
+    flags: view.getBigUint64(40, true),
+  };
+}
+
+export interface HeaderEntryV1 {
+  kind: number;
+  valueType: number;
+  flags: number;
+  reserved: number;
+  physicalFirst: bigint;
+  physicalCount: bigint;
+  keywordOff: bigint;
+  keywordLen: bigint;
+  valueOff: bigint;
+  valueLen: bigint;
+  commentOff: bigint;
+  commentLen: bigint;
+  intValue: bigint;
+  floatValue: number;
+}
+
+/** Decode entry `index` from a packed array of ZfHeaderEntryV1 descriptors. */
+export function decodeHeaderEntryV1(bytes: Uint8Array, index = 0): HeaderEntryV1 {
+  if (!Number.isSafeInteger(index) || index < 0) throw new RangeError(`invalid header-entry index ${index}`);
+  const base = index * HEADER_ENTRY_V1_SIZE;
+  const view = requireBytes(bytes, base + HEADER_ENTRY_V1_SIZE, "ZfHeaderEntryV1 array");
+  return {
+    kind: view.getUint32(base, true),
+    valueType: view.getUint32(base + 4, true),
+    flags: view.getUint32(base + 8, true),
+    reserved: view.getUint32(base + 12, true),
+    physicalFirst: view.getBigUint64(base + 16, true),
+    physicalCount: view.getBigUint64(base + 24, true),
+    keywordOff: view.getBigUint64(base + 32, true),
+    keywordLen: view.getBigUint64(base + 40, true),
+    valueOff: view.getBigUint64(base + 48, true),
+    valueLen: view.getBigUint64(base + 56, true),
+    commentOff: view.getBigUint64(base + 64, true),
+    commentLen: view.getBigUint64(base + 72, true),
+    intValue: view.getBigInt64(base + 80, true),
+    floatValue: view.getFloat64(base + 88, true),
+  };
+}
+
+export function decodeHeaderEntriesV1(bytes: Uint8Array, count: number): HeaderEntryV1[] {
+  if (!Number.isSafeInteger(count) || count < 0 || count * HEADER_ENTRY_V1_SIZE > bytes.byteLength) {
+    throw new RangeError(`invalid ZfHeaderEntryV1 count ${count} for ${bytes.byteLength} bytes`);
+  }
+  return Array.from({ length: count }, (_, i) => decodeHeaderEntryV1(bytes, i));
+}
+
+export interface HeaderOpV1 {
+  opcode: number;
+  valueType?: number;
+  flags?: number;
+  reserved?: number;
+  nameOff?: bigint;
+  nameLen?: bigint;
+  valueOff?: bigint;
+  valueLen?: bigint;
+  commentOff?: bigint;
+  commentLen?: bigint;
+  intValue?: bigint;
+  floatValue?: number;
+  position?: bigint;
+}
+
+/** Encode a packed caller-owned array of ZfHeaderOpV1 descriptors. */
+export function encodeHeaderOpsV1(ops: readonly HeaderOpV1[]): Uint8Array {
+  const bytes = new Uint8Array(ops.length * HEADER_OP_V1_SIZE);
+  const view = new DataView(bytes.buffer);
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    const base = i * HEADER_OP_V1_SIZE;
+    view.setUint32(base, op.opcode, true);
+    view.setUint32(base + 4, op.valueType ?? 0, true);
+    view.setUint32(base + 8, op.flags ?? 0, true);
+    view.setUint32(base + 12, op.reserved ?? 0, true);
+    view.setBigUint64(base + 16, op.nameOff ?? 0n, true);
+    view.setBigUint64(base + 24, op.nameLen ?? 0n, true);
+    view.setBigUint64(base + 32, op.valueOff ?? 0n, true);
+    view.setBigUint64(base + 40, op.valueLen ?? 0n, true);
+    view.setBigUint64(base + 48, op.commentOff ?? 0n, true);
+    view.setBigUint64(base + 56, op.commentLen ?? 0n, true);
+    view.setBigInt64(base + 64, op.intValue ?? 0n, true);
+    view.setFloat64(base + 72, op.floatValue ?? 0, true);
+    view.setBigInt64(base + 80, op.position ?? -1n, true);
+  }
+  return bytes;
+}
+
+export interface HeaderApplyOptsV1 {
+  expectedRevision?: bigint;
+  flags?: number;
+  reserved?: number;
+}
+
+export function encodeHeaderApplyOptsV1(opts: HeaderApplyOptsV1 = {}): Uint8Array {
+  const bytes = new Uint8Array(HEADER_APPLY_OPTS_V1_SIZE);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(0, opts.expectedRevision ?? 0n, true);
+  view.setUint32(8, opts.flags ?? 0, true);
+  view.setUint32(12, opts.reserved ?? 0, true);
+  return bytes;
+}
+
+export interface HeaderApplyResultV1 {
+  newRevision: bigint;
+  failedOp: bigint;
+  cardsBefore: bigint;
+  cardsAfter: bigint;
+}
+
+export function newHeaderApplyResultV1Buf(): Uint8Array {
+  return new Uint8Array(HEADER_APPLY_RESULT_V1_SIZE);
+}
+
+export function decodeHeaderApplyResultV1(bytes: Uint8Array): HeaderApplyResultV1 {
+  const view = requireBytes(bytes, HEADER_APPLY_RESULT_V1_SIZE, "ZfHeaderApplyResultV1");
+  return {
+    newRevision: view.getBigUint64(0, true),
+    failedOp: view.getBigUint64(8, true),
+    cardsBefore: view.getBigUint64(16, true),
+    cardsAfter: view.getBigUint64(24, true),
   };
 }

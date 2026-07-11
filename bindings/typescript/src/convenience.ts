@@ -50,10 +50,10 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
     }
     const plain = gunzip(bytes);
     ll.check(ll.lib.zf_open_memory(plain, plain.length, ll.READONLY, optBuf, out));
-    return HDUList._fromHandle(out[0], modeCode);
+    return HDUList._fromHandle(out[0], modeCode, opts?.checksumOnClose === true);
   }
   ll.check(ll.lib.zf_open_memory(bytes, bytes.length, modeCode, optBuf, out));
-  const hdul = HDUList._fromHandle(out[0], modeCode);
+  const hdul = HDUList._fromHandle(out[0], modeCode, opts?.checksumOnClose === true);
   hdul._path = path; // origin for update/append write-back on close()
   return hdul;
 }

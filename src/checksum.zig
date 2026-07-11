@@ -85,7 +85,7 @@ pub fn sumBytes(prev: u32, bytes: []const u8) u32 {
     }
     // Zero-padded tail (<4 bytes), summed only at a non-block-aligned end.
     if (i < bytes.len) {
-        var tail = [4]u8{ 0, 0, 0, 0};
+        var tail = [4]u8{ 0, 0, 0, 0 };
         const rem = bytes.len - i;
         @memcpy(tail[0..rem], bytes[i..][0..rem]);
         const g = endian.read(u32, &tail);
@@ -251,6 +251,9 @@ pub fn update(fits: *Fits, hdu: *Hdu) UpdateError!void {
     var dbuf: [16]u8 = undefined;
     const dstr = std.fmt.bufPrint(&dbuf, "{d}", .{ds}) catch unreachable; // u32 ⇒ ≤10 digits
     hdu.header.cards.items[ds_idx] = try Card.buildValue("DATASUM", .{ .string = dstr }, "data unit checksum");
+    // The in-memory logical header changed. Bump immediately so a later checksum/read/write error
+    // cannot leave a query/fill snapshot generation falsely current.
+    hdu.bumpHeaderRevision();
 
     // 2. Reset CHECKSUM to the placeholder, then accumulate the whole-HDU sum over it.
     hdu.header.cards.items[cs_idx] = try Card.buildValue("CHECKSUM", .{ .string = ZERO_CHECKSUM }, "HDU checksum");

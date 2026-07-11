@@ -99,6 +99,97 @@ typedef struct {
     int     has_tnull;
 } ZfColInfo;
 
+/* ── Logical-header snapshot/edit V1 structs ───────────────────────────────────────────── */
+#define ZF_HEADER_SNAPSHOT_INCLUDE_RAW 0x00000001u
+
+#define ZF_HEADER_ENTRY_VALUE       1u
+#define ZF_HEADER_ENTRY_COMMENTARY  2u
+#define ZF_HEADER_ENTRY_BLANK       3u
+#define ZF_HEADER_ENTRY_OTHER       4u
+
+#define ZF_HEADER_VALUE_NONE          0u
+#define ZF_HEADER_VALUE_UNDEFINED     1u
+#define ZF_HEADER_VALUE_LOGICAL       2u
+#define ZF_HEADER_VALUE_INT64         3u
+#define ZF_HEADER_VALUE_INTEGER_TEXT  4u
+#define ZF_HEADER_VALUE_FLOAT64       5u
+#define ZF_HEADER_VALUE_STRING        6u
+#define ZF_HEADER_VALUE_RAW_TOKEN     7u
+
+#define ZF_HEADER_ENTRY_HIERARCH   0x00000001u
+#define ZF_HEADER_ENTRY_CONTINUED  0x00000002u
+#define ZF_HEADER_ENTRY_MALFORMED  0x00000004u
+
+#define ZF_HEADER_OP_UPSERT             1u
+#define ZF_HEADER_OP_DELETE_FIRST       2u
+#define ZF_HEADER_OP_DELETE_ALL         3u
+#define ZF_HEADER_OP_RENAME             4u
+#define ZF_HEADER_OP_APPEND_COMMENTARY  5u
+#define ZF_HEADER_OP_APPEND_RAW_RUN     6u
+#define ZF_HEADER_OP_INSERT_RAW_RUN     7u
+#define ZF_HEADER_OP_RESERVE_BLANKS     8u
+
+#define ZF_HEADER_OP_COMMENT_PRESENT 0x00000001u
+/* Reserved V1 bits: passing either currently returns BAD_KEYCHAR rather than being ignored. */
+#define ZF_HEADER_OP_STRICT          0x00000002u
+#define ZF_HEADER_OP_FORCE_HIERARCH  0x00000004u
+#define ZF_HEADER_APPLY_CHECK_REVISION 0x00000001u
+
+typedef struct {
+    uint64_t revision;
+    uint64_t logical_count;
+    uint64_t physical_count;
+    uint64_t arena_bytes;
+    uint64_t raw_bytes;
+    uint64_t flags;
+} ZfHeaderSnapshotInfoV1;
+
+typedef struct {
+    uint32_t kind;
+    uint32_t value_type;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t physical_first;
+    uint64_t physical_count;
+    uint64_t keyword_off;
+    uint64_t keyword_len;
+    uint64_t value_off;
+    uint64_t value_len;
+    uint64_t comment_off;
+    uint64_t comment_len;
+    int64_t  int_value;
+    double   float_value;
+} ZfHeaderEntryV1;
+
+typedef struct {
+    uint32_t opcode;
+    uint32_t value_type;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t name_off;
+    uint64_t name_len;
+    uint64_t value_off;
+    uint64_t value_len;
+    uint64_t comment_off;
+    uint64_t comment_len;
+    int64_t  int_value;
+    double   float_value;
+    int64_t  position;
+} ZfHeaderOpV1;
+
+typedef struct {
+    uint64_t expected_revision;
+    uint32_t flags;
+    uint32_t reserved;
+} ZfHeaderApplyOptsV1;
+
+typedef struct {
+    uint64_t new_revision;
+    uint64_t failed_op;
+    uint64_t cards_before;
+    uint64_t cards_after;
+} ZfHeaderApplyResultV1;
+
 /* ── Version & error introspection ───────────────────────────────────────────────────────── */
 const char* zf_version(void);
 int    zf_last_status(void);
@@ -161,6 +252,24 @@ int  zf_delete_key(ZfFits* h, const uint8_t* name, size_t name_len);
 int  zf_rename_key(ZfFits* h, const uint8_t* old, size_t old_len, const uint8_t* neu, size_t neu_len);
 int  zf_write_record(ZfFits* h, const uint8_t* card80);
 int  zf_insert_record(ZfFits* h, long index, const uint8_t* card80);
+/* Query retains one revision-bound snapshot on the single-threaded handle; a matching successful
+ * fill consumes it (BUFFER_TOO_SMALL leaves it retryable, and another query replaces it). */
+int  zf_header_snapshot_query_v1(ZfFits* h, uint64_t hdu_index, uint32_t flags,
+                                 ZfHeaderSnapshotInfoV1* out);
+int  zf_header_snapshot_fill_v1(ZfFits* h, uint64_t hdu_index, uint32_t flags,
+                                uint64_t expected_revision,
+                                ZfHeaderEntryV1* entries, size_t entry_capacity,
+                                uint8_t* arena, size_t arena_capacity,
+                                uint8_t* raw_cards, size_t raw_capacity,
+                                ZfHeaderSnapshotInfoV1* out);
+/* All operations validate against a staged clone before one header write. Validation/revision
+ * failures leave bytes untouched; device failures use best-effort rollback, not crash-safe
+ * journaling. A successful table-header edit invalidates open ZfTable views for that HDU. */
+int  zf_header_apply_v1(ZfFits* h, uint64_t hdu_index,
+                        const ZfHeaderApplyOptsV1* opts,
+                        const ZfHeaderOpV1* ops, size_t op_count,
+                        const uint8_t* arena, size_t arena_len,
+                        ZfHeaderApplyResultV1* out);
 
 /* ── HDU management ──────────────────────────────────────────────────────────────────────── */
 int  zf_delete_hdu(ZfFits* h, long n);

@@ -69,6 +69,20 @@ with zf.open("image.fits", mode="update") as hdul:
     print("BITPIX" in h, list(h.keys()))
 ```
 
+Setters remain eager by default. Use `Header.edit()` to validate related changes together and
+commit them with one Zig call/header write:
+
+```python
+with zf.open("image.fits", mode="update") as hdul:
+    with hdul[0].header.edit() as h:
+        h["OBSERVER"] = ("Hubble", "who")
+        h["ESO DET CHIP ID"] = 42  # HIERARCH is serialized by the Zig core
+        h.add_history("calibrated")
+```
+
+Callback, validation, and revision-conflict failures leave the file unchanged. Device failures
+use best-effort rollback and are not a crash-safe/on-disk journaling transaction.
+
 ### WCS (celestial)
 
 ```python

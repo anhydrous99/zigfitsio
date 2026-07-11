@@ -231,6 +231,7 @@ pub export fn zf_close(h: ?*Handle) void {
         th.dead = true;
     }
     hh.tables.deinit(gpa);
+    hh.clearHeaderSnapshot();
     hh.fits.deinit();
     if (hh.mem_dev) |md| {
         md.deinit();
@@ -544,6 +545,14 @@ pub export fn zf_write_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower
 // Header
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
+fn headerHduAt(h: *Handle, hdu_index: u64) fits.Error!*fits.Hdu {
+    if (hdu_index == 0) return error.WrongHduType;
+    const n = std.math.cast(usize, hdu_index) orelse return error.WrongHduType;
+    const saved = h.fits.chdu;
+    defer h.fits.chdu = saved;
+    return h.fits.select(n);
+}
+
 fn endIndex(hdr: *const fits.Header) usize {
     var i: usize = 0;
     while (i < hdr.count()) : (i += 1) if (hdr.at(i).kind == .end) return i;
@@ -569,6 +578,336 @@ pub export fn zf_read_card(h_opt: ?*Handle, index: c_long, buf80: [*]u8) c_int {
     if (index < 0 or @as(usize, @intCast(index)) >= hdu.header.count()) return abi.fail(&h.diag, error.KeywordNotFound);
     const card = hdu.header.at(@intCast(index));
     @memcpy(buf80[0..80], card.bytes()[0..80]);
+    return 0;
+}
+
+const ZfHeaderSnapshotInfoV1 = abi.ZfHeaderSnapshotInfoV1;
+const ZfHeaderEntryV1 = abi.ZfHeaderEntryV1;
+
+fn snapshotRawBytes(hdu: *const fits.Hdu, flags: u32) fits.Error!u64 {
+    if (flags & abi.header_snapshot_include_raw == 0) return 0;
+    return std.math.mul(u64, @intCast(hdu.header.count()), 80) catch error.LimitExceeded;
+}
+
+fn setSnapshotInfo(out: *ZfHeaderSnapshotInfoV1, hdu: *const fits.Hdu, snap: *const fits.logical_header.Snapshot, flags: u32) fits.Error!void {
+    out.* = .{
+        .revision = hdu.header_revision,
+        .logical_count = @intCast(snap.entries.len),
+        .physical_count = @intCast(snap.physical_count),
+        .arena_bytes = @intCast(snap.arena.len),
+        .raw_bytes = try snapshotRawBytes(hdu, flags),
+        .flags = flags,
+    };
+}
+
+const SnapshotArenaRef = struct { off: u64, len: u64 };
+
+fn snapshotArenaRef(snap: *const fits.logical_header.Snapshot, bytes: []const u8) SnapshotArenaRef {
+    if (bytes.len == 0) return .{ .off = 0, .len = 0 };
+    return .{ .off = @intCast(@intFromPtr(bytes.ptr) - @intFromPtr(snap.arena.ptr)), .len = @intCast(bytes.len) };
+}
+
+fn abiSnapshotEntry(snap: *const fits.logical_header.Snapshot, entry: fits.logical_header.Entry) ZfHeaderEntryV1 {
+    const name = snapshotArenaRef(snap, entry.keyword);
+    const comment: SnapshotArenaRef = if (entry.comment) |c| snapshotArenaRef(snap, c) else .{ .off = 0, .len = 0 };
+    var out: ZfHeaderEntryV1 = .{
+        .kind = @intFromEnum(switch (entry.kind) {
+            .value => abi.HeaderEntryKind.value,
+            .commentary => abi.HeaderEntryKind.commentary,
+            .blank => abi.HeaderEntryKind.blank,
+            .other => abi.HeaderEntryKind.other,
+        }),
+        .flags = (if (entry.hierarch) abi.header_entry_hierarch else 0) |
+            (if (entry.continued) abi.header_entry_continued else 0) |
+            (if (entry.malformed) abi.header_entry_malformed else 0),
+        .physical_first = @intCast(entry.physical_first),
+        .physical_count = @intCast(entry.physical_count),
+        .keyword_off = name.off,
+        .keyword_len = name.len,
+        .comment_off = comment.off,
+        .comment_len = comment.len,
+    };
+    switch (entry.value) {
+        .none => {
+            out.value_type = @intFromEnum(abi.HeaderValueType.none);
+            const text = snapshotArenaRef(snap, entry.commentary_text);
+            out.value_off = text.off;
+            out.value_len = text.len;
+        },
+        .undefined => out.value_type = @intFromEnum(abi.HeaderValueType.undefined),
+        .logical => |v| {
+            out.value_type = @intFromEnum(abi.HeaderValueType.logical);
+            out.int_value = if (v) 1 else 0;
+        },
+        .int64 => |v| {
+            out.value_type = @intFromEnum(abi.HeaderValueType.int64);
+            out.int_value = v;
+        },
+        .integer_text => |v| {
+            out.value_type = @intFromEnum(abi.HeaderValueType.integer_text);
+            const text = snapshotArenaRef(snap, v);
+            out.value_off = text.off;
+            out.value_len = text.len;
+        },
+        .float64 => |v| {
+            out.value_type = @intFromEnum(abi.HeaderValueType.float64);
+            out.float_value = v;
+        },
+        .string => |v| {
+            out.value_type = @intFromEnum(abi.HeaderValueType.string);
+            const text = snapshotArenaRef(snap, v);
+            out.value_off = text.off;
+            out.value_len = text.len;
+        },
+        .raw_token => |v| {
+            out.value_type = @intFromEnum(abi.HeaderValueType.raw_token);
+            const text = snapshotArenaRef(snap, v);
+            out.value_off = text.off;
+            out.value_len = text.len;
+        },
+    }
+    return out;
+}
+
+fn fillHeaderSnapshotBuffers(
+    hdu: *const fits.Hdu,
+    snap: *const fits.logical_header.Snapshot,
+    flags: u32,
+    entries_opt: ?[*]ZfHeaderEntryV1,
+    entry_capacity: usize,
+    arena_opt: ?[*]u8,
+    arena_capacity: usize,
+    raw_opt: ?[*]u8,
+    raw_capacity: usize,
+    out: *ZfHeaderSnapshotInfoV1,
+) fits.Error!void {
+    var info: ZfHeaderSnapshotInfoV1 = .{};
+    try setSnapshotInfo(&info, hdu, snap, flags);
+    const raw_needed = std.math.cast(usize, info.raw_bytes) orelse return error.LimitExceeded;
+    if (entry_capacity < snap.entries.len or arena_capacity < snap.arena.len or raw_capacity < raw_needed or
+        (snap.entries.len != 0 and entries_opt == null) or (snap.arena.len != 0 and arena_opt == null) or
+        (raw_needed != 0 and raw_opt == null))
+    {
+        return error.BufferTooSmall;
+    }
+
+    if (snap.arena.len != 0) @memcpy(arena_opt.?[0..snap.arena.len], snap.arena);
+    if (raw_needed != 0) {
+        const raw = raw_opt.?[0..raw_needed];
+        for (hdu.header.cards.items, 0..) |*card, i| @memcpy(raw[i * 80 ..][0..80], card.bytes());
+    }
+    if (snap.entries.len != 0) {
+        const entries = entries_opt.?[0..snap.entries.len];
+        for (snap.entries, entries) |entry, *dst| dst.* = abiSnapshotEntry(snap, entry);
+    }
+    out.* = info;
+}
+
+/// Query exact capacities for a V1 logical-header snapshot. `hdu_index` is 1-based and does not
+/// change the handle's current HDU.
+pub export fn zf_header_snapshot_query_v1(h_opt: ?*Handle, hdu_index: u64, flags: u32, out: *ZfHeaderSnapshotInfoV1) c_int {
+    const h = h_opt orelse return abi.failNull();
+    if (flags & ~abi.header_snapshot_include_raw != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
+    const hdu = headerHduAt(h, hdu_index) catch |e| return abi.fail(&h.diag, e);
+    if (h.header_snapshot) |*cache| {
+        if (cache.hdu == hdu and cache.hdu_index == hdu_index and cache.flags == flags and cache.revision == hdu.header_revision) {
+            setSnapshotInfo(out, hdu, &cache.snapshot, flags) catch |e| return abi.fail(&h.diag, e);
+            return 0;
+        }
+    }
+    h.clearHeaderSnapshot();
+    var snap = fits.logical_header.Snapshot.build(abi.gpa, hdu.header.cards.items, h.fits.limits) catch |e| return abi.fail(&h.diag, e);
+    setSnapshotInfo(out, hdu, &snap, flags) catch |e| {
+        snap.deinit(abi.gpa);
+        return abi.fail(&h.diag, e);
+    };
+    h.header_snapshot = .{
+        .hdu = hdu,
+        .hdu_index = hdu_index,
+        .flags = flags,
+        .revision = hdu.header_revision,
+        .snapshot = snap,
+    };
+    return 0;
+}
+
+/// Fill caller-owned descriptor/arena buffers for a previously queried V1 snapshot. No output
+/// buffer is modified when the generation changed or any capacity is insufficient.
+pub export fn zf_header_snapshot_fill_v1(
+    h_opt: ?*Handle,
+    hdu_index: u64,
+    flags: u32,
+    expected_revision: u64,
+    entries_opt: ?[*]ZfHeaderEntryV1,
+    entry_capacity: usize,
+    arena_opt: ?[*]u8,
+    arena_capacity: usize,
+    raw_opt: ?[*]u8,
+    raw_capacity: usize,
+    out: *ZfHeaderSnapshotInfoV1,
+) c_int {
+    const h = h_opt orelse return abi.failNull();
+    if (flags & ~abi.header_snapshot_include_raw != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
+    const hdu = headerHduAt(h, hdu_index) catch |e| return abi.fail(&h.diag, e);
+    if (hdu.header_revision != expected_revision) return abi.fail(&h.diag, error.TransactionConflict);
+    if (h.header_snapshot) |*cache| {
+        if (cache.hdu == hdu and cache.hdu_index == hdu_index and cache.flags == flags and cache.revision == expected_revision) {
+            fillHeaderSnapshotBuffers(
+                hdu,
+                &cache.snapshot,
+                flags,
+                entries_opt,
+                entry_capacity,
+                arena_opt,
+                arena_capacity,
+                raw_opt,
+                raw_capacity,
+                out,
+            ) catch |e| return abi.fail(&h.diag, e);
+            h.clearHeaderSnapshot();
+            return 0;
+        }
+    }
+    // V1 fill consumes the handle's most recent matching query. Rebuilding here would both redo
+    // the parse and let an HDU replacement with the same per-HDU revision alias the old query.
+    return abi.fail(&h.diag, error.TransactionConflict);
+}
+
+const ZfHeaderOpV1 = abi.ZfHeaderOpV1;
+const ZfHeaderApplyOptsV1 = abi.ZfHeaderApplyOptsV1;
+const ZfHeaderApplyResultV1 = abi.ZfHeaderApplyResultV1;
+
+fn headerArenaSlice(arena: []const u8, off64: u64, len64: u64) fits.Error![]const u8 {
+    const off = std.math.cast(usize, off64) orelse return error.InvalidHeaderOperation;
+    const len = std.math.cast(usize, len64) orelse return error.InvalidHeaderOperation;
+    const end = std.math.add(usize, off, len) catch return error.InvalidHeaderOperation;
+    if (end > arena.len) return error.InvalidHeaderOperation;
+    return arena[off..end];
+}
+
+fn headerEditValue(op: ZfHeaderOpV1, arena: []const u8) fits.Error!fits.header_edit.Value {
+    const tag = std.enums.fromInt(abi.HeaderValueType, op.value_type) orelse return error.InvalidHeaderOperation;
+    return switch (tag) {
+        .undefined => .undefined,
+        .logical => .{ .logical = op.int_value != 0 },
+        .int64 => .{ .int = op.int_value },
+        .float64 => .{ .float = op.float_value },
+        .string => .{ .string = try headerArenaSlice(arena, op.value_off, op.value_len) },
+        else => error.InvalidHeaderOperation,
+    };
+}
+
+fn headerRawCards(bytes: []const u8) fits.Error![]const [80]u8 {
+    if (bytes.len == 0 or bytes.len % 80 != 0) return error.InvalidHeaderOperation;
+    const ptr: [*]const [80]u8 = @ptrCast(bytes.ptr);
+    return ptr[0 .. bytes.len / 80];
+}
+
+fn decodeHeaderEdit(op: ZfHeaderOpV1, arena: []const u8) fits.Error!fits.header_edit.Edit {
+    if (op.reserved != 0) return error.InvalidHeaderOperation;
+    // STRICT/FORCE_HIERARCH are reserved descriptor bits, not implemented V1 semantics. Reject
+    // them (and every unknown bit) instead of silently accepting a request we do not honor.
+    const known_flags = abi.header_op_comment_present;
+    if (op.flags & ~known_flags != 0) return error.InvalidHeaderOperation;
+    const opcode = std.enums.fromInt(abi.HeaderOpCode, op.opcode) orelse return error.InvalidHeaderOperation;
+    const name = try headerArenaSlice(arena, op.name_off, op.name_len);
+    return switch (opcode) {
+        .upsert => .{ .upsert = .{
+            .name = name,
+            .value = try headerEditValue(op, arena),
+            .comment = if (op.flags & abi.header_op_comment_present != 0)
+                .{ .explicit = blk: {
+                    const c = try headerArenaSlice(arena, op.comment_off, op.comment_len);
+                    break :blk if (c.len == 0) null else c;
+                } }
+            else
+                .preserve,
+        } },
+        .delete_first => .{ .delete_first = name },
+        .delete_all => .{ .delete_all = name },
+        .rename => .{ .rename = .{ .old = name, .new = try headerArenaSlice(arena, op.value_off, op.value_len) } },
+        .append_commentary => .{ .append_commentary = .{ .keyword = name, .text = try headerArenaSlice(arena, op.value_off, op.value_len) } },
+        .append_raw_run => .{ .append_raw = try headerRawCards(try headerArenaSlice(arena, op.value_off, op.value_len)) },
+        .insert_raw_run => blk: {
+            if (op.position < 0) return error.InvalidHeaderOperation;
+            break :blk .{ .insert_raw = .{
+                .index = std.math.cast(usize, op.position) orelse return error.InvalidHeaderOperation,
+                .cards = try headerRawCards(try headerArenaSlice(arena, op.value_off, op.value_len)),
+            } };
+        },
+        .reserve_blanks => blk: {
+            if (op.position < 0) return error.InvalidHeaderOperation;
+            break :blk .{ .reserve_blanks = std.math.cast(usize, op.position) orelse return error.InvalidHeaderOperation };
+        },
+    };
+}
+
+/// Validate and apply a borrowed array of header edits to a staged clone, then commit the final
+/// physical header once. The current HDU is preserved and every arena slice is consumed in-call.
+pub export fn zf_header_apply_v1(
+    h_opt: ?*Handle,
+    hdu_index: u64,
+    opts_opt: ?*const ZfHeaderApplyOptsV1,
+    ops_opt: ?[*]const ZfHeaderOpV1,
+    op_count: usize,
+    arena_opt: ?[*]const u8,
+    arena_len: usize,
+    out: *ZfHeaderApplyResultV1,
+) c_int {
+    const h = h_opt orelse return abi.failNull();
+    out.* = .{};
+    const hdu = headerHduAt(h, hdu_index) catch |e| return abi.fail(&h.diag, e);
+    const opts = if (opts_opt) |p| p.* else ZfHeaderApplyOptsV1{};
+    const known_apply_flags = abi.header_apply_check_revision;
+    if (opts.flags & ~known_apply_flags != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
+    if (opts.reserved != 0) return abi.fail(&h.diag, error.InvalidHeaderOperation);
+    if (opts.flags & abi.header_apply_check_revision != 0 and opts.expected_revision != hdu.header_revision)
+        return abi.fail(&h.diag, error.TransactionConflict);
+    if ((op_count != 0 and ops_opt == null) or (arena_len != 0 and arena_opt == null)) return abi.fail(&h.diag, error.InvalidHeaderOperation);
+    if (arena_len > h.fits.limits.max_open_alloc) return abi.fail(&h.diag, error.LimitExceeded);
+    const edit_bytes = std.math.mul(u64, @intCast(op_count), @sizeOf(fits.header_edit.Edit)) catch return abi.fail(&h.diag, error.LimitExceeded);
+    if (edit_bytes > h.fits.limits.max_open_alloc) return abi.fail(&h.diag, error.LimitExceeded);
+    const arena: []const u8 = if (arena_len == 0) "" else arena_opt.?[0..arena_len];
+
+    out.cards_before = @intCast(hdu.header.count());
+    if (op_count == 0) {
+        out.new_revision = hdu.header_revision;
+        out.failed_op = std.math.maxInt(u64);
+        out.cards_after = out.cards_before;
+        return 0;
+    }
+
+    const edits = abi.gpa.alloc(fits.header_edit.Edit, op_count) catch |e| return abi.fail(&h.diag, e);
+    defer abi.gpa.free(edits);
+    if (op_count != 0) for (ops_opt.?[0..op_count], edits, 0..) |op, *edit, i| {
+        out.failed_op = @intCast(i);
+        edit.* = decodeHeaderEdit(op, arena) catch |e| return abi.fail(&h.diag, e);
+        switch (edit.*) {
+            .upsert => |u| switch (u.value) {
+                .string => |s| if (s.len > h.fits.limits.max_string_value) return abi.fail(&h.diag, error.LimitExceeded),
+                else => {},
+            },
+            else => {},
+        }
+    };
+
+    out.failed_op = std.math.maxInt(u64); // failures below are transaction/global, not decode errors
+    var failed_index: usize = edits.len;
+    var staged = fits.header_edit.applyWithFailureAndLimits(abi.gpa, &hdu.header, hdu.kind, edits, h.fits.limits, &failed_index) catch |e| {
+        out.failed_op = @intCast(failed_index);
+        return abi.fail(&h.diag, e);
+    };
+    defer staged.deinit(abi.gpa);
+    const max_cards = std.math.mul(u64, h.fits.limits.max_header_blocks, 36) catch return abi.fail(&h.diag, error.LimitExceeded);
+    if (staged.count() > max_cards) return abi.fail(&h.diag, error.LimitExceeded);
+    h.fits.replaceHeaderInPlace(hdu, &staged) catch |e| return abi.fail(&h.diag, e);
+    // Table views cache parsed column metadata. The committed header may have changed names,
+    // units, scaling, nulls, or dimensions, so leaving an old view live would expose stale state.
+    invalidateTableViewsFor(h, hdu);
+    h.clearHeaderSnapshot();
+    out.new_revision = hdu.header_revision;
+    out.failed_op = std.math.maxInt(u64);
+    out.cards_after = @intCast(hdu.header.count());
     return 0;
 }
 
@@ -639,11 +978,24 @@ pub export fn zf_key_comment(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: u
     return 0;
 }
 
+/// Serialize a legacy in-place header mutation and keep snapshot generations honest on every
+/// exit. `rewriteHeaderInPlace` advances the revision on success; if serialization fails after
+/// the caller already changed live cards, advance it here and discard any cached pre-mutation
+/// snapshot before returning the error.
+fn rewriteChangedHeader(h: *Handle, hdu: *fits.Hdu) c_int {
+    h.fits.rewriteHeaderInPlace(hdu) catch |e| {
+        hdu.bumpHeaderRevision();
+        h.clearHeaderSnapshot();
+        return abi.fail(&h.diag, e);
+    };
+    h.clearHeaderSnapshot();
+    return 0;
+}
+
 fn writeKey(h: *Handle, name: []const u8, v: fits.KeywordValue, comment: ?[]const u8) c_int {
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.update(gpa, name, v, comment) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Create or update an integer keyword.
@@ -675,16 +1027,34 @@ pub export fn zf_write_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const name = name_ptr[0..name_len];
-    hdu.header.delete(name) catch {}; // replace if present
+    // Build and reserve the complete replacement before deleting the old logical run. In
+    // particular, an unrepresentable final comment must not delete the existing keyword and
+    // leave a same-revision snapshot cache describing cards that are no longer live.
     const cards = fits.continuation.split(gpa, name, value_ptr[0..value_len], commentOf(comment_ptr, comment_len)) catch |e| return abi.fail(&h.diag, e);
     defer gpa.free(cards);
+    const reserve = std.math.add(usize, hdu.header.cards.items.len, cards.len) catch return abi.fail(&h.diag, error.LimitExceeded);
+    hdu.header.cards.ensureTotalCapacityPrecise(gpa, reserve) catch |e| return abi.fail(&h.diag, e);
+
+    const count_before_delete = hdu.header.count();
+    var mutated = false;
+    hdu.header.delete(name) catch |e| switch (e) {
+        error.KeywordNotFound => {}, // create when absent
+        else => return abi.fail(&h.diag, e),
+    };
+    mutated = hdu.header.count() != count_before_delete;
     var idx = endIndex(&hdu.header);
     for (cards) |c| {
-        hdu.header.insert(gpa, idx, c) catch |e| return abi.fail(&h.diag, e);
+        hdu.header.insert(gpa, idx, c) catch |e| {
+            if (mutated) {
+                hdu.bumpHeaderRevision();
+                h.clearHeaderSnapshot();
+            }
+            return abi.fail(&h.diag, e);
+        };
+        mutated = true;
         idx += 1;
     }
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Create or update a keyword with an undefined (blank) value field (FITS 4.0 §4.1.2.3).
@@ -698,8 +1068,7 @@ pub export fn zf_delete_key(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: us
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.delete(name_ptr[0..name_len]) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Rename keyword `old` to `new`.
@@ -707,8 +1076,7 @@ pub export fn zf_rename_key(h_opt: ?*Handle, old_ptr: [*]const u8, old_len: usiz
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     hdu.header.rename(old_ptr[0..old_len], new_ptr[0..new_len]) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Insert a raw 80-byte card before END. Like CFITSIO's `ffprec`, the value field is NOT
@@ -719,8 +1087,7 @@ pub export fn zf_write_record(h_opt: ?*Handle, card80: [*]const u8) c_int {
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     const card = fits.Card.parse(card80[0..80]) catch |e| return abi.fail(&h.diag, e);
     hdu.header.insert(gpa, endIndex(&hdu.header), card) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 /// Insert a raw 80-byte card at `index` (0-based).
@@ -730,8 +1097,7 @@ pub export fn zf_insert_record(h_opt: ?*Handle, index: c_long, card80: [*]const 
     if (index < 0 or @as(usize, @intCast(index)) > hdu.header.count()) return abi.fail(&h.diag, error.KeywordNotFound);
     const card = fits.Card.parse(card80[0..80]) catch |e| return abi.fail(&h.diag, e);
     hdu.header.insert(gpa, @intCast(index), card) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
-    return 0;
+    return rewriteChangedHeader(h, hdu);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1472,11 +1838,39 @@ pub export fn zf_write_col_vla_packed(
 // HDU management (delete / copy)
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Delete HDU `n` (1-based).
+fn tableViewTargets(th: *const TableHandle, hdu: *const fits.Hdu) bool {
+    if (th.dead) return false;
+    return switch (th.kind) {
+        .binary => if (th.bin) |view| view.hdu == hdu else false,
+        .ascii => if (th.asc) |view| view.hdu == hdu else false,
+    };
+}
+
+fn invalidateTableViewsFor(h: *Handle, hdu: *const fits.Hdu) void {
+    var i = h.tables.items.len;
+    while (i > 0) {
+        i -= 1;
+        const th = h.tables.items[i];
+        if (!tableViewTargets(th, hdu)) continue;
+        th.deinit();
+        th.dead = true;
+        _ = h.tables.orderedRemove(i); // zf_table_close later owns/frees the dead handle itself
+    }
+}
+
+/// Delete HDU `n` (1-based). Any open table view over that HDU is invalidated before the core
+/// frees its individually allocated `Hdu`; views over surviving HDUs remain live.
 pub export fn zf_delete_hdu(h_opt: ?*Handle, n: c_long) c_int {
     const h = h_opt orelse return abi.failNull();
     if (n < 1) return abi.fail(&h.diag, error.WrongHduType);
-    h.fits.deleteHdu(@intCast(n)) catch |e| return abi.fail(&h.diag, e);
+    if (h.fits.mode == .read_only or !h.fits.dev.isWritable()) return abi.fail(&h.diag, error.NotWritable);
+    const index: usize = @intCast(n);
+    const count = h.fits.hduCount() catch |e| return abi.fail(&h.diag, e);
+    if (index == 1 or index > count) return abi.fail(&h.diag, error.WrongHduType);
+    const doomed = h.fits.hdus.items[index - 1];
+    invalidateTableViewsFor(h, doomed);
+    h.clearHeaderSnapshot();
+    h.fits.deleteHdu(index) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
@@ -1496,8 +1890,19 @@ pub export fn zf_copy_hdu(h_opt: ?*Handle, src_n: c_long) c_int {
 pub export fn zf_write_chksum(h_opt: ?*Handle) c_int {
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
-    fits.checksum.ensureCards(&hdu.header, gpa) catch |e| return abi.fail(&h.diag, e);
-    h.fits.rewriteHeaderInPlace(hdu) catch |e| return abi.fail(&h.diag, e);
+    const had_datasum = hdu.header.has("DATASUM");
+    const had_checksum = hdu.header.has("CHECKSUM");
+    fits.checksum.ensureCards(&hdu.header, gpa) catch |e| {
+        // ensureCards adds the two placeholders separately. If the second allocation fails after
+        // the first succeeded, that partial live mutation must invalidate a retained snapshot.
+        if (hdu.header.has("DATASUM") != had_datasum or hdu.header.has("CHECKSUM") != had_checksum) {
+            hdu.bumpHeaderRevision();
+            h.clearHeaderSnapshot();
+        }
+        return abi.fail(&h.diag, e);
+    };
+    const rewrite_status = rewriteChangedHeader(h, hdu);
+    if (rewrite_status != 0) return rewrite_status;
     fits.checksum.update(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
