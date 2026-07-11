@@ -142,6 +142,8 @@ pub const Header = struct {
         return card.valueField();
     }
 
+    /// Read a numeric or logical keyword as `T`, applying checked FITS-to-host conversion.
+    /// String and aggregate values are available through `getString` and `getValueUnion`.
     pub fn getValue(self: *const Header, comptime T: type, name: []const u8) (ValueError || ConvError || HeaderError)!T {
         const card = try self.get(name);
         // The value is parsed from the card's raw bytes on demand. Only numeric/logical types

@@ -23,7 +23,9 @@ on:
       - "build.zig.zon"
       - "pyproject.toml"
       - "hatch_build.py"
+      - "tools/wiki/**"
       - ".github/workflows/python-wheels.yml"
+      - ".github/workflows/publish-wiki.yml"
   workflow_dispatch:
     inputs:
       publish_testpypi:
@@ -83,6 +85,51 @@ jobs:
               exit 1
             fi
           fi
+
+  api-docs:
+    name: generated API Wiki bundle
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: bindings/typescript/package-lock.json
+      - run: npm ci
+        working-directory: bindings/typescript
+      - name: Test Wiki generators and publication guards
+        run: |
+          python3 -m unittest discover -s tools/wiki -p 'test_*.py' -v
+          python3 -m pip install pytest==8.3.5
+          python3 -m pytest tools/wiki/tests -q
+          npm run test:docs --prefix bindings/typescript
+          zig build wiki-zig-test
+      - name: Generate and validate all public API references
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          tag="v${version}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tag="$GITHUB_REF_NAME"; fi
+          python3 tools/wiki/generate.py \
+            --out "$RUNNER_TEMP/wiki" --tag "$tag" --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-wiki-preview-${{ github.sha }}
+          path: ${{ runner.temp }}/wiki
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: true
 
   # Tag pushes do not trigger ci.yml (its full matrix already ran on the same commit's main
   # push); this single cell gates publishing on the core Zig suite.
@@ -178,7 +225,7 @@ jobs:
   publish-testpypi:
     name: publish to TestPyPI (rehearsal)
     if: github.event_name == 'workflow_dispatch' && inputs.publish_testpypi
-    needs: [version-check, zig-test, wheels, sdist, smoke]
+    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke]
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -202,7 +249,7 @@ jobs:
     name: publish to PyPI
     # Strictly tag pushes: a workflow_dispatch run pointed at a tag ref must NOT publish here.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version-check, zig-test, wheels, sdist, smoke]
+    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke]
     runs-on: ubuntu-latest
     environment:
       name: pypi

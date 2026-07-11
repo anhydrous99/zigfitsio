@@ -246,12 +246,16 @@ class Header:
         return isinstance(key, str) and key.upper() in _COMMENTARY
 
     def __contains__(self, key: str) -> bool:
+        """Return whether a valued or commentary keyword is present."""
+
         if self._is_commentary_key(key):
             ku = key.upper()
             return any(c.commentary and c.keyword.upper() == ku for c in self._cards)
         return self._find(key) >= 0
 
     def __getitem__(self, key: str) -> Any:
+        """Return a keyword value or a mutable commentary-card view."""
+
         # A commentary keyword returns a mutable list-like view over all of its cards (astropy's
         # ``header['COMMENT']`` behavior), never raising: an absent keyword yields an empty view.
         if self._is_commentary_key(key):
@@ -262,12 +266,16 @@ class Header:
         return self._cards[i].value
 
     def get(self, key: str, default: Any = None) -> Any:
+        """Return a keyword value, or ``default`` when it is absent."""
+
         if self._is_commentary_key(key):
             return _CommentaryCards(self, key.upper())
         i = self._find(key)
         return self._cards[i].value if i >= 0 else default
 
     def __setitem__(self, key: str, value: Any) -> None:
+        """Insert or replace a keyword, persisting it when attached to a writable file."""
+
         # Commentary keywords accumulate (append), never overwrite; a list/tuple replaces all of
         # them. Handled before the (value, comment) unpack, which does not apply to commentary.
         if self._is_commentary_key(key):
@@ -292,6 +300,8 @@ class Header:
             self._dirty_cb()  # read-only edit → not in the handle's bytes; reconstruct on save
 
     def __delitem__(self, key: str) -> None:
+        """Delete a valued keyword or every card for a commentary keyword."""
+
         # Deleting a commentary keyword removes ALL of its cards (astropy semantics).
         if self._is_commentary_key(key):
             ku = key.upper()
@@ -359,27 +369,41 @@ class Header:
         self._set_commentary("HISTORY", value)
 
     def __iter__(self) -> Iterator[str]:
+        """Iterate valued keyword names in card order."""
+
         for c in self._cards:
             if not c.commentary:
                 yield c.keyword
 
     def __len__(self) -> int:
+        """Return the number of valued (non-commentary) keyword cards."""
+
         return sum(1 for c in self._cards if not c.commentary)
 
     def keys(self):
+        """Return valued keyword names in card order."""
+
         return list(self.__iter__())
 
     def items(self):
+        """Return ``(keyword, value)`` pairs in card order."""
+
         return [(c.keyword, c.value) for c in self._cards if not c.commentary]
 
     def values(self):
+        """Return valued keyword values in card order."""
+
         return [c.value for c in self._cards if not c.commentary]
 
     def comment_of(self, key: str) -> str:
+        """Return the comment belonging to ``key``, or an empty string."""
+
         i = self._find(key)
         return self._cards[i].comment if i >= 0 else ""
 
     def cards(self) -> list[tuple[str, Any, str]]:
+        """Return all physical records as ``(keyword, value, comment)`` tuples."""
+
         return [(c.keyword, c.value, c.comment) for c in self._cards]
 
     @property
@@ -393,6 +417,8 @@ class Header:
         return [c.value for c in self._cards if c.commentary and c.keyword == "HISTORY"]
 
     def __repr__(self) -> str:
+        """Render the header as human-readable FITS-style card rows."""
+
         rows = []
         for c in self._cards:
             if c.commentary:

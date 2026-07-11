@@ -7,6 +7,8 @@
 //!   zig build fitsverify   — run the structural-validation CLI demo (X-TOOL)
 //!   zig build fuzz         — run the header/table fuzz harnesses (NFR-SAFE-2)
 //!   zig build wasm-check   — compile the freestanding core for wasm32 (NFR-PORT-3)
+//!   zig build docs         — emit compiler-backed Zig Autodoc into zig-out/docs/zig
+//!   zig build wiki-zig     — emit Wiki-native Zig API Markdown and a symbol manifest
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -28,6 +30,29 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     b.installArtifact(lib);
+
+    // `zig build docs` — ask the compiler to analyze the real consumer module and install its
+    // native Autodoc output. This is deliberately independent of the Wiki Markdown renderer:
+    // compiler documentation is the semantic validation/artifact, while `wiki-zig` below
+    // supplies deterministic Markdown suitable for github.com/.../wiki.
+    const docs_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const docs_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "zigfitsio",
+        .root_module = docs_mod,
+    });
+    const emitted_docs = docs_lib.getEmittedDocs();
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = emitted_docs,
+        .install_dir = .prefix,
+        .install_subdir = "docs/zig",
+    });
+    const docs_step = b.step("docs", "Generate compiler-backed Zig API documentation");
+    docs_step.dependOn(&install_docs.step);
 
     // C-ABI shim (Python/C bindings, design bindings/). A separate dynamic library compiled
     // from `bindings/capi/capi.zig`, which imports the public `zigfitsio` module and exports the
@@ -79,6 +104,34 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the unit/integration test suite");
     test_step.dependOn(&run_tests.step);
+
+    // `zig build wiki-zig -- <out-dir> --tag vX.Y.Z --sha <sha> [--repo-url <url>]`
+    // walks only the public surface reachable from `src/root.zig`, verifies the root names
+    // against compiler reflection, and writes `Zig-API.md` plus `zig-api-symbols.json`.
+    // The executable is always built for the host so documentation can still be generated
+    // when a caller selects a cross-compilation target for the library.
+    const wiki_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const wiki_mod = b.createModule(.{
+        .root_source_file = b.path("tools/wiki/zig_api.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    wiki_mod.addImport("zigfitsio", wiki_api_mod);
+    const wiki_exe = b.addExecutable(.{ .name = "zig-api-wiki", .root_module = wiki_mod });
+    const run_wiki = b.addRunArtifact(wiki_exe);
+    if (b.args) |args| run_wiki.addArgs(args);
+    const wiki_step = b.step("wiki-zig", "Generate the GitHub Wiki Zig API reference");
+    wiki_step.dependOn(&run_wiki.step);
+
+    const wiki_tests = b.addTest(.{ .root_module = wiki_mod });
+    const run_wiki_tests = b.addRunArtifact(wiki_tests);
+    const wiki_test_step = b.step("wiki-zig-test", "Test the Zig Wiki API generator");
+    wiki_test_step.dependOn(&run_wiki_tests.step);
+    test_step.dependOn(&run_wiki_tests.step);
 
     // The C-ABI shim's own round-trip tests (`bindings/capi/test_capi.zig`) are wired into the
     // default `test` step too (test-plan Phase 4): previously `capi-test` only ran in one Linux

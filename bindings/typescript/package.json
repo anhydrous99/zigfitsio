@@ -45,7 +45,9 @@
   "scripts": {
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json && node scripts/build-wasm.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
+    "docs": "node scripts/generate-wiki-docs.mjs",
     "test": "bun test tests",
+    "test:docs": "node --test ../../tools/wiki/typescript-normalize.test.mjs",
     "test:node": "vitest run",
     "typecheck:tests": "tsc -p tsconfig.test.json",
     "check-versions": "node scripts/check-versions.mjs",
@@ -53,6 +55,9 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.0",
+    "typedoc": "0.28.20",
+    "typedoc-github-wiki-theme": "2.1.0",
+    "typedoc-plugin-markdown": "4.12.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
   }
