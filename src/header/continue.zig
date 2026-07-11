@@ -183,7 +183,7 @@ pub fn endsWithSentinel(field: []const u8) bool {
 // trailing `&` (inside the quotes) is added when `continues`; a `/ comment` suffix when given.
 // `chunk` is pre-escaped text (quotes already doubled) written verbatim between the quotes.
 fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: bool, comment: ?[]const u8) HeaderError!Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     if (first.*) {
         const nm = @import("name.zig").Name.parseStrict(name) catch return error.BadKeywordName;
         @memcpy(raw[0..8], &nm.bytes);
@@ -209,7 +209,7 @@ fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: 
 const testing = std.testing;
 
 fn card80(s: []const u8) Card {
-    var b: [80]u8 = [_]u8{' '} ** 80;
+    var b: [80]u8 = @splat(' ');
     @memcpy(b[0..s.len], s);
     return Card.parse(&b) catch unreachable;
 }
@@ -249,7 +249,7 @@ test "orphaned CONTINUE is not a value start" {
 
 test "split then assemble round-trips a long string" {
     const long = "The quick brown fox jumps over the lazy dog, and then continues running across " ++
-        "a very wide field for a considerable distance under a clear blue sky." ; // > 68 chars
+        "a very wide field for a considerable distance under a clear blue sky."; // > 68 chars
     const cards = try split(testing.allocator, "LONGKEY", long, "a comment");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2); // it was split
@@ -273,7 +273,7 @@ test "split keeps a short string in one card" {
 test "split preserves the comment when the final data chunk would fill the card (no silent drop)" {
     // 135 chars: greedy 67-char chunking leaves a full 68-char final chunk, so the old code wrote
     // a full value field and then dropped the comment via `catch {}`. The comment must survive.
-    const long = "x" ** 135;
+    const long = &@as([135]u8, @splat('x'));
     const cards = try split(testing.allocator, "DESC", long, "units");
     defer testing.allocator.free(cards);
     const a = try assemble(testing.allocator, cards, 0, 1 << 20);
@@ -287,7 +287,7 @@ test "split preserves the comment when the final data chunk would fill the card 
 test "split with a comment that overflows a single card falls through to multi-card" {
     // A 68-char string fits one card alone but not with a comment; it must split, not be rejected
     // with CardOverflow (regression: the single-card threshold ignored the comment).
-    const s = "y" ** 68;
+    const s = &@as([68]u8, @splat('y'));
     const cards = try split(testing.allocator, "DESC", s, "note");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2);

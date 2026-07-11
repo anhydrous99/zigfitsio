@@ -67,9 +67,8 @@ pub const Card = struct {
     /// so its `kind` reflects the `FR-HDR-6` rule (e.g. a commentary name stays commentary
     /// even with the indicator present).
     pub fn buildValue(name_field: []const u8, v: value.KeywordValue, comment: ?[]const u8) HeaderError!Card {
-        const name = try Name.parseStrict(name_field);
-        try value.requireFinite(v);
-        var raw: [80]u8 = [_]u8{' '} ** 80;
+        const name = try Name.parse(name_field);
+        var raw: [80]u8 = @splat(' ');
         @memcpy(raw[0..8], &name.bytes);
         raw[8] = '=';
         raw[9] = ' ';
@@ -126,7 +125,7 @@ const testing = std.testing;
 
 // Build an 80-byte card: `s` left-justified, space-padded. Caller ensures `s.len <= 80`.
 fn card80(s: []const u8) [80]u8 {
-    var b: [80]u8 = [_]u8{' '} ** 80;
+    var b: [80]u8 = @splat(' ');
     @memcpy(b[0..s.len], s);
     return b;
 }
@@ -168,7 +167,7 @@ test "an entirely blank card is .blank, a blank keyword with text is commentary"
     try testing.expect(cb.name.isBlank());
 
     // Blank keyword (bytes 1–8 spaces) but free text in 9–80 ⇒ commentary, not .blank.
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     const txt = "blank-keyword free text";
     @memcpy(raw[10..][0..txt.len], txt);
     const c = try Card.parse(&raw);
@@ -238,7 +237,7 @@ test "buildValue: a commentary name with the indicator stays commentary" {
 }
 
 test "buildValue: oversized comment overflows the card" {
-    const long = "x" ** 70;
+    const long = &@as([70]u8, @splat('x'));
     try testing.expectError(error.CardOverflow, Card.buildValue("OBJECT", .{ .string = "M31" }, long));
 }
 
