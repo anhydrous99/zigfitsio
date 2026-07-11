@@ -51,9 +51,6 @@ export const PROTOS: readonly Proto[] = [
   // ── header ──
   p("zf_card_count", "int", "handle", "buf"),
   p("zf_read_card", "int", "handle", "long", "buf"),
-  p("zf_header_snapshot_query_v1", "int", "handle", "u64", "u32", "buf"),
-  p("zf_header_snapshot_fill_v1", "int", "handle", "u64", "u32", "u64", "buf", "usize", "buf", "usize", "buf", "usize", "buf"),
-  p("zf_header_apply_v1", "int", "handle", "u64", "buf", "buf", "usize", "buf", "usize", "buf"),
   p("zf_key_exists", "int", "handle", "buf", "usize"),
   p("zf_read_key_lng", "int", "handle", "buf", "usize", "buf"),
   p("zf_read_key_dbl", "int", "handle", "buf", "usize", "buf"),
@@ -71,6 +68,9 @@ export const PROTOS: readonly Proto[] = [
   p("zf_rename_key", "int", "handle", "buf", "usize", "buf", "usize"),
   p("zf_write_record", "int", "handle", "buf"),
   p("zf_insert_record", "int", "handle", "long", "buf"),
+  p("zf_header_snapshot_query_v1", "int", "handle", "u64", "u32", "buf"),
+  p("zf_header_snapshot_fill_v1", "int", "handle", "u64", "u32", "u64", "buf", "usize", "buf", "usize", "buf", "usize", "buf"),
+  p("zf_header_apply_v1", "int", "handle", "u64", "buf", "buf", "usize", "buf", "usize", "buf"),
   // ── HDU management ──
   p("zf_delete_hdu", "int", "handle", "long"),
   p("zf_copy_hdu", "int", "handle", "long"),

@@ -13,8 +13,13 @@ const hierarch = @import("hierarch.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Classification of one logical header entry after any CONTINUE run has been folded.
 pub const EntryKind = enum { value, commentary, blank, other };
 
+/// Decoded value representation used by the logical header projection.
+///
+/// `none` belongs to non-valued entries, while `integer_text` and `raw_token` preserve valid FITS
+/// content that cannot be represented by the narrower typed variants without losing information.
 pub const Value = union(enum) {
     none,
     undefined,
@@ -26,6 +31,9 @@ pub const Value = union(enum) {
     raw_token: []const u8,
 };
 
+/// One logical header entry and the physical-card span from which it was decoded.
+///
+/// Every text slice borrows storage from the owning `Snapshot.arena` or `ParsedAt.arena`.
 pub const Entry = struct {
     kind: EntryKind,
     value: Value = .none,
@@ -69,17 +77,22 @@ const TempEntry = struct {
     malformed: bool = false,
 };
 
+/// Allocator-owned logical projection of a complete physical FITS header.
+///
+/// Entry text slices point into `arena`; release both arrays together with `deinit`.
 pub const Snapshot = struct {
     entries: []Entry,
     arena: []u8,
     physical_count: usize,
 
+    /// Release the entry array and shared text arena, leaving an empty snapshot.
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.entries);
         alloc.free(self.arena);
         self.* = .{ .entries = &.{}, .arena = &.{}, .physical_count = 0 };
     }
 
+    /// Decode physical cards through END into an owned logical snapshot under `limits`.
     pub fn build(alloc: Allocator, cards: []const Card, limits: Limits) (errors.HeaderError || errors.LimitError || Allocator.Error)!Snapshot {
         // The retained arena is a projection of 80-byte physical cards: for each logical record,
         // keyword + decoded value/commentary + comment cannot exceed the bytes consumed by its
@@ -145,6 +158,7 @@ pub const ParsedAt = struct {
     entry: Entry,
     arena: []u8,
 
+    /// Release the text arena owned by this run-local parse.
     pub fn deinit(self: *ParsedAt, alloc: Allocator) void {
         alloc.free(self.arena);
         self.* = undefined;

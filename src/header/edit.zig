@@ -50,23 +50,27 @@ pub const Comment = union(enum) {
     explicit: ?[]const u8,
 };
 
+/// Borrowed key, value, and comment policy for one insert-or-update operation.
 pub const Upsert = struct {
     name: []const u8,
     value: Value,
     comment: Comment = .preserve,
 };
 
+/// Borrowed source and destination names for one logical-key rename.
 pub const Rename = struct {
     old: []const u8,
     new: []const u8,
 };
 
+/// One COMMENT, HISTORY, or blank commentary record to append.
 pub const Commentary = struct {
     /// Must be `COMMENT`, `HISTORY`, or the empty keyword (case-insensitive).
     keyword: []const u8,
     text: []const u8,
 };
 
+/// Borrowed run of pre-parsed physical cards and its staged-header insertion point.
 pub const RawInsert = struct {
     /// Physical card index in the staged header. The run is inserted before the card at `index`;
     /// `index == END` inserts immediately before END. Inserting after END is invalid.
@@ -91,6 +95,7 @@ pub const Edit = union(enum) {
     reserve_blanks: usize,
 };
 
+/// Errors that can arise while validating, allocating, or staging a header edit batch.
 pub const ApplyError = errors.HeaderError || errors.HeaderEditError || errors.ValueError || errors.LimitError || Allocator.Error;
 
 /// Apply `edits` sequentially to an allocator-owned clone of `source`.
