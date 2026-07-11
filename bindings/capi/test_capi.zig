@@ -145,6 +145,65 @@ test "binary table create, write columns, read back" {
     try testing.expectEqualStrings("gamma", std.mem.trimEnd(u8, name_out[16..24], " \x00"));
 }
 
+test "read-only ASCII-table writes return READONLY_FILE without mutation" {
+    var source: ?*Handle = null;
+    defer if (source) |handle| capi.zf_close(handle);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{ "COUNT", "LABEL" };
+    const tform = [_]?[*:0]const u8{ "I6", "A8" };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(src, 1, 2, 2, &ttype, &tform, null, "ASCII"));
+    {
+        var table: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(src, &table));
+        defer capi.zf_table_close(table);
+        const th = table.?;
+        var counts = [_]i32{ 11, 22 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col(th, I32, 0, 1, 2, null, &counts));
+        var labels = "alpha\x00\x00\x00beta\x00\x00\x00\x00".*;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_str(th, 1, 1, 2, 8, 8, &labels));
+    }
+    try testing.expectEqual(@as(c_int, 0), capi.zf_flush(src));
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const serialized = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(serialized);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, serialized.ptr, serialized.len, &got));
+    try testing.expectEqual(serialized.len, got);
+    capi.zf_close(source);
+    source = null;
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(serialized.ptr, serialized.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(ro, 2));
+
+    const before = try testing.allocator.alloc(u8, serialized.len);
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, serialized.len);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+
+    var table: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(ro, &table));
+    defer capi.zf_table_close(table);
+    const th = table.?;
+    var count = [_]i32{99};
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col(th, I32, 0, 1, 1, null, &count));
+    var label = "changed\x00".*;
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_str(th, 1, 1, 1, 8, 8, &label));
+
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, after.ptr, after.len, &got));
+    try testing.expectEqual(after.len, got);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
 test "packed VLA ABI matches legacy P/Q/complex transfers and rejects invalid buffers" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
