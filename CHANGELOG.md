@@ -7,6 +7,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Documentation / Releases**: release-pinned Zig, Python, and TypeScript API references
+  are now published to a managed GitHub Wiki and attached to each GitHub Release as a
+  reproducible archive. Release gates verify public API coverage and exact C/Python/TypeScript
+  ABI parity before package publication. (#53)
 - **Core / C ABI**: packed variable-length-array column transfer via
   `vlaColumnLayout`/`readVlaColumnInto`/`writeVlaColumn` and the additive
   `zf_read_col_vla_layout`, `zf_read_col_vla_packed`, and `zf_write_col_vla_packed`
