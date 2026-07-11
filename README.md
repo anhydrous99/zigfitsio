@@ -11,6 +11,20 @@
 zigfitsio implements the [*Definition of the FITS Standard*, Version 4.0](https://fits.gsfc.nasa.gov)
 end to end, with interoperability verified in **both directions** against CFITSIO 4.6.4 and Astropy.
 
+## Demo: Aperture
+
+[**Aperture**](https://anhydrous99.github.io/web-fits-viewer/) is a browser-based FITS image lab
+built on zigfitsio's TypeScript/WebAssembly bindings. Open a local `.fits` or `.fits.gz` file—or
+load the bundled demo observation—to navigate image HDUs, inspect header cards and plane statistics,
+and tune stretch, color, orientation, zoom, and pan. Processing stays entirely in the browser.
+
+**[Launch the live demo](https://anhydrous99.github.io/web-fits-viewer/)** ·
+**[View the demo source](https://github.com/anhydrous99/web-fits-viewer)**
+
+| Inspect an observation | Explore stretch and color |
+| :---: | :---: |
+| [![Aperture displaying a FITS observation with its HDU, header cards, histogram, and plane statistics](./docs/images/aperture-observation.jpg)](https://anhydrous99.github.io/web-fits-viewer/) | [![Aperture displaying the observation with a logarithmic stretch and Magma color map](./docs/images/aperture-magma.jpg)](https://anhydrous99.github.io/web-fits-viewer/) |
+
 ## Features
 
 - **Images** — all six `BITPIX` types, `BSCALE`/`BZERO` scaling, null handling, strided sections.
