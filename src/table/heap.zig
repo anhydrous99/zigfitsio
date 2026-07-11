@@ -160,6 +160,65 @@ pub const ManagerInitError = errors.TableError || errors.IoError || errors.Limit
 
 const SCRATCH_BYTES: usize = 8192;
 
+// `max_open_alloc` is a ceiling on each allocation request, not merely on the number of
+// logical items retained. Keep the checked byte arithmetic shared by the packed-write scratch
+// arrays and the extent lists so every caller applies the same exact-boundary policy.
+fn ensureAllocationWithin(comptime T: type, count: usize, max_bytes: u64) errors.LimitError!void {
+    const count_u64 = std.math.cast(u64, count) orelse return error.LimitExceeded;
+    const bytes = try limits.mul(count_u64, @sizeOf(T));
+    try limits.ensureWithin(bytes, max_bytes, null);
+    // Allocator lengths are usize even when the configured u64 ceiling is larger (notably the
+    // 4 GiB default on wasm32). Reject an otherwise-in-limit footprint that the target cannot
+    // address before Allocator's internal size multiplication can degrade it to OutOfMemory.
+    _ = std.math.cast(usize, bytes) orelse return error.LimitExceeded;
+}
+
+fn maxElementsWithin(comptime T: type, max_bytes: u64) usize {
+    comptime std.debug.assert(@sizeOf(T) != 0);
+    const addressable_bytes: u64 = @min(max_bytes, std.math.maxInt(usize));
+    const count_u64 = addressable_bytes / @sizeOf(T);
+    return std.math.cast(usize, count_u64) orelse std.math.maxInt(usize);
+}
+
+// Reserve exactly `count` items after validating the resulting allocator request. The standard
+// `ensureTotalCapacity` grows beyond its requested logical count, which can cross a tight
+// max_open_alloc boundary even when `count * @sizeOf(T)` itself is legal.
+fn ensureListCapacityWithin(
+    comptime T: type,
+    list: *std.ArrayList(T),
+    alloc: Allocator,
+    count: usize,
+    max_bytes: u64,
+) (errors.LimitError || Allocator.Error)!void {
+    try ensureAllocationWithin(T, count, max_bytes);
+    try list.ensureTotalCapacityPrecise(alloc, count);
+}
+
+// Append in one pass with geometric growth, but clamp every precise capacity request to the
+// configured allocation ceiling. This preserves amortized O(1) appends, lets an exact-limit
+// footprint succeed, and performs no allocation at all until the first item is encountered.
+fn appendWithinAllocationLimit(
+    comptime T: type,
+    list: *std.ArrayList(T),
+    alloc: Allocator,
+    item: T,
+    max_bytes: u64,
+) (errors.LimitError || Allocator.Error)!void {
+    const next_len = std.math.add(usize, list.items.len, 1) catch return error.LimitExceeded;
+    const max_items = maxElementsWithin(T, max_bytes);
+    if (next_len > max_items) return error.LimitExceeded;
+
+    if (next_len > list.capacity) {
+        const grown = if (list.capacity == 0)
+            @min(@as(usize, 8), max_items)
+        else
+            std.math.mul(usize, list.capacity, 2) catch max_items;
+        const target = @min(max_items, @max(next_len, grown));
+        try ensureListCapacityWithin(T, list, alloc, target, max_bytes);
+    }
+    list.appendAssumeCapacity(item);
+}
+
 // ── geometry ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolve the heap geometry of `table` from its HDU (`data_off`, `data_bytes`, `pcount`) and
@@ -562,9 +621,25 @@ pub fn writeVlaColumn(
     try validateRowRange(table, first_row, nrows);
     const column = &table.columns[try table.resolve(col)];
     const spec = try VlaSpec.of(column);
-    const geom = try heapGeometry(table);
 
-    const plans = try alloc.alloc(PackedWritePlan, offsets.len - 1);
+    const plan_count = offsets.len - 1;
+    const geom = try heapGeometry(table);
+    // A validated zero-row transfer has no descriptors, heap payload, or manager state to touch.
+    // In particular, do not clone a pre-existing free list merely to perform a no-op.
+    if (plan_count == 0) return;
+
+    const free_list_reserve = std.math.add(
+        usize,
+        mgr.free_list.items.len,
+        plan_count,
+    ) catch return error.LimitExceeded;
+    // Both arrays are sized directly from caller-controlled row geometry. Check each actual
+    // allocation footprint before making either request so an oversized all-empty column yields
+    // LimitExceeded rather than bypassing the configured ceiling or surfacing OutOfMemory.
+    try ensureAllocationWithin(PackedWritePlan, plan_count, table.fits.limits.max_open_alloc);
+    try ensureAllocationWithin(OldExtentRef, plan_count, table.fits.limits.max_open_alloc);
+    try ensureAllocationWithin(Extent, free_list_reserve, table.fits.limits.max_open_alloc);
+    const plans = try alloc.alloc(PackedWritePlan, plan_count);
     defer alloc.free(plans);
     const old_extents = try alloc.alloc(OldExtentRef, plans.len);
     defer alloc.free(old_extents);
@@ -623,7 +698,14 @@ pub fn writeVlaColumn(
     var trial = HeapManager.init(mgr.capacity);
     defer trial.deinit(alloc);
     trial.top = mgr.top;
-    try trial.free_list.appendSlice(alloc, mgr.free_list.items);
+    try ensureListCapacityWithin(
+        Extent,
+        &trial.free_list,
+        alloc,
+        free_list_reserve,
+        table.fits.limits.max_open_alloc,
+    );
+    trial.free_list.appendSliceAssumeCapacity(mgr.free_list.items);
     for (plans) |plan| {
         if (plan.release_old) try releaseDescriptorExtent(alloc, &trial, plan.old_desc, spec.elem, &geom);
     }
@@ -639,8 +721,13 @@ pub fn writeVlaColumn(
     try validateWriteValues(T, spec.elem, in, column);
 
     // Guarantee the real manager will not allocate while applying the already-proven frees.
-    const reserve = std.math.add(usize, mgr.free_list.items.len, plans.len) catch return error.LimitExceeded;
-    try mgr.free_list.ensureTotalCapacity(alloc, reserve);
+    try ensureListCapacityWithin(
+        Extent,
+        &mgr.free_list,
+        alloc,
+        free_list_reserve,
+        table.fits.limits.max_open_alloc,
+    );
 
     for (plans) |plan| {
         if (plan.release_old) try releaseDescriptorExtent(alloc, mgr, plan.old_desc, spec.elem, &geom);
@@ -755,7 +842,13 @@ pub const HeapManager = struct {
                 const heap_off: u64 = @intCast(desc.off); // validated non-negative by plan
                 const heap_end = std.math.add(u64, heap_off, plan.bytes) catch return error.BadDescriptor;
                 top = @max(top, heap_end);
-                try live_extents.append(table.fits.alloc, .{ .off = heap_off, .len = plan.bytes });
+                try appendWithinAllocationLimit(
+                    Extent,
+                    &live_extents,
+                    table.fits.alloc,
+                    .{ .off = heap_off, .len = plan.bytes },
+                    table.fits.limits.max_open_alloc,
+                );
             }
         }
 
@@ -1283,6 +1376,232 @@ const Fixture = struct {
         alloc.destroy(self.mem);
     }
 };
+
+// Records every allocator request shape used by the limit-boundary tests. `ArrayList` may try a
+// remap/resize before falling back to alloc, so all three paths must be observed to prove no
+// request crosses max_open_alloc.
+const MaxRequestAllocator = struct {
+    child: Allocator,
+    max_requested: usize = 0,
+    request_count: usize = 0,
+
+    const Self = @This();
+
+    fn note(self: *Self, len: usize) void {
+        self.max_requested = @max(self.max_requested, len);
+        self.request_count += 1;
+    }
+
+    fn reset(self: *Self) void {
+        self.max_requested = 0;
+        self.request_count = 0;
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.note(len);
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.note(new_len);
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.note(new_len);
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable: Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocator(self: *Self) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "packed VLA planning allocations honor max_open_alloc exact boundary" {
+    const alloc = testing.allocator;
+    var recording = MaxRequestAllocator{ .child = alloc };
+    const scratch_alloc = recording.allocator();
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 3, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(scratch_alloc);
+
+    const offsets = [_]u64{ 0, 0, 0, 0 };
+    const plan_bytes = try limits.mul(offsets.len - 1, @sizeOf(PackedWritePlan));
+    const old_extent_bytes = try limits.mul(offsets.len - 1, @sizeOf(OldExtentRef));
+    try ensureAllocationWithin(OldExtentRef, offsets.len - 1, old_extent_bytes);
+    try testing.expectError(
+        error.LimitExceeded,
+        ensureAllocationWithin(OldExtentRef, offsets.len - 1, old_extent_bytes - 1),
+    );
+
+    const before = try alloc.dupe(u8, fx.mem.bytes());
+    defer alloc.free(before);
+    const top_before = mgr.top;
+    const capacity_before = mgr.free_list.capacity;
+
+    // One byte below the larger per-row planning footprint fails before either scratch array is
+    // allocated and before the file or manager changes.
+    fx.f.limits.max_open_alloc = plan_bytes - 1;
+    recording.reset();
+    try testing.expectError(
+        error.LimitExceeded,
+        writeVlaColumn(i32, scratch_alloc, &t, &mgr, .{ .index = 0 }, 0, &offsets, &.{}),
+    );
+    try testing.expectEqual(@as(usize, 0), recording.request_count);
+    try testing.expectEqualSlices(u8, before, fx.mem.bytes());
+    try testing.expectEqual(top_before, mgr.top);
+    try testing.expectEqual(@as(usize, 0), mgr.free_list.items.len);
+    try testing.expectEqual(capacity_before, mgr.free_list.capacity);
+
+    // The exact footprint succeeds, and alloc/remap/resize observations prove every request is
+    // bounded by that ceiling. This also covers the precise trial/real free-list reservations.
+    fx.f.limits.max_open_alloc = plan_bytes;
+    recording.reset();
+    try writeVlaColumn(i32, scratch_alloc, &t, &mgr, .{ .index = 0 }, 0, &offsets, &.{});
+    try testing.expect(recording.request_count > 0);
+    try testing.expectEqual(@as(usize, @intCast(plan_bytes)), recording.max_requested);
+}
+
+test "packed VLA free-list reserve is bounded before manager or device mutation" {
+    const alloc = testing.allocator;
+    var recording = MaxRequestAllocator{ .child = alloc };
+    const scratch_alloc = recording.allocator();
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 1, 128, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(scratch_alloc);
+
+    // Make the conservative free-list reserve larger than the one-row plan allocation. The
+    // entries are existing manager state; the write must neither clone nor modify them once its
+    // bounded-reserve preflight rejects the request.
+    const existing_count = @sizeOf(PackedWritePlan) / @sizeOf(Extent) + 2;
+    try mgr.free_list.ensureTotalCapacityPrecise(scratch_alloc, existing_count);
+    for (0..existing_count) |i| {
+        mgr.free_list.appendAssumeCapacity(.{ .off = @intCast(i * 2), .len = 1 });
+    }
+    const manager_before = try alloc.dupe(Extent, mgr.free_list.items);
+    defer alloc.free(manager_before);
+    const bytes_before = try alloc.dupe(u8, fx.mem.bytes());
+    defer alloc.free(bytes_before);
+    const capacity_before = mgr.free_list.capacity;
+
+    const reserve_bytes = try limits.mul(existing_count + 1, @sizeOf(Extent));
+    try testing.expect(reserve_bytes > @sizeOf(PackedWritePlan));
+
+    // A zero-row write is a validated no-op even with existing manager state and a zero-byte
+    // ceiling. It must not clone or reserve that existing free list.
+    fx.f.limits.max_open_alloc = 0;
+    recording.reset();
+    try writeVlaColumn(i32, scratch_alloc, &t, &mgr, .{ .index = 0 }, 1, &.{0}, &.{});
+    try testing.expectEqual(@as(usize, 0), recording.request_count);
+    try testing.expectEqualSlices(u8, bytes_before, fx.mem.bytes());
+    try testing.expectEqualSlices(Extent, manager_before, mgr.free_list.items);
+    try testing.expectEqual(capacity_before, mgr.free_list.capacity);
+
+    // One byte below the reserve fails before either otherwise-legal row-plan allocation.
+    fx.f.limits.max_open_alloc = reserve_bytes - 1;
+    recording.reset();
+    try testing.expectError(
+        error.LimitExceeded,
+        writeVlaColumn(i32, scratch_alloc, &t, &mgr, .{ .index = 0 }, 0, &.{ 0, 0 }, &.{}),
+    );
+    try testing.expectEqual(@as(usize, 0), recording.request_count);
+    try testing.expectEqualSlices(u8, bytes_before, fx.mem.bytes());
+    try testing.expectEqualSlices(Extent, manager_before, mgr.free_list.items);
+    try testing.expectEqual(capacity_before, mgr.free_list.capacity);
+    try testing.expectEqual(@as(u64, 0), mgr.top);
+
+    // The exact reserve succeeds, and every alloc/remap/resize request remains at or below it.
+    fx.f.limits.max_open_alloc = reserve_bytes;
+    recording.reset();
+    try writeVlaColumn(i32, scratch_alloc, &t, &mgr, .{ .index = 0 }, 0, &.{ 0, 0 }, &.{});
+    try testing.expect(recording.request_count > 0);
+    try testing.expectEqual(@as(usize, @intCast(reserve_bytes)), recording.max_requested);
+    try testing.expectEqualSlices(u8, bytes_before, fx.mem.bytes());
+    try testing.expectEqualSlices(Extent, manager_before, mgr.free_list.items);
+    try testing.expectEqual(@as(u64, 0), mgr.top);
+}
+
+test "HeapManager live extents honor max_open_alloc exact boundary" {
+    var recording = MaxRequestAllocator{ .child = testing.allocator };
+    const alloc = recording.allocator();
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PB", 3, 3, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var seed_mgr = try HeapManager.initForTable(&t);
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 0 }, 0, u8, &.{1});
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 0 }, 1, u8, &.{2});
+    try writeVlaCell(alloc, &t, &seed_mgr, .{ .index = 0 }, 2, u8, &.{3});
+    seed_mgr.deinit(alloc);
+
+    const before = try alloc.dupe(u8, fx.mem.bytes());
+    defer alloc.free(before);
+    const exact_bytes = try limits.mul(3, @sizeOf(Extent));
+
+    // A ceiling exactly equal to the logical extent footprint must not be defeated by geometric
+    // over-allocation. The first growth is clamped to exactly three items.
+    fx.f.limits.max_open_alloc = exact_bytes;
+    recording.reset();
+    var exact_mgr = try HeapManager.initForTable(&t);
+    try testing.expectEqual(@as(u64, 3), exact_mgr.top);
+    try testing.expect(recording.request_count > 0);
+    try testing.expectEqual(@as(usize, @intCast(exact_bytes)), recording.max_requested);
+    exact_mgr.deinit(alloc);
+
+    // One byte below the complete footprint permits only two Extents. Reconstruction remains
+    // one-pass, makes no over-limit allocator request, and never mutates the FITS device.
+    fx.f.limits.max_open_alloc = exact_bytes - 1;
+    recording.reset();
+    try testing.expectError(error.LimitExceeded, HeapManager.initForTable(&t));
+    try testing.expect(recording.request_count > 0);
+    try testing.expect(recording.max_requested <= exact_bytes - 1);
+    try testing.expectEqualSlices(u8, before, fx.mem.bytes());
+}
+
+test "HeapManager all-empty reconstruction allocates no extent storage" {
+    var recording = MaxRequestAllocator{ .child = testing.allocator };
+    const alloc = recording.allocator();
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 64, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+
+    fx.f.limits.max_open_alloc = 0;
+    recording.reset();
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try testing.expectEqual(@as(u64, 0), mgr.top);
+    try testing.expectEqual(@as(usize, 0), recording.request_count);
+}
 
 test "packed VLA layout and read preserve row boundaries (1PJ)" {
     const alloc = testing.allocator;

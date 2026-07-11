@@ -275,6 +275,67 @@ test "packed VLA ABI matches legacy P/Q/complex transfers and rejects invalid bu
     try testing.expectEqualSlices(u8, before, after);
 }
 
+test "read-only VLA writes reject before lazy heap reconstruction" {
+    // Build a minimal VLA table, export its bytes, then forge its sole descriptor so a heap scan
+    // would fail with BadDescriptor. The write APIs must return READONLY_FILE before attempting
+    // that scan, leaving both the lazy manager and the complete file image untouched.
+    var source: ?*Handle = null;
+    defer if (source) |handle| capi.zf_close(handle);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{"P"};
+    const tform = [_]?[*:0]const u8{"1PJ"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(src, 0, 1, 1, &ttype, &tform, null, "RO", 16));
+    const descriptor_off: usize = @intCast(src.fits.current().data_off);
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const forged = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(forged);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, forged.ptr, forged.len, &got));
+    try testing.expectEqual(forged.len, got);
+    capi.zf_close(source);
+    source = null;
+
+    // P descriptor: one J element at a heap-relative offset beyond the reserved 16-byte heap.
+    std.mem.writeInt(i32, forged[descriptor_off..][0..4], 1, .big);
+    std.mem.writeInt(i32, forged[descriptor_off + 4 ..][0..4], 1024, .big);
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(forged.ptr, forged.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(ro, 2));
+
+    const before = try testing.allocator.alloc(u8, forged.len);
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, forged.len);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+
+    var table: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(ro, &table));
+    defer capi.zf_table_close(table);
+    const th = table.?;
+    try testing.expect(th.mgr == null);
+
+    var value = [_]i32{42};
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_vla(th, I32, 0, 1, &value, value.len));
+    try testing.expect(th.mgr == null);
+
+    const offsets = [_]u64{ 0, 1 };
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_vla_packed(th, I32, 0, 1, 1, &offsets, offsets.len, &value, value.len));
+    try testing.expect(th.mgr == null);
+
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, after.ptr, after.len, &got));
+    try testing.expectEqual(after.len, got);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
 test "lazy VLA manager preserves every live column when rewriting a populated heap" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

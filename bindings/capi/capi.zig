@@ -1261,6 +1261,9 @@ pub export fn zf_write_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, r
     const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or nelem < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    // Match the core write predicate before lazily reconstructing the heap. A read-only write is
+    // guaranteed to fail, so it must not scan or allocate based on untrusted live descriptors.
+    if (tbl.fits.mode == .read_only or !tbl.fits.dev.isWritable()) return abi.fail(&t.owner.diag, error.NotWritable);
     if (t.mgr == null) {
         t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
     }
@@ -1443,6 +1446,10 @@ pub export fn zf_write_col_vla_packed(
     if (offsets_len != needed) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     const n: usize = std.math.cast(usize, nelem) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
     const offsets_ptr: [*]const u64 = @ptrCast(@alignCast(offsets_raw));
+
+    // Preserve ABI pointer/range validation precedence, then reject the guaranteed failure before
+    // either the temporary zero-row manager or full live-heap reconstruction can do any work.
+    if (tbl.fits.mode == .read_only or !tbl.fits.dev.isWritable()) return abi.fail(&t.owner.diag, error.NotWritable);
 
     // Preserve the core's full dtype/column/range/offset validation for a zero-row write without
     // reconstructing and sorting a populated heap merely to perform a no-op. No allocation can
