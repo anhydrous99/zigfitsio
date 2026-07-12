@@ -441,6 +441,11 @@ describe("wasm buf-direction map", () => {
     expect(BUF_DIRS.zf_header_snapshot_query_v1).toEqual({ 3: "out" });
     // Failure-atomic fill buffers intentionally retain the safe default "inout" staging.
     expect(BUF_DIRS.zf_header_snapshot_fill_v1).toBeUndefined();
+    // Strided reads leave inter-row/trailing padding untouched, so their buffers must retain the
+    // default inout staging unless copy-back becomes cell-range aware.
+    expect(BUF_DIRS.zf_read_col_strided_v1).toBeUndefined();
+    expect(BUF_DIRS.zf_read_col_str_strided_v1).toBeUndefined();
+    expect(BUF_DIRS.zf_read_col_str).toBeUndefined();
     expect(BUF_DIRS.zf_header_apply_v1).toEqual({ 2: "in", 3: "in", 5: "in", 7: "out" });
     expect(BUF_DIRS.zf_read_col_vla_layout).toEqual({ 4: "out", 6: "out" });
     expect(BUF_DIRS.zf_read_col_vla_packed).toEqual({ 5: "out" });
@@ -497,6 +502,36 @@ describe("wasm failure-atomic copy-back", () => {
     expect(Array.from(arena)).toEqual([11, 12, 13, 14]);
     expect(Array.from(physical)).toEqual([21, 22, 23]);
     expect(Array.from(result)).toEqual([31, 32, 33, 34, 35, 36]);
+  });
+
+  test("strided column reads preserve caller padding", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    let next = 64;
+    const ex = {
+      memory,
+      zf_walloc: (len: number) => {
+        const out = next;
+        next += Math.max(len, 1);
+        return out;
+      },
+      zf_wfree: () => undefined,
+      zf_read_col_strided_v1: (
+        _handle: number, _dtype: number, _col: number, _first: bigint, rows: bigint,
+        _nul: number, dst: number, _len: number, stride: number,
+      ) => {
+        const bytes = new Uint8Array(memory.buffer);
+        for (let row = 0; row < Number(rows); row++) {
+          bytes.fill(row + 1, dst + row * stride, dst + row * stride + 4);
+        }
+        return 0;
+      },
+    } as unknown as WasmExports;
+    const proto = PROTOS.find((item) => item.name === "zf_read_col_strided_v1")!;
+    const lib = openWasmLibrary(ex, [proto]);
+
+    const numeric = new Uint8Array(11).fill(0xa5);
+    expect(lib.fn.zf_read_col_strided_v1(1n, 5, 0, 1n, 2n, null, numeric, numeric.length, 7)).toBe(0);
+    expect(Array.from(numeric)).toEqual([1, 1, 1, 1, 0xa5, 0xa5, 0xa5, 2, 2, 2, 2]);
   });
 });
 
@@ -684,13 +719,21 @@ describe("wasm owned-memory fast paths", () => {
     expect(Array.from(copied.bytes)).toEqual([4, 3, 2, 1]);
   });
 
-  test("older modules expose neither optional capability", () => {
-    const ex = {
+  test("older 92-symbol modules load without optional fast paths", () => {
+    const missing = new Set(["zf_read_col_strided_v1", "zf_read_col_str_strided_v1"]);
+    const ex: Record<string, unknown> = {
       memory: new WebAssembly.Memory({ initial: 1 }),
       zf_walloc: () => 64,
       zf_wfree: () => undefined,
-    } as unknown as WasmExports;
-    const lib = openWasmLibrary(ex, []);
+    };
+    for (const proto of PROTOS) {
+      if (!missing.has(proto.name)) ex[proto.name] = () => 0;
+    }
+
+    const lib = openWasmLibrary(ex as unknown as WasmExports, PROTOS);
+    expect(typeof lib.fn.zf_version).toBe("function");
+    expect(lib.fn.zf_read_col_strided_v1).toBeUndefined();
+    expect(lib.fn.zf_read_col_str_strided_v1).toBeUndefined();
     expect(lib.openMemoryOwned).toBeUndefined();
     expect(lib.copyMemoryBytes).toBeUndefined();
     expect(lib.withMemoryBytes).toBeUndefined();

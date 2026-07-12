@@ -61,9 +61,7 @@ export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "o
   zf_write_subset: { 9: "in" },
   zf_read_col: { 6: "out" }, //           (handle, dtype, col, firstrow, nelem, nulval, [array])
   zf_write_col: { 6: "in" },
-  zf_read_col_strided_v1: { 6: "out" },
-  zf_read_col_str_strided_v1: { 7: "out" },
-  zf_read_col_str: { 6: "out" },
+  // Strided reads leave padding untouched, so their buffers retain the safe "inout" default.
   zf_write_col_str: { 6: "in" },
   zf_read_col_vla_layout: { 4: "out", 6: "out" },
   zf_read_col_vla_packed: { 5: "out" },
@@ -72,6 +70,13 @@ export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "o
   zf_open_memory: { 0: "in" }, //         ([bytes], len, mode, opts, out) — read-only source copy
   zf_open_gzip: { 0: "in" }, //           ([bytes], len, opts, out) — read-only source copy
 };
+
+// These C ABI additions are not used by the TypeScript high-level API. Treat them as optional so
+// a pre-strided-ABI module can still use the legacy staged-copy paths below.
+const OPTIONAL_WASM_SYMBOLS = new Set([
+  "zf_read_col_strided_v1",
+  "zf_read_col_str_strided_v1",
+]);
 
 /** Per-proto plan: the `buf` copy direction for each arg index (undefined ⇒ not a `buf`). */
 function planDirs(proto: Proto): (BufDir | undefined)[] {
@@ -146,7 +151,10 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
   const fn: Record<string, NativeFn> = {};
   for (const proto of protos) {
     const raw = ex[proto.name];
-    if (typeof raw !== "function") throw new Error(`symbol ${proto.name} missing from the zigfitsio wasm module`);
+    if (typeof raw !== "function") {
+      if (OPTIONAL_WASM_SYMBOLS.has(proto.name)) continue;
+      throw new Error(`symbol ${proto.name} missing from the zigfitsio wasm module`);
+    }
     const argKinds = proto.args;
     const retKind = proto.returns;
     const dirs = planDirs(proto);

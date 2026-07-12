@@ -101,8 +101,10 @@ pub export fn zf_wopen_memory_begin_v1(len: usize, out_builder: *?*MemoryBuilder
     out_builder.* = null;
     out_data.* = null;
     const owned = gpa.alloc(u8, len) catch return abi.fail(null, error.OutOfMemory);
-    errdefer gpa.free(owned);
-    const builder = gpa.create(MemoryBuilder) catch return abi.fail(null, error.OutOfMemory);
+    const builder = gpa.create(MemoryBuilder) catch {
+        gpa.free(owned);
+        return abi.fail(null, error.OutOfMemory);
+    };
     builder.* = .{ .owned = owned };
     out_builder.* = builder;
     if (len != 0) out_data.* = owned.ptr;
