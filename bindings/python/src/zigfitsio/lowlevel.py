@@ -22,6 +22,7 @@ __all__ = [
     "ZF_UINT8", "ZF_INT8", "ZF_INT16", "ZF_UINT16", "ZF_INT32", "ZF_UINT32",
     "ZF_INT64", "ZF_UINT64", "ZF_FLOAT32", "ZF_FLOAT64", "ZF_BOOL", "ZF_BIT",
     "ZF_STRING", "ZF_COMPLEX64", "ZF_COMPLEX128",
+    "ZF_STR_TRIM",
     "READONLY", "READWRITE", "CREATE",
     "HDU_PRIMARY", "HDU_IMAGE", "HDU_ASCII_TABLE", "HDU_BINARY_TABLE", "HDU_RANDOM_GROUPS",
     "BINARY_TBL", "ASCII_TBL",
@@ -85,6 +86,9 @@ ZF_BIT = 12
 ZF_STRING = 13
 ZF_COMPLEX64 = 14
 ZF_COMPLEX128 = 15
+
+# zf_read_col_str_strided_v1 flags.
+ZF_STR_TRIM = 1 << 0
 
 # Open modes.
 READONLY = 0
@@ -444,8 +448,10 @@ _PROTOS = [
     ("zf_table_col_name", INT, [VOID, INT, CHARP, SZ, PSZ]),
     ("zf_table_col_unit", INT, [VOID, INT, CHARP, SZ, PSZ]),
     ("zf_read_col", INT, [VOID, INT, INT, LL, LL, VOID, VOID]),
+    ("zf_read_col_strided_v1", INT, [VOID, INT, INT, LL, LL, VOID, CHARP, SZ, SZ]),
     ("zf_write_col", INT, [VOID, INT, INT, LL, LL, VOID, VOID]),
     ("zf_read_col_str", INT, [VOID, INT, LL, LL, LL, LL, CHARP]),
+    ("zf_read_col_str_strided_v1", INT, [VOID, INT, LL, LL, SZ, SZ, U32, CHARP, SZ]),
     ("zf_write_col_str", INT, [VOID, INT, LL, LL, LL, LL, CHARP]),
     ("zf_append_rows", INT, [VOID, LL]),
     ("zf_insert_rows", INT, [VOID, LL, LL]),

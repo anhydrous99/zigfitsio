@@ -31,7 +31,7 @@ class GenerateWikiTests(unittest.TestCase):
 
     def test_c_header_has_ordered_neutral_abi(self) -> None:
         prototypes = _header_zf_prototypes()
-        self.assertEqual(len(prototypes), 92)
+        self.assertEqual(len(prototypes), 94)
         self.assertEqual(
             prototypes[0],
             {"name": "zf_version", "returns": "cstring_ret", "args": []},

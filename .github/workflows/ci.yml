@@ -171,7 +171,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y libcfitsio-dev libcfitsio-bin pkg-config
+          sudo apt-get install -y fitsverify libcfitsio-dev libcfitsio-bin pkg-config
           python -m pip install --upgrade pip
           python -m pip install -r interop/requirements.txt
       - name: Inbound — Astropy reads & cross-validates every committed CFITSIO golden (X-XVAL)
@@ -188,6 +188,7 @@ jobs:
           zig build emit-fixtures -- "$OUT"
           python interop/check_funpack.py "$OUT"           # CFITSIO funpack decodes every codec to the ramp
           python interop/verify_outbound.py "$OUT"         # Astropy opens/verifies every emitted file
+          fitsverify -q "$OUT/image_checksum.fits"          # checksum-bearing fixture is a hard gate
           for f in "$OUT"/*.fits; do fitsverify -q "$f" || true; done   # informational structural report
       - name: Golden drift-guard — regenerate & byte-diff (informational; needs CFITSIO 4.6.4)
         if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'

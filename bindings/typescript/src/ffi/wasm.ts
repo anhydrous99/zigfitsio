@@ -61,7 +61,7 @@ export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "o
   zf_write_subset: { 9: "in" },
   zf_read_col: { 6: "out" }, //           (handle, dtype, col, firstrow, nelem, nulval, [array])
   zf_write_col: { 6: "in" },
-  zf_read_col_str: { 6: "out" },
+  // Strided reads leave padding untouched, so their buffers retain the safe "inout" default.
   zf_write_col_str: { 6: "in" },
   zf_read_col_vla_layout: { 4: "out", 6: "out" },
   zf_read_col_vla_packed: { 5: "out" },
@@ -70,6 +70,13 @@ export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "o
   zf_open_memory: { 0: "in" }, //         ([bytes], len, mode, opts, out) — read-only source copy
   zf_open_gzip: { 0: "in" }, //           ([bytes], len, opts, out) — read-only source copy
 };
+
+// These C ABI additions are not used by the TypeScript high-level API. Treat them as optional so
+// a pre-strided-ABI module can still use the legacy staged-copy paths below.
+const OPTIONAL_WASM_SYMBOLS = new Set([
+  "zf_read_col_strided_v1",
+  "zf_read_col_str_strided_v1",
+]);
 
 /** Per-proto plan: the `buf` copy direction for each arg index (undefined ⇒ not a `buf`). */
 function planDirs(proto: Proto): (BufDir | undefined)[] {
@@ -83,19 +90,31 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
   const u8 = (): Uint8Array => new Uint8Array(ex.memory.buffer);
   const dv = (): DataView => new DataView(ex.memory.buffer);
 
-  const alloc = (len: number): number => {
+  const validateLength = (len: number): void => {
     // `zf_walloc` takes a wasm32 `usize`. Never let JS-to-wasm i32 coercion wrap a malformed
     // or oversized request (in particular, 4 GiB used to become a zero-byte allocation via
     // `>>> 0`). Buffers at the exact 4-GiB boundary are also unaddressable as one wasm32 span.
     if (!Number.isSafeInteger(len) || len < 0 || len >= 0x1_0000_0000) {
       throw new RangeError(`zigfitsio(wasm): buffer length ${len} is not representable by wasm32`);
     }
+  };
+
+  const alloc = (len: number): number => {
+    validateLength(len);
     // wasm i32 returns are signed in JS; `>>> 0` reads the offset as unsigned so a heap grown past
     // 2 GiB (offsets with the high bit set) does not surface as a negative index that would crash
     // `set`/`subarray` or silently address the wrong region.
     const p = ex.zf_walloc(len) >>> 0;
     if (p === 0 && len > 0) throw new Error(`zigfitsio(wasm): out of memory allocating ${len} bytes`);
     return p;
+  };
+
+  const checkedView = (ptr: number, len: number): Uint8Array => {
+    const mem = u8();
+    if (ptr > mem.length || len > mem.length - ptr) {
+      throw new Error(`zigfitsio(wasm): invalid memory span ${ptr}+${len} (memory size ${mem.length})`);
+    }
+    return mem.subarray(ptr, ptr + len);
   };
 
   /** `handle`/pointer bigint (the u64 neutral contract) → wasm32 32-bit offset. */
@@ -132,7 +151,10 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
   const fn: Record<string, NativeFn> = {};
   for (const proto of protos) {
     const raw = ex[proto.name];
-    if (typeof raw !== "function") throw new Error(`symbol ${proto.name} missing from the zigfitsio wasm module`);
+    if (typeof raw !== "function") {
+      if (OPTIONAL_WASM_SYMBOLS.has(proto.name)) continue;
+      throw new Error(`symbol ${proto.name} missing from the zigfitsio wasm module`);
+    }
     const argKinds = proto.args;
     const retKind = proto.returns;
     const dirs = planDirs(proto);
@@ -252,9 +274,91 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
     };
   }
 
+  const begin = ex.zf_wopen_memory_begin_v1;
+  const commit = ex.zf_wopen_memory_commit_v1;
+  const abort = ex.zf_wopen_memory_abort_v1;
+  const openMemoryOwned: NativeLibrary["openMemoryOwned"] =
+    typeof begin === "function" && typeof commit === "function" && typeof abort === "function"
+      ? (data, mode, opts) => {
+          // Two wasm32 out-pointers share one scratch block. The final device bytes are allocated
+          // by begin(), so the input crosses the JS/Wasm boundary exactly once.
+          const dataLength = data.byteLength;
+          const wasmSourceOffset = data.buffer === ex.memory.buffer ? data.byteOffset : null;
+          const frees: number[] = [];
+          let builder = 0;
+          let active = false;
+          try {
+            validateLength(dataLength);
+            const scratch = alloc(8);
+            frees.push(scratch);
+            let optsOff = 0;
+            if (opts !== null) {
+              optsOff = alloc(opts.byteLength);
+              frees.push(optsOff);
+              u8().set(new Uint8Array(opts.buffer, opts.byteOffset, opts.byteLength), optsOff);
+            }
+            const status = Number(begin(dataLength, scratch, scratch + 4));
+            const out = dv(); // begin may have grown memory
+            builder = out.getUint32(scratch, true);
+            const dataOff = out.getUint32(scratch + 4, true);
+            active = builder !== 0;
+            if (status !== 0) {
+              if (active) abort(builder);
+              active = false;
+              return { status, handle: 0n };
+            }
+            const source = wasmSourceOffset === null ? data : checkedView(wasmSourceOffset, dataLength);
+            checkedView(dataOff, dataLength).set(source);
+            dv().setUint32(scratch, 0, true);
+            // commit consumes the builder on every normal return, including a parse error.
+            active = false;
+            const commitStatus = Number(commit(builder, mode, optsOff, scratch));
+            const handle = BigInt(dv().getUint32(scratch, true));
+            return { status: commitStatus, handle };
+          } finally {
+            // Only failures between begin and commit leave a live builder for abort.
+            if (active) abort(builder);
+            for (let i = frees.length - 1; i >= 0; i--) ex.zf_wfree(frees[i]);
+          }
+        }
+      : undefined;
+
+  const memoryView = ex.zf_wmemory_view_v1;
+  const withMemoryBytes: NativeLibrary["withMemoryBytes"] =
+    typeof memoryView === "function"
+      ? (handle, callback) => {
+          const scratch = alloc(8);
+          try {
+            dv().setBigUint64(scratch, 0n, true);
+            const status = Number(memoryView(toOffset(handle), scratch, scratch + 4));
+            if (status !== 0) return status;
+            const out = dv(); // the call may have grown memory
+            const ptr = out.getUint32(scratch, true);
+            const len = out.getUint32(scratch + 4, true);
+            callback(checkedView(ptr, len));
+            return 0;
+          } finally {
+            ex.zf_wfree(scratch);
+          }
+        }
+      : undefined;
+
+  const copyMemoryBytes: NativeLibrary["copyMemoryBytes"] = withMemoryBytes
+    ? (handle) => {
+        let bytes = new Uint8Array(0);
+        const status = withMemoryBytes(handle, (view) => {
+          bytes = view.slice();
+        });
+        return { status, bytes };
+      }
+    : undefined;
+
   return {
     backend: "wasm",
     fn,
+    ...(openMemoryOwned ? { openMemoryOwned } : {}),
+    ...(copyMemoryBytes ? { copyMemoryBytes } : {}),
+    ...(withMemoryBytes ? { withMemoryBytes } : {}),
     readCString(p: Ptr, len: number): string {
       if (p === 0n || len === 0) return "";
       const start = Number(p);

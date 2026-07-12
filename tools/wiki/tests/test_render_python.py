@@ -45,10 +45,10 @@ def test_generates_complete_static_contract(tmp_path):
         "python-symbols.json",
     ]
     assert manifest["counts"]["public_exports"] == 25
-    assert manifest["counts"]["lowlevel_exports"] == 95
-    assert manifest["counts"]["lowlevel_functions"] == 92
+    assert manifest["counts"]["lowlevel_exports"] == 96
+    assert manifest["counts"]["lowlevel_functions"] == 94
     assert manifest["coverage"]["missing"] == []
-    assert len(manifest["abi_prototypes"]) == 92
+    assert len(manifest["abi_prototypes"]) == 94
     assert manifest["abi_prototypes"][0] == {
         "name": "zf_version",
         "returns": "CHARP",
@@ -126,7 +126,7 @@ def test_lowlevel_all_is_literal_and_hides_loader_internals():
     )
     exports = ast.literal_eval(all_node.value)
 
-    assert len(exports) == len(set(exports)) == 95
+    assert len(exports) == len(set(exports)) == 96
     assert "lib" in exports
     assert "ZfOpenOpts" in exports
     assert "ZfHeaderSnapshotInfoV1" in exports

@@ -196,33 +196,67 @@ pub const BinTable = struct {
         const sl: usize = std.math.cast(usize, slots) orelse return error.CellOutOfRange;
         if (out.len % sl != 0) return error.CellOutOfRange;
         const nrows: u64 = out.len / sl;
+        const row_bytes = std.math.mul(usize, sl, @sizeOf(T)) catch return error.CellOutOfRange;
+        return self.readColumnStrided(T, col, first_row, nrows, std.mem.sliceAsBytes(out), row_bytes, opts);
+    }
+
+    /// Read `nrows` consecutive cells directly into a caller-owned byte buffer. Each decoded
+    /// cell starts at `out[row * row_stride]`; elements inside a cell remain contiguous. The
+    /// destination may be byte-aligned (for example, a packed NumPy structured-array field).
+    /// `out` must cover `(nrows - 1) * row_stride + cellSlots * @sizeOf(T)` bytes.
+    pub fn readColumnStrided(self: *BinTable, comptime T: type, col: ColumnRef, first_row: u64, nrows: u64, out: []u8, row_stride: usize, opts: ReadOpts(T)) AccessError!void {
+        const column = &self.columns[try self.resolve(col)];
+        if (column.tform.type.isVla()) return error.BadDescriptor;
+        const slots = cellSlots(column);
+        const sl = std.math.cast(usize, slots) orelse return error.CellOutOfRange;
+        const cell_bytes = std.math.mul(usize, sl, @sizeOf(T)) catch return error.CellOutOfRange;
+        const rows = try batch.validateStrided(nrows, cell_bytes, row_stride, out.len);
         const last = std.math.add(u64, first_row, nrows) catch return error.RowOutOfRange;
         if (last > self.naxis2) return error.RowOutOfRange;
+        if (rows == 0 or slots == 0) return;
         const field_bytes = try column.tform.fieldBytes();
         const plan = batch.Plan.init(self.naxis1, field_bytes, nrows, self.fits.limits.max_open_alloc) orelse {
-            var r: u64 = 0;
-            while (r < nrows) : (r += 1) {
-                const base: usize = @intCast(r * slots);
-                try self.readCellInto(T, column, first_row + r, out[base..][0..sl], .bulk, opts);
+            for (0..rows) |r| {
+                const start = r * row_stride;
+                const cell = @as([*]align(1) T, @ptrCast(out[start..].ptr))[0..sl];
+                try self.readCellInto(T, column, first_row + r, cell, .bulk, opts);
             }
             return;
         };
         var storage: [batch.target_bytes]u8 = undefined;
         const window = storage[0..plan.window_bytes];
-        var done: u64 = 0;
-        while (done < nrows) {
-            const rows: usize = @intCast(@min(@as(u64, plan.rows_per_window), nrows - done));
-            const bytes = rows * @as(usize, @intCast(self.naxis1));
+        var done: usize = 0;
+        while (done < rows) {
+            const window_rows = @min(plan.rows_per_window, rows - done);
+            const bytes = window_rows * @as(usize, @intCast(self.naxis1));
             const row0 = first_row + done;
             try self.fits.dev.readAll(window[0..bytes], try self.rowOffset(row0));
             var borrowed: batch.BorrowedDevice = .{ .bytes = window[0..bytes] };
             const dev = borrowed.device();
-            for (0..rows) |r| {
-                const out_base: usize = @intCast((done + r) * slots);
+            for (0..window_rows) |r| {
+                const start = (done + r) * row_stride;
+                const cell = @as([*]align(1) T, @ptrCast(out[start..].ptr))[0..sl];
                 const off = @as(u64, r) * self.naxis1 + column.byte_offset;
-                try readCellFrom(T, dev, off, column, out[out_base..][0..sl], .bulk, opts);
+                try readCellFrom(T, dev, off, column, cell, .bulk, opts);
             }
-            done += rows;
+            done += window_rows;
+        }
+    }
+
+    /// Read fixed-width text cells into a row-strided byte destination. When
+    /// `normalize_nulpad` is set, trailing FITS spaces/NULs become NUL padding suitable for a
+    /// fixed-width byte-string array. `width` must equal the column's caller-visible slot count.
+    pub fn readColumnStrStrided(self: *BinTable, col: ColumnRef, first_row: u64, nrows: u64, out: []u8, width: usize, row_stride: usize, normalize_nulpad: bool) AccessError!void {
+        const column = &self.columns[try self.resolve(col)];
+        const slots = std.math.cast(usize, cellSlots(column)) orelse return error.CellOutOfRange;
+        if (width != slots) return error.CellOutOfRange;
+        try self.readColumnStrided(u8, col, first_row, nrows, out, row_stride, .{});
+        if (!normalize_nulpad) return;
+        const rows = try batch.validateStrided(nrows, width, row_stride, out.len);
+        for (0..rows) |r| {
+            const cell = out[r * row_stride ..][0..width];
+            const trimmed = std.mem.trimEnd(u8, cell, " \x00");
+            @memset(cell[trimmed.len..], 0);
         }
     }
 
@@ -699,7 +733,7 @@ pub const BinTable = struct {
         return limits.add(self.hdu.data_off, row_off);
     }
 
-    fn readCellInto(self: *BinTable, comptime T: type, column: *const Column, row: u64, out: []T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
+    fn readCellInto(self: *BinTable, comptime T: type, column: *const Column, row: u64, out: []align(1) T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
         const off = try self.cellOffset(column, row);
         try readCellFrom(T, self.fits.dev, off, column, out, mode, opts);
     }
@@ -758,7 +792,7 @@ pub fn decodeCellBytes(comptime T: type, column: *const Column, raw: []const u8,
     try readCellFrom(T, borrowed.device(), 0, column, out, .bulk, opts);
 }
 
-fn readCellFrom(comptime T: type, dev: Device, off: u64, column: *const Column, out: []T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
+fn readCellFrom(comptime T: type, dev: Device, off: u64, column: *const Column, out: []align(1) T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
     switch (column.tform.type) {
         .logical => try readLogical(T, dev, off, out, mode, opts),
         .bit => try readBits(T, dev, off, out, mode),
@@ -1114,7 +1148,7 @@ fn convertStored(comptime Stored: type, comptime T: type, v: T, column: *const C
 const SCRATCH_BYTES: usize = 8192;
 
 // Numeric/complex read: `out.len` stored values, chunked, byte-swapped, scaled, converted.
-fn readRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, out: []T, column: *const Column, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
+fn readRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, out: []align(1) T, column: *const Column, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
     const cap = @max(1, SCRATCH_BYTES / @sizeOf(Stored));
     var scratch: [cap]Stored = undefined;
     var done: usize = 0;
@@ -1144,7 +1178,7 @@ fn writeRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, in: 
 }
 
 // L: 'T'/'F' bytes ↔ bool/numeric; a 0 byte is the logical null.
-fn readLogical(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
+fn readLogical(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
     var scratch: [SCRATCH_BYTES]u8 = undefined;
     var done: usize = 0;
     while (done < out.len) {
@@ -1187,7 +1221,7 @@ fn writeLogical(comptime T: type, dev: Device, off: u64, in: []const T, opts: Wr
 }
 
 // X: MSB-first packed bits ↔ one element per bit. `out.len` is the bit (repeat) count.
-fn readBits(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode) (errors.IoError || errors.ConvError)!void {
+fn readBits(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode) (errors.IoError || errors.ConvError)!void {
     const nbits = out.len;
     const fbytes = (nbits + 7) / 8;
     var scratch: [SCRATCH_BYTES]u8 = undefined;
@@ -1252,7 +1286,7 @@ fn charWidth(column: *const Column, full: usize) usize {
 // `TDIMn` declares a string array (`TDIMn=(w,…)`), the NUL/pad state resets at every `w`-byte
 // substring boundary so a NUL in one string does not blank the following strings (FR-BTB-7).
 // For non-`u8` `T`, each byte is simply converted (no string semantics).
-fn readChars(comptime T: type, dev: Device, off: u64, out: []T, mode: Mode, column: *const Column) (errors.IoError || errors.ConvError)!void {
+fn readChars(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode, column: *const Column) (errors.IoError || errors.ConvError)!void {
     const width = charWidth(column, out.len);
     var scratch: [SCRATCH_BYTES]u8 = undefined;
     var done: usize = 0;
@@ -1447,6 +1481,56 @@ test "dense column reads use row windows and partial writes stay field-only" {
     // Field-only writes must preserve adjacent fields.
     try table.readColumn(i32, .{ .index = 1 }, 0, values, .{});
     for (values) |v| try testing.expectEqual(@as(i32, 0), v);
+}
+
+test "row-strided reads support packed unaligned destinations" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const hdu = try buildBinTable(&f, alloc, &.{
+        .{ .tform = "2J", .ttype = "PAIR" },
+        .{ .tform = "1D", .ttype = "VALUE" },
+        .{ .tform = "4A", .ttype = "LABEL" },
+    }, 3, null);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    const pairs = [_]i32{ 1, 2, 3, 4, 5, 6 };
+    const values = [_]f64{ 1.25, -2.5, 9.0 };
+    try table.writeColumn(i32, .{ .name = "PAIR" }, 0, &pairs, .{});
+    try table.writeColumn(f64, .{ .name = "VALUE" }, 0, &values, .{});
+    try table.writeColumn(u8, .{ .name = "LABEL" }, 0, "A   BC      ", .{});
+
+    var packed_bytes: [64]u8 = undefined;
+    @memset(&packed_bytes, 0xa5);
+    try table.readColumnStrided(i32, .{ .name = "PAIR" }, 0, 3, packed_bytes[1..35], 13, .{});
+    for (0..3) |r| {
+        var got: [2]i32 = undefined;
+        @memcpy(std.mem.asBytes(&got), packed_bytes[1 + r * 13 ..][0..8]);
+        try testing.expectEqualSlices(i32, pairs[r * 2 ..][0..2], &got);
+        if (r < 2) for (packed_bytes[1 + r * 13 + 8 .. 1 + (r + 1) * 13]) |b| try testing.expectEqual(@as(u8, 0xa5), b);
+    }
+    try testing.expectEqual(@as(u8, 0xa5), packed_bytes[0]);
+    try testing.expectEqual(@as(u8, 0xa5), packed_bytes[35]);
+
+    @memset(&packed_bytes, 0xa5);
+    try table.readColumnStrided(f64, .{ .name = "VALUE" }, 0, 3, packed_bytes[1..31], 11, .{});
+    for (values, 0..) |want, r| {
+        var got: f64 = undefined;
+        @memcpy(std.mem.asBytes(&got), packed_bytes[1 + r * 11 ..][0..8]);
+        try testing.expectEqual(want, got);
+    }
+
+    @memset(&packed_bytes, 0xa5);
+    try table.readColumnStrStrided(.{ .name = "LABEL" }, 0, 3, packed_bytes[1..19], 4, 7, true);
+    try testing.expectEqualSlices(u8, "A\x00\x00\x00", packed_bytes[1..5]);
+    try testing.expectEqualSlices(u8, "BC\x00\x00", packed_bytes[8..12]);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00", packed_bytes[15..19]);
+    try testing.expectError(error.CellOutOfRange, table.readColumnStrided(i32, .{ .index = 0 }, 0, 2, packed_bytes[0..20], 7, .{}));
+    try testing.expectError(error.CellOutOfRange, table.readColumnStrided(i32, .{ .index = 0 }, 0, 2, packed_bytes[0..20], 13, .{}));
 }
 
 test "whole-row column writes are batched without a read" {

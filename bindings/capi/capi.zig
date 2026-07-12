@@ -21,6 +21,12 @@ const ZfScaling = abi.ZfScaling;
 const ZfOpenOpts = abi.ZfOpenOpts;
 const gpa = abi.gpa;
 
+/// Opaque owner used by the WebAssembly binding to fill the final `MemoryDevice` allocation
+/// directly. It is intentionally not part of the public C header.
+pub const MemoryBuilder = struct {
+    owned: []u8,
+};
+
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // Version & error introspection
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -88,6 +94,30 @@ pub export fn zf_wfree(ptr: ?[*]u8) void {
     gpa.free(aligned[0..total]);
 }
 
+/// Allocate the final handle-owned memory buffer without staging it through `zf_walloc`.
+/// The builder must be consumed by `zf_wopen_memory_commit_v1` or released with
+/// `zf_wopen_memory_abort_v1`.
+pub export fn zf_wopen_memory_begin_v1(len: usize, out_builder: *?*MemoryBuilder, out_data: *?[*]u8) c_int {
+    out_builder.* = null;
+    out_data.* = null;
+    const owned = gpa.alloc(u8, len) catch return abi.fail(null, error.OutOfMemory);
+    const builder = gpa.create(MemoryBuilder) catch {
+        gpa.free(owned);
+        return abi.fail(null, error.OutOfMemory);
+    };
+    builder.* = .{ .owned = owned };
+    out_builder.* = builder;
+    if (len != 0) out_data.* = owned.ptr;
+    return 0;
+}
+
+/// Release an uncommitted builder. Safe to call with null.
+pub export fn zf_wopen_memory_abort_v1(builder_opt: ?*MemoryBuilder) void {
+    const builder = builder_opt orelse return;
+    gpa.free(builder.owned);
+    gpa.destroy(builder);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // Lifecycle
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -96,6 +126,33 @@ fn allocHandle() ?*Handle {
     const h = gpa.create(Handle) catch return null;
     h.* = .{ .fits = undefined, .diag = .{}, .mem_dev = null };
     return h;
+}
+
+/// Open a handle over `owned`, consuming and freeing the slice on every failure path.
+fn openOwnedMemory(owned: []u8, mode: c_int, opts: ?*const ZfOpenOpts, out: *?*Handle) c_int {
+    out.* = null;
+    const h = allocHandle() orelse {
+        gpa.free(owned);
+        return abi.fail(null, error.OutOfMemory);
+    };
+    const md = gpa.create(fits.MemoryDevice) catch {
+        gpa.free(owned);
+        gpa.destroy(h);
+        return abi.fail(null, error.OutOfMemory);
+    };
+    md.* = fits.MemoryDevice.initOwnedBytes(gpa, owned);
+    h.mem_dev = md;
+    const o = abi.optsFrom(opts, &h.diag);
+    const m: fits.Mode = if (abi.modeFrom(mode) == .read_write) .read_write else .read_only;
+    h.fits = fits.Fits.open(gpa, md.device(), m, o) catch |e| {
+        const code = abi.fail(&h.diag, e);
+        md.deinit();
+        gpa.destroy(md);
+        gpa.destroy(h);
+        return code;
+    };
+    out.* = h;
+    return 0;
 }
 
 /// Open an on-disk FITS file by path. `mode`: 0 read-only, 1 read-write, 2 create.
@@ -130,28 +187,18 @@ pub export fn zf_create_file(path_ptr: [*]const u8, path_len: usize, opts: ?*con
 /// 2 (create) is treated as read-write; use `zf_create_memory` to build a new in-RAM file.
 pub export fn zf_open_memory(buf_ptr: [*]const u8, buf_len: usize, mode: c_int, opts: ?*const ZfOpenOpts, out: *?*Handle) c_int {
     out.* = null;
-    const h = allocHandle() orelse return abi.fail(null, error.OutOfMemory);
-    const md = gpa.create(fits.MemoryDevice) catch {
-        gpa.destroy(h);
-        return abi.fail(null, error.OutOfMemory);
-    };
-    md.* = fits.MemoryDevice.initBytes(gpa, buf_ptr[0..buf_len]) catch |e| {
-        gpa.destroy(md);
-        gpa.destroy(h);
-        return abi.fail(null, e);
-    };
-    h.mem_dev = md;
-    const o = abi.optsFrom(opts, &h.diag);
-    const m: fits.Mode = if (abi.modeFrom(mode) == .read_write) .read_write else .read_only;
-    h.fits = fits.Fits.open(gpa, md.device(), m, o) catch |e| {
-        const code = abi.fail(&h.diag, e);
-        md.deinit();
-        gpa.destroy(md);
-        gpa.destroy(h);
-        return code;
-    };
-    out.* = h;
-    return 0;
+    const owned = gpa.dupe(u8, buf_ptr[0..buf_len]) catch return abi.fail(null, error.OutOfMemory);
+    return openOwnedMemory(owned, mode, opts, out);
+}
+
+/// Consume a builder and open its already-filled allocation as a memory handle. The builder is
+/// consumed on every normal return, including malformed-FITS failures.
+pub export fn zf_wopen_memory_commit_v1(builder_opt: ?*MemoryBuilder, mode: c_int, opts: ?*const ZfOpenOpts, out: *?*Handle) c_int {
+    out.* = null;
+    const builder = builder_opt orelse return abi.failNull();
+    const owned = builder.owned;
+    gpa.destroy(builder);
+    return openOwnedMemory(owned, mode, opts, out);
 }
 
 /// Create a new, empty FITS file in memory. Read the resulting bytes back with `zf_data_size`
@@ -216,6 +263,19 @@ pub export fn zf_data_size(h_opt: ?*Handle, out: *u64) c_int {
 pub export fn zf_read_bytes(h_opt: ?*Handle, offset: u64, dst: [*]u8, len: usize, out_read: *usize) c_int {
     const h = h_opt orelse return abi.failNull();
     out_read.* = h.fits.device().pread(dst[0..len], offset) catch |e| return abi.fail(&h.diag, e);
+    return 0;
+}
+
+/// Borrow the bytes of an in-memory handle for the WebAssembly bridge. The returned pointer is
+/// valid only until the next mutating operation on the handle or `zf_close`.
+pub export fn zf_wmemory_view_v1(h_opt: ?*Handle, out_data: *?[*]const u8, out_len: *usize) c_int {
+    out_data.* = null;
+    out_len.* = 0;
+    const h = h_opt orelse return abi.failNull();
+    const md = h.mem_dev orelse return abi.fail(&h.diag, error.WrongValueType);
+    const bytes = md.bytes();
+    if (bytes.len != 0) out_data.* = bytes.ptr;
+    out_len.* = bytes.len;
     return 0;
 }
 
@@ -1437,12 +1497,66 @@ fn colDispatch(comptime dir: Dir, t: *TableHandle, ty: ZfType, col: u16, first_r
     };
 }
 
+fn colStridedT(comptime T: type, t: *TableHandle, col: u16, first_row: u64, nrows: u64, dst: []u8, row_stride: usize, nulval: ?*const anyopaque) fits.Error!void {
+    const sentinel = sentinelOf(T, nulval);
+    switch (t.kind) {
+        .binary => try t.bin.?.readColumnStrided(T, .{ .index = col }, first_row, nrows, dst, row_stride, .{ .null_sentinel = sentinel }),
+        .ascii => try t.asc.?.readColumnStrided(T, .{ .index = col }, first_row, nrows, dst, row_stride, sentinel),
+    }
+}
+
+fn colStridedDispatch(t: *TableHandle, ty: ZfType, col: u16, first_row: u64, nrows: u64, dst: []u8, row_stride: usize, nulval: ?*const anyopaque) fits.Error!void {
+    return switch (ty) {
+        .uint8 => colStridedT(u8, t, col, first_row, nrows, dst, row_stride, nulval),
+        .int8 => colStridedT(i8, t, col, first_row, nrows, dst, row_stride, nulval),
+        .int16 => colStridedT(i16, t, col, first_row, nrows, dst, row_stride, nulval),
+        .uint16 => colStridedT(u16, t, col, first_row, nrows, dst, row_stride, nulval),
+        .int32 => colStridedT(i32, t, col, first_row, nrows, dst, row_stride, nulval),
+        .uint32 => colStridedT(u32, t, col, first_row, nrows, dst, row_stride, nulval),
+        .int64 => colStridedT(i64, t, col, first_row, nrows, dst, row_stride, nulval),
+        .uint64 => colStridedT(u64, t, col, first_row, nrows, dst, row_stride, nulval),
+        .float32 => colStridedT(f32, t, col, first_row, nrows, dst, row_stride, nulval),
+        .float64 => colStridedT(f64, t, col, first_row, nrows, dst, row_stride, nulval),
+        else => error.WrongValueType,
+    };
+}
+
 /// Read `nelem` elements of 0-based column `col` starting at 1-based `firstrow`, as `dtype`.
 pub export fn zf_read_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
     const t = liveTable(t_opt) orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     colDispatch(.read, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
+    return 0;
+}
+
+/// Read complete fixed-width cells into a caller-owned row-strided byte span. Unlike
+/// `zf_read_col`, the destination has no natural-alignment requirement.
+pub export fn zf_read_col_strided_v1(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nrows: c_longlong, nulval: ?*const anyopaque, dst_opt: ?[*]u8, dst_len: usize, row_stride: usize) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    if (nrows == 0) return 0;
+    if (nrows < 0 or col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    const dst = dst_opt orelse return abi.failNull();
+    const ci = std.math.cast(u16, col) orelse return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    colStridedDispatch(t, @enumFromInt(dtype), ci, @intCast(firstrow - 1), @intCast(nrows), dst[0..dst_len], row_stride, nulval) catch |e| return abi.fail(&t.owner.diag, e);
+    return 0;
+}
+
+const zf_str_trim: u32 = 1 << 0;
+
+/// Read fixed-width text cells into a row-strided destination. `ZF_STR_TRIM` normalizes FITS
+/// padding to trailing NULs for NumPy-style fixed-byte strings.
+pub export fn zf_read_col_str_strided_v1(t_opt: ?*TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: usize, row_stride: usize, flags: u32, dst_opt: ?[*]u8, dst_len: usize) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    if (nrows == 0) return 0;
+    if (nrows < 0 or col < 0 or firstrow < 1 or flags & ~zf_str_trim != 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    const dst = dst_opt orelse return abi.failNull();
+    const ci = std.math.cast(u16, col) orelse return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    const normalize = flags & zf_str_trim != 0;
+    switch (t.kind) {
+        .binary => t.bin.?.readColumnStrStrided(.{ .index = ci }, @intCast(firstrow - 1), @intCast(nrows), dst[0..dst_len], width, row_stride, normalize) catch |e| return abi.fail(&t.owner.diag, e),
+        .ascii => t.asc.?.readColumnStrStrided(.{ .index = ci }, @intCast(firstrow - 1), @intCast(nrows), dst[0..dst_len], width, row_stride, normalize) catch |e| return abi.fail(&t.owner.diag, e),
+    }
     return 0;
 }
 

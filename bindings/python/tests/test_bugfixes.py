@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import zigfitsio as zf
+from zigfitsio import core
 from zigfitsio import lowlevel as ll
 
 
@@ -886,6 +887,43 @@ def test_inplace_mutation_of_readonly_open_is_saved(tmp_fits):
     np.testing.assert_array_equal(reread[1].data["FLUX"], [42.0, 42.0, 42.0])
 
 
+def test_change_fingerprints_are_bounded_and_layout_independent(monkeypatch):
+    logical = np.arange(48, dtype=">i4").reshape(6, 8)[:, ::2]
+    expected = core._ndarray_fp(np.array(logical, order="C"))
+
+    def no_full_copy(*_args, **_kwargs):
+        raise AssertionError("fingerprinting must not materialize a full contiguous copy")
+
+    monkeypatch.setattr(core.np, "ascontiguousarray", no_full_copy)
+    assert core._ndarray_fp(logical) == expected
+    logical[0, 0] += 1
+    assert core._ndarray_fp(logical) != expected
+
+    split = np.empty(2, dtype=object)
+    joined = np.empty(2, dtype=object)
+    split[:] = [np.array([1], dtype="i4"), np.array([2], dtype="i4")]
+    joined[:] = [np.array([1, 2], dtype="i4"), np.array([], dtype="i4")]
+    assert core._col_fp(split) != core._col_fp(joined)
+
+
+def test_table_read_fills_packed_unaligned_fields_directly():
+    n = 4
+    cols = [
+        zf.Column("PAD", "1B", np.arange(n, dtype="u1")),
+        zf.Column("VALUE", "1D", np.arange(n, dtype="f8") + 0.25),
+        zf.Column("VEC", "3J", np.arange(n * 3, dtype="i4").reshape(n, 3)),
+        zf.Column("Z", "1M", (np.arange(n) + 1j * np.arange(n)[::-1]).astype("c16")),
+        zf.Column("NAME", "5A", np.array([b"A", b"B  ", b"", b"ABCDE"])),
+    ]
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).to_bytes()) as hdus:
+        rec = hdus[1].data
+        assert rec.dtype.fields["VALUE"][1] == 1  # deliberately unaligned f64 destination
+        np.testing.assert_array_equal(rec["VALUE"], np.arange(n, dtype="f8") + 0.25)
+        np.testing.assert_array_equal(rec["VEC"], np.arange(n * 3, dtype="i4").reshape(n, 3))
+        np.testing.assert_array_equal(rec["Z"], cols[3].array)
+        np.testing.assert_array_equal(rec["NAME"], [b"A", b"B", b"", b"ABCDE"])
+
+
 def test_unchanged_readonly_open_still_uses_fast_path(tmp_fits):
     # Reading data without editing must not disable the verbatim copy (data preserved either way).
     src, out = tmp_fits("fp_src.fits"), tmp_fits("fp_out.fits")
@@ -896,6 +934,15 @@ def test_unchanged_readonly_open_still_uses_fast_path(tmp_fits):
     hdul.close()
     with zf.open(out) as chk:
         np.testing.assert_array_equal(chk[0].data, np.arange(12).reshape(3, 4))
+
+
+def test_pristine_writeto_streams_without_materializing_source(tmp_fits, monkeypatch):
+    src, out = tmp_fits("stream-src.fits"), tmp_fits("stream-out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(4096, dtype="i4"))]).writeto(src, overwrite=True)
+    with zf.open(src) as hdus:
+        monkeypatch.setattr(hdus, "_source_bytes", lambda: pytest.fail("full source allocation"))
+        hdus.writeto(out, overwrite=True)
+    assert open(out, "rb").read() == open(src, "rb").read()
 
 
 def test_table_data_setter_replaces_rows(tmp_fits):

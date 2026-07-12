@@ -34,6 +34,10 @@ def main(root):
                     # Touch the data of each HDU so lazy decode/codec paths execute.
                     for hdu in hdul:
                         _ = None if hdu.data is None else hdu.data.shape
+                        if "DATASUM" in hdu.header and hdu.verify_datasum() != 1:
+                            raise AssertionError("DATASUM verification failed")
+                        if "CHECKSUM" in hdu.header and hdu.verify_checksum() != 1:
+                            raise AssertionError("CHECKSUM verification failed")
                 print("ok:   %s" % path)
             except Exception as exc:  # noqa: BLE001 - report and continue
                 failures += 1

@@ -13,9 +13,9 @@
 import { existsSync as _existsSync, readFileSync, renameSync as _renameSync, rmSync as _rmSync, writeFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 
-/** Read a file into a fresh `Uint8Array`. */
+/** Read a file into a `Uint8Array` (Node's Buffer already is one). */
 export function readFile(path: string): Uint8Array {
-  return new Uint8Array(readFileSync(path));
+  return readFileSync(path);
 }
 
 /**
@@ -24,7 +24,7 @@ export function readFile(path: string): Uint8Array {
  * file reads) and the plain FITS bytes go to `zf_open_memory`.
  */
 export function gunzip(data: Uint8Array): Uint8Array {
-  return new Uint8Array(gunzipSync(data));
+  return gunzipSync(data);
 }
 
 /** Write bytes to a file (overwriting). */

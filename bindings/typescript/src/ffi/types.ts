@@ -66,6 +66,29 @@ export interface NativeLibrary {
   /** Adapted `zf_*` callables keyed by symbol name. */
   readonly fn: Record<string, NativeFn>;
   /**
+   * Copy bytes directly into the final Wasm-owned memory device, avoiding the
+   * generic `buf` staging allocation. Absent when an older Wasm module does not
+   * export the builder ABI.
+   * @internal
+   */
+  readonly openMemoryOwned?: (
+    data: Uint8Array,
+    mode: number,
+    opts: ArrayBufferView | null,
+  ) => { status: number; handle: Ptr };
+  /**
+   * Return one stable JS-owned copy of an in-memory FITS device. Absent when an
+   * older Wasm module does not export the scoped-view ABI.
+   * @internal
+   */
+  readonly copyMemoryBytes?: (handle: Ptr) => { status: number; bytes: Uint8Array };
+  /**
+   * Invoke a synchronous callback with a borrowed view of an in-memory FITS
+   * device. The callback must not retain the view or call back into Wasm.
+   * @internal
+   */
+  readonly withMemoryBytes?: (handle: Ptr, callback: (bytes: Uint8Array) => void) => number;
+  /**
    * Copy `len` bytes at the raw address `ptr` and decode as UTF-8. Provided for
    * the allocate-and-return ABI (`zf_read_key_longstr`) available to low-level
    * callers; the copy must happen before the matching `zf_free`. (The high-level
