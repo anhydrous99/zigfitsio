@@ -17,12 +17,11 @@
 //!     write-back role.
 //!
 //! Bounded memory (NFR-PERF-3): the table iterator allocates exactly one reusable buffer per
-//! bound column — sized to the chunk, never to the row count — and the image walk allocates
-//! nothing at all (the caller owns the scratch). There is **no per-element and no per-chunk
-//! allocation**: the buffers are allocated once, before the chunk loop, and reused for every
-//! chunk. All declared chunk sizes are validated against `Limits` before any allocation
-//! (NFR-SAFE-1). Underlying transfers go through the block-aware `BinTable`/`ImageView` I/O,
-//! which already batches device access in block-aligned windows (NFR-PERF-1).
+//! bound column plus, for dense bindings, one complete-row window shared by every column. The
+//! image walk allocates nothing at all (the caller owns the scratch). There is **no per-element
+//! and no per-chunk allocation**: buffers are allocated once, before the chunk loop, and reused.
+//! The shared row window reduces a multi-column chunk to one physical read and at most one
+//! physical write; sparse wide rows retain the per-column fallback to avoid read amplification.
 //!
 //! Null substitution (FR-IMG-8/FR-ITR-1): both walks expose it. The image walk takes a typed
 //! `ImageOpts.null_sentinel`; the table walk takes a per-`Binding` `null_sentinel` — a
@@ -37,6 +36,7 @@ const errors = @import("errors.zig");
 const limits = @import("limits.zig");
 const block = @import("io/block.zig");
 const binary = @import("table/binary.zig");
+const table_batch = @import("table/batch.zig");
 const common = @import("table/common.zig");
 const image_mod = @import("image.zig");
 
@@ -169,6 +169,8 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             var roles: [fields.len]Role = undefined;
             var slots: [fields.len]u64 = undefined;
             var sentinels: [fields.len]NullSentinel = undefined;
+            var selected_wire_bytes: u64 = 0;
+            var has_write = false;
             inline for (fields, 0..) |f, i| {
                 const b = self.findBinding(f.name) orelse return error.NoSuchColumn;
                 const idx = try table.resolve(b.ref);
@@ -176,6 +178,8 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                 roles[i] = b.role;
                 slots[i] = cellSlots(&table.columns[idx]);
                 sentinels[i] = b.null_sentinel;
+                selected_wire_bytes = try limits.add(selected_wire_bytes, try table.columns[idx].tform.fieldBytes());
+                if (b.role == .out or b.role == .inout) has_write = true;
             }
 
             if (total_rows == 0) return; // empty table: nothing to drive
@@ -202,7 +206,13 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                 const cnt = try limits.mul(rows_per_chunk, slots[i]);
                 total_bytes = try limits.add(total_bytes, try limits.mul(cnt, @sizeOf(Elem)));
             }
-            try limits.ensureWithin(total_bytes, table.fits.limits.max_open_alloc, null);
+            const amplification_limit = std.math.mul(u64, selected_wire_bytes, table_batch.max_amplification) catch std.math.maxInt(u64);
+            const row_window_bytes = limits.mul(rows_per_chunk, table.naxis1) catch std.math.maxInt(u64);
+            const fused_total = limits.add(total_bytes, row_window_bytes) catch std.math.maxInt(u64);
+            const use_row_window = table.naxis1 <= amplification_limit and
+                fused_total <= table.fits.limits.max_open_alloc and
+                std.math.cast(usize, row_window_bytes) != null;
+            try limits.ensureWithin(if (use_row_window) fused_total else total_bytes, table.fits.limits.max_open_alloc, null);
 
             // Allocate one reusable full-chunk buffer per column. `nready` lets the single
             // `defer` free exactly the buffers that were successfully allocated, even on a
@@ -221,18 +231,32 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                 nready = i + 1;
             }
 
+            const raw_owned: ?[]u8 = if (use_row_window)
+                try alloc.alloc(u8, @intCast(row_window_bytes))
+            else
+                null;
+            defer if (raw_owned) |raw| alloc.free(raw);
+
             // Drive the chunks. The `Cols` view is re-sliced to the chunk's `n` rows each pass;
             // the owned buffers are never reallocated.
             var first_row: u64 = 0;
             while (first_row < total_rows) {
                 const n: usize = @intCast(@min(rows_per_chunk, total_rows - first_row));
+                const raw = if (raw_owned) |owned_rows|
+                    owned_rows[0 .. n * @as(usize, @intCast(table.naxis1))]
+                else
+                    null;
+                if (raw) |row_bytes| try table.readRowWindow(first_row, n, row_bytes);
                 var view: Cols = undefined;
                 inline for (fields, 0..) |f, i| {
                     const Elem = std.meta.Elem(f.type);
                     const want: usize = @intCast(@as(u64, n) * slots[i]);
                     const v = @field(owned, f.name)[0..want];
                     if (roles[i] == .in or roles[i] == .inout) {
-                        try table.readColumn(Elem, .{ .index = col_idx[i] }, first_row, v, .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
+                        if (raw) |row_bytes|
+                            try table.decodeColumnWindow(Elem, col_idx[i], n, row_bytes, v, .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
+                        else
+                            try table.readColumn(Elem, .{ .index = col_idx[i] }, first_row, v, .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
                     }
                     @field(view, f.name) = v;
                 }
@@ -242,9 +266,13 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                 inline for (fields, 0..) |f, i| {
                     const Elem = std.meta.Elem(f.type);
                     if (roles[i] == .out or roles[i] == .inout) {
-                        try table.writeColumn(Elem, .{ .index = col_idx[i] }, first_row, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
+                        if (raw) |row_bytes|
+                            try table.encodeColumnWindow(Elem, col_idx[i], n, row_bytes, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
+                        else
+                            try table.writeColumn(Elem, .{ .index = col_idx[i] }, first_row, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
                     }
                 }
+                if (has_write) if (raw) |row_bytes| try table.writeRowWindow(first_row, n, row_bytes);
                 first_row += n;
             }
         }
@@ -332,9 +360,54 @@ fn unravel(linear: u64, axes: []const u64, out: []u64) void {
 // ── tests ──────────────────────────────────────────────────────────────────────────────────
 const testing = std.testing;
 const MemoryDevice = @import("io/memory.zig").MemoryDevice;
+const Device = @import("io/device.zig").Device;
 const Fits = @import("fits.zig").Fits;
 const Hdu = @import("hdu.zig").Hdu;
 const Header = @import("header/header.zig").Header;
+
+const IoCounter = struct {
+    child: Device,
+    reads: usize = 0,
+    writes: usize = 0,
+    fn pread(ctx: *anyopaque, dst: []u8, off: u64) errors.IoError!usize {
+        const self: *IoCounter = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        return self.child.pread(dst, off);
+    }
+    fn pwrite(ctx: *anyopaque, src: []const u8, off: u64) errors.IoError!usize {
+        const self: *IoCounter = @ptrCast(@alignCast(ctx));
+        self.writes += 1;
+        return self.child.pwrite(src, off);
+    }
+    fn getSize(ctx: *anyopaque) errors.IoError!u64 {
+        const self: *IoCounter = @ptrCast(@alignCast(ctx));
+        return self.child.getSize();
+    }
+    fn setSize(ctx: *anyopaque, size: u64) errors.IoError!void {
+        const self: *IoCounter = @ptrCast(@alignCast(ctx));
+        return self.child.setSize(size);
+    }
+    fn sync(ctx: *anyopaque) errors.IoError!void {
+        const self: *IoCounter = @ptrCast(@alignCast(ctx));
+        return self.child.sync();
+    }
+    fn close(_: *anyopaque) void {}
+    const vtable: Device.VTable = .{
+        .pread = pread,
+        .pwrite = pwrite,
+        .getSize = getSize,
+        .setSize = setSize,
+        .sync = sync,
+        .close = close,
+    };
+    fn device(self: *IoCounter) Device {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn reset(self: *IoCounter) void {
+        self.reads = 0;
+        self.writes = 0;
+    }
+};
 
 const ColSpec = struct { tform: []const u8, ttype: []const u8, tnull: ?i64 = null };
 
@@ -409,6 +482,51 @@ test "heterogeneous Cols driven in one pass (inout + out), chunked" {
     try t.readColumn(i32, .{ .name = "COUNT" }, 0, &count_out, .{});
     try testing.expectEqualSlices(f32, &[_]f32{ 2, 4, 6, 8, 10 }, &flux_out);
     try testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3, 4, 5 }, &count_out);
+}
+
+test "dense multi-column chunk uses one physical read and write" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counter: IoCounter = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counter.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const specs = [_]ColSpec{
+        .{ .tform = "1J", .ttype = "A" },
+        .{ .tform = "1J", .ttype = "B" },
+        .{ .tform = "1J", .ttype = "C" },
+        .{ .tform = "1J", .ttype = "D" },
+    };
+    const hdu = try appendTable(&f, alloc, &specs, 100);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    var initial: [100]i32 = undefined;
+    for (&initial, 0..) |*v, i| v.* = @intCast(i);
+    try table.writeColumn(i32, .{ .index = 0 }, 0, &initial, .{});
+    try table.writeColumn(i32, .{ .index = 1 }, 0, &initial, .{});
+
+    const Cols = struct { a: []i32, b: []i32, c: []i32, d: []i32 };
+    const W = struct {
+        fn work(n: usize, cols: *Cols) error{}!void {
+            for (0..n) |i| {
+                cols.c[i] = cols.a[i] + cols.b[i];
+                cols.d[i] += 1;
+            }
+        }
+    };
+    var iter = Iterator(Cols, error{}){ .bindings = &.{
+        .{ .ref = .{ .index = 0 }, .role = .in, .field = "a" },
+        .{ .ref = .{ .index = 1 }, .role = .in, .field = "b" },
+        .{ .ref = .{ .index = 2 }, .role = .out, .field = "c" },
+        .{ .ref = .{ .index = 3 }, .role = .inout, .field = "d" },
+    } };
+
+    counter.reset();
+    try iter.run(&table, 100, W.work);
+    try testing.expectEqual(@as(usize, 1), counter.reads);
+    try testing.expectEqual(@as(usize, 1), counter.writes);
 }
 
 test "auto chunk size (group=0) covers all rows in one pass" {
@@ -504,7 +622,7 @@ test "caller error propagates with its concrete type" {
 }
 
 // An allocator that counts `alloc` calls, to prove the chunked run does no per-element or
-// per-chunk allocation (exactly one buffer per bound column, regardless of row/chunk count).
+// per-chunk allocation (one buffer per column plus one fused row window, regardless of chunks).
 const CountingAllocator = struct {
     child: Allocator,
     n_alloc: usize = 0,
@@ -569,8 +687,8 @@ test "chunked run does no per-element allocation" {
     const before = counting.n_alloc;
     try iter.run(&t, 4, W.work); // 64 rows / 4 = 16 chunks
     const delta = counting.n_alloc - before;
-    // Exactly two buffers (one per bound column) for 16 chunks ⇒ no per-chunk allocation.
-    try testing.expectEqual(@as(usize, 2), delta);
+    // Two typed buffers plus one shared row window for 16 chunks ⇒ no per-chunk allocation.
+    try testing.expectEqual(@as(usize, 3), delta);
 }
 
 test "unbound Cols field is a typed error" {
