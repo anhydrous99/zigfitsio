@@ -370,18 +370,27 @@ pub const CellPlan = struct {
 /// Operation-scoped VLA read state. Heap geometry is resolved once and device size is queried
 /// lazily, at most once, when the first non-empty descriptor is followed.
 pub const ReadContext = struct {
+    /// Table whose heap geometry and device size this context snapshots.
+    table: *const BinTable,
     geom: HeapGeometry,
     dev_size: ?u64 = null,
 
     /// Resolve immutable heap geometry for a sequence of descriptor plans.
     pub fn init(table: *const BinTable) GeomError!ReadContext {
-        return .{ .geom = try heapGeometry(table) };
+        return .{ .table = table, .geom = try heapGeometry(table) };
     }
 
     /// Validate an already-read descriptor and resolve its absolute payload span without reading
     /// the heap. The returned plan can be carried directly into a later payload read.
-    pub fn plan(self: *ReadContext, table: *const BinTable, spec: VlaSpec, desc: Descriptor) LayoutError!CellPlan {
-        return planDescriptor(table, spec, desc, &self.geom, &self.dev_size);
+    pub fn plan(self: *ReadContext, spec: VlaSpec, desc: Descriptor) LayoutError!CellPlan {
+        return planDescriptor(self.table, spec, desc, &self.geom, &self.dev_size, true);
+    }
+
+    /// Resolve an opaque raw payload such as a compressed tile stream. Raw streams retain heap,
+    /// byte, data-unit, and device bounds but are not caller-visible VLA element transfers, so
+    /// `max_vla_elems` does not apply to their encoded byte/word count.
+    pub fn planRaw(self: *ReadContext, spec: VlaSpec, desc: Descriptor) LayoutError!CellPlan {
+        return planDescriptor(self.table, spec, desc, &self.geom, &self.dev_size, false);
     }
 };
 
@@ -395,6 +404,7 @@ fn planDescriptor(
     desc: Descriptor,
     geom: *const HeapGeometry,
     dev_size: *?u64,
+    enforce_elem_limit: bool,
 ) LayoutError!CellPlan {
     if (desc.len < 0) return error.BadDescriptor;
 
@@ -409,7 +419,7 @@ fn planDescriptor(
     const slots = try slotCount(spec.elem, len);
 
     // Validate configured per-cell limits before a caller allocates the packed output.
-    try limits.ensureWithin(len, table.fits.limits.max_vla_elems, null);
+    if (enforce_elem_limit) try limits.ensureWithin(len, table.fits.limits.max_vla_elems, null);
     try limits.ensureWithin(bytes, table.fits.limits.max_heap_bytes, null);
 
     // A forged descriptor is structural corruption, even when its arithmetic alone overflowed.
@@ -440,7 +450,7 @@ pub fn readVlaCell(alloc: Allocator, table: *BinTable, col: ColumnRef, row: u64,
     const desc = try readDescAt(table, column, row);
     const geom = try heapGeometry(table);
     var dev_size: ?u64 = null;
-    const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+    const plan = try planDescriptor(table, spec, desc, &geom, &dev_size, true);
     const n: usize = std.math.cast(usize, plan.slots) orelse return error.LimitExceeded;
     const out = try alloc.alloc(T, n);
     errdefer alloc.free(out);
@@ -463,7 +473,7 @@ pub fn vlaColumnLayout(table: *BinTable, col: ColumnRef, first_row: u64, offsets
     for (0..offsets.len - 1) |i| {
         const row = first_row + @as(u64, @intCast(i));
         const desc = try readDescAt(table, column, row);
-        const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+        const plan = try planDescriptor(table, spec, desc, &geom, &dev_size, true);
         total = try limits.add(total, plan.slots);
         offsets[i + 1] = total;
     }
@@ -490,7 +500,7 @@ pub fn readVlaColumnInto(
     var row_delta: u64 = 0;
     while (row_delta < nrows) : (row_delta += 1) {
         const desc = try readDescAt(table, column, first_row + row_delta);
-        const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+        const plan = try planDescriptor(table, spec, desc, &geom, &dev_size, true);
         const slots: usize = std.math.cast(usize, plan.slots) orelse return error.LimitExceeded;
         if (slots > out.len - cursor) return error.CellOutOfRange;
         if (slots != 0) {
@@ -872,7 +882,7 @@ pub const HeapManager = struct {
             var row: u64 = 0;
             while (row < table.naxis2) : (row += 1) {
                 const desc = try readDescAt(table, column, row);
-                const plan = try planDescriptor(table, spec, desc, &geom, &dev_size);
+                const plan = try planDescriptor(table, spec, desc, &geom, &dev_size, true);
                 if (plan.len == 0) continue;
                 const heap_off: u64 = @intCast(desc.off); // validated non-negative by plan
                 const heap_end = std.math.add(u64, heap_off, plan.bytes) catch return error.BadDescriptor;
