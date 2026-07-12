@@ -575,21 +575,7 @@ pub const BinTable = struct {
 
     fn readCellInto(self: *BinTable, comptime T: type, column: *const Column, row: u64, out: []T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
         const off = try self.cellOffset(column, row);
-        const dev = self.fits.dev;
-        switch (column.tform.type) {
-            .logical => try readLogical(T, dev, off, out, mode, opts),
-            .bit => try readBits(T, dev, off, out, mode),
-            .char => try readChars(T, dev, off, out, mode, column),
-            .byte => try readRun(u8, T, dev, off, out, column, mode, opts),
-            .int16 => try readRun(i16, T, dev, off, out, column, mode, opts),
-            .int32 => try readRun(i32, T, dev, off, out, column, mode, opts),
-            .int64 => try readRun(i64, T, dev, off, out, column, mode, opts),
-            .float32 => try readRun(f32, T, dev, off, out, column, mode, opts),
-            .float64 => try readRun(f64, T, dev, off, out, column, mode, opts),
-            .complex32 => try readRun(f32, T, dev, off, out, column, mode, opts),
-            .complex64 => try readRun(f64, T, dev, off, out, column, mode, opts),
-            .vla32, .vla64 => return error.BadDescriptor,
-        }
+        try readCellFrom(T, self.fits.dev, off, column, out, mode, opts);
     }
 
     fn writeCellInto(self: *BinTable, comptime T: type, column: *const Column, row: u64, in: []const T, mode: Mode, opts: WriteOpts(T)) AccessError!void {
@@ -611,6 +597,71 @@ pub const BinTable = struct {
         }
     }
 };
+
+// A read-only, allocation-free Device view over caller-owned bytes. It lets prefetched table-row
+// fields reuse the exact fixed-cell conversion path without performing another physical read.
+const BorrowedDevice = struct {
+    bytes: []const u8,
+
+    fn pread(ctx: *anyopaque, out: []u8, offset: u64) errors.IoError!usize {
+        const self: *BorrowedDevice = @ptrCast(@alignCast(ctx));
+        const start = std.math.cast(usize, offset) orelse return 0;
+        if (start >= self.bytes.len) return 0;
+        const n = @min(out.len, self.bytes.len - start);
+        @memcpy(out[0..n], self.bytes[start..][0..n]);
+        return n;
+    }
+
+    fn getSize(ctx: *anyopaque) errors.IoError!u64 {
+        const self: *BorrowedDevice = @ptrCast(@alignCast(ctx));
+        return @intCast(self.bytes.len);
+    }
+
+    fn sync(_: *anyopaque) errors.IoError!void {}
+    fn close(_: *anyopaque) void {}
+
+    const vtable: Device.VTable = .{
+        .pread = pread,
+        .pwrite = null,
+        .getSize = getSize,
+        .setSize = null,
+        .sync = sync,
+        .close = close,
+    };
+
+    fn device(self: *BorrowedDevice) Device {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+/// Decode one already-read fixed-width table cell under the same bulk conversion policy as
+/// `BinTable.readColumn`, without touching the table's physical Device.
+pub fn decodeCellBytes(comptime T: type, column: *const Column, raw: []const u8, out: []T, opts: ReadOpts(T)) AccessError!void {
+    if (column.tform.type.isVla()) return error.BadDescriptor;
+    if (out.len != cellSlots(column)) return error.CellOutOfRange;
+    const field_bytes = try column.tform.fieldBytes();
+    const field_len = std.math.cast(usize, field_bytes) orelse return error.LimitExceeded;
+    if (raw.len != field_len) return error.CellOutOfRange;
+    var borrowed: BorrowedDevice = .{ .bytes = raw };
+    try readCellFrom(T, borrowed.device(), 0, column, out, .bulk, opts);
+}
+
+fn readCellFrom(comptime T: type, dev: Device, off: u64, column: *const Column, out: []T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
+    switch (column.tform.type) {
+        .logical => try readLogical(T, dev, off, out, mode, opts),
+        .bit => try readBits(T, dev, off, out, mode),
+        .char => try readChars(T, dev, off, out, mode, column),
+        .byte => try readRun(u8, T, dev, off, out, column, mode, opts),
+        .int16 => try readRun(i16, T, dev, off, out, column, mode, opts),
+        .int32 => try readRun(i32, T, dev, off, out, column, mode, opts),
+        .int64 => try readRun(i64, T, dev, off, out, column, mode, opts),
+        .float32 => try readRun(f32, T, dev, off, out, column, mode, opts),
+        .float64 => try readRun(f64, T, dev, off, out, column, mode, opts),
+        .complex32 => try readRun(f32, T, dev, off, out, column, mode, opts),
+        .complex64 => try readRun(f64, T, dev, off, out, column, mode, opts),
+        .vla32, .vla64 => return error.BadDescriptor,
+    }
+}
 
 /// Per-row element count of a column in caller-buffer slots: `repeat` for scalar/`A`/`X`
 /// (one slot per byte / per bit), `2×repeat` for complex (real, imaginary).

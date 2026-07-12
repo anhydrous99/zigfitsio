@@ -291,14 +291,30 @@ fn readDescAt(table: *const BinTable, column: *const Column, row: u64) Descripto
     switch (column.tform.type) {
         .vla32 => {
             try table.fits.dev.readAll(buf[0..8], off);
-            return .{ .len = endian.read(i32, buf[0..4]), .off = endian.read(i32, buf[4..8]) };
+            return decodeDescriptor(column, buf[0..8]);
         },
         .vla64 => {
             try table.fits.dev.readAll(buf[0..16], off);
-            return .{ .len = endian.read(i64, buf[0..8]), .off = endian.read(i64, buf[8..16]) };
+            return decodeDescriptor(column, buf[0..16]);
         },
         else => unreachable,
     }
+}
+
+/// Decode one already-read P/Q descriptor from its big-endian table-row bytes. This is the
+/// I/O-free counterpart of `readDescriptor`, used by callers that fetch complete row windows.
+pub fn decodeDescriptor(column: *const Column, raw: []const u8) errors.TableError!Descriptor {
+    return switch (column.tform.type) {
+        .vla32 => if (raw.len == 8)
+            .{ .len = endian.read(i32, raw[0..4]), .off = endian.read(i32, raw[4..8]) }
+        else
+            error.BadDescriptor,
+        .vla64 => if (raw.len == 16)
+            .{ .len = endian.read(i64, raw[0..8]), .off = endian.read(i64, raw[8..16]) }
+        else
+            error.BadDescriptor,
+        else => error.BadDescriptor,
+    };
 }
 
 fn writeDescAt(table: *BinTable, column: *const Column, row: u64, desc: Descriptor) DescriptorError!void {
@@ -339,7 +355,7 @@ pub fn setDescriptor(table: *BinTable, col: ColumnRef, row: u64, desc: Descripto
 
 // ── reading ──────────────────────────────────────────────────────────────────────────────
 
-const CellPlan = struct {
+pub const CellPlan = struct {
     /// Logical FITS elements (complex values count once here).
     len: u64,
     /// Caller-visible scalar slots (complex values count twice here).
@@ -348,6 +364,23 @@ const CellPlan = struct {
     bytes: u64,
     /// Absolute payload offset. Null for an empty cell, whose descriptor offset is undefined.
     abs: ?u64,
+};
+
+/// Operation-scoped VLA read state. Heap geometry is resolved once and device size is queried
+/// lazily, at most once, when the first non-empty descriptor is followed.
+pub const ReadContext = struct {
+    geom: HeapGeometry,
+    dev_size: ?u64 = null,
+
+    pub fn init(table: *const BinTable) GeomError!ReadContext {
+        return .{ .geom = try heapGeometry(table) };
+    }
+
+    /// Validate an already-read descriptor and resolve its absolute payload span without reading
+    /// the heap. The returned plan can be carried directly into a later payload read.
+    pub fn plan(self: *ReadContext, table: *const BinTable, spec: VlaSpec, desc: Descriptor) LayoutError!CellPlan {
+        return planDescriptor(table, spec, desc, &self.geom, &self.dev_size);
+    }
 };
 
 /// Validate one already-read descriptor and resolve its payload. `dev_size` is populated lazily

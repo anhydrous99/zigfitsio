@@ -16,6 +16,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
   updates. This centralizes HIERARCH/CONTINUE handling and substantially reduces binding
   crossings for large headers and batch edits. (#59)
 
+### Changed
+- **Core / Compression**: tiled-image reads now fetch compact descriptor and per-tile metadata
+  rows in bounded windows, carry the selected descriptor through heap validation and decoding,
+  and share heap geometry/device-size checks across the operation. Tiled-table cells likewise
+  reuse their first descriptor read, eliminating repeated small reads and HTTP Range requests.
+
 ## [0.1.5] - 2026-07-11
 
 ### Added
