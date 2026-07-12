@@ -21,6 +21,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
   rows in bounded windows, carry the selected descriptor through heap validation and decoding,
   and share heap geometry/device-size checks across the operation. Tiled-table cells likewise
   reuse their first descriptor read, eliminating repeated small reads and HTTP Range requests.
+- **Core / Performance**: binary and ASCII table column reads now batch dense strided fields
+  through bounded row windows instead of issuing one device call per row; true whole-row
+  column writes are batched as well. Binary-table iterators share one read window across every
+  bound column and fuse writes when their outputs cover the complete row. Sparse wide rows and
+  partial writes retain field-level I/O to cap amplification and preserve non-overlapping
+  concurrent updates through distinct handles.
 
 ## [0.1.5] - 2026-07-11
 
