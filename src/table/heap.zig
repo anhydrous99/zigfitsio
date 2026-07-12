@@ -355,6 +355,7 @@ pub fn setDescriptor(table: *BinTable, col: ColumnRef, row: u64, desc: Descripto
 
 // ── reading ──────────────────────────────────────────────────────────────────────────────
 
+/// Validated shape and absolute location of one VLA heap payload.
 pub const CellPlan = struct {
     /// Logical FITS elements (complex values count once here).
     len: u64,
@@ -372,6 +373,7 @@ pub const ReadContext = struct {
     geom: HeapGeometry,
     dev_size: ?u64 = null,
 
+    /// Resolve immutable heap geometry for a sequence of descriptor plans.
     pub fn init(table: *const BinTable) GeomError!ReadContext {
         return .{ .geom = try heapGeometry(table) };
     }
