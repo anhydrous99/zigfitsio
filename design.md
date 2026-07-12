@@ -1431,7 +1431,7 @@ section for the mechanism; this table is the completeness check.)
 | **Interop (outbound)** | a CI job opens **every `zigfitsio`-written corpus file with CFITSIO and Astropy** and asserts success — the explicit check for the outbound MUST (beyond the implicit conformance/round-trip guarantee). | `NFR-INTEROP-1` (outbound) |
 | **Fuzz** | `test/fuzz/` harnesses for the **header** and **table** parsers; crashes/leaks are release blockers. Run under `zig build fuzz`; seeds from the corpus. | `NFR-SAFE-2` |
 | **Leak** | the whole suite runs under `std.testing.allocator`; zero leaks required. | `NFR-MEM-2` |
-| **Checksum parity (golden)** | committed vector: a CFITSIO-written ASCII table with `DATASUM = 628729719`; the suite recomputes and must match, **and** must differ under zero-fill — locking the `FR-SUM-1` space-fill rule (§16). | `NFR-TEST-1`, `NFR-INTEROP-1` |
+| **Checksum parity (golden)** | committed vector: a CFITSIO-written ASCII table with `DATASUM = 1837006711`; the suite recomputes and must match, **and** must differ under zero-fill — locking the `FR-SUM-1` space-fill rule (§16). | `NFR-TEST-1`, `NFR-INTEROP-1` |
 | **API regression (Zig 0.16)** | compile-fixtures asserting the corrected snippets build and the three original defects do **not** (field/method collision, method-on-error-union, removed `std.BoundedArray`). | `GC-3`, `GC-4` |
 
 **Realized (this branch).** The cross-validation, conformance, both interop legs, and the

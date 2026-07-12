@@ -184,6 +184,7 @@ pub export fn zf_create_file(path_ptr: [*]const u8, path_len: usize, opts: ?*con
 /// Open a FITS file held in memory (the bytes are copied into a handle-owned buffer). `mode`
 /// 2 (create) is treated as read-write; use `zf_create_memory` to build a new in-RAM file.
 pub export fn zf_open_memory(buf_ptr: [*]const u8, buf_len: usize, mode: c_int, opts: ?*const ZfOpenOpts, out: *?*Handle) c_int {
+    out.* = null;
     const owned = gpa.dupe(u8, buf_ptr[0..buf_len]) catch return abi.fail(null, error.OutOfMemory);
     return openOwnedMemory(owned, mode, opts, out);
 }

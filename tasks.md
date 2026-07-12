@@ -404,7 +404,7 @@ Every task must satisfy all of these before it is `done`:
   `{match,mismatch,not_present}`; **an explicit `updateChecksum()` operation** (FR-SUM-3) registered into
   the `FITS-1b.flush` `checksum_on_close` hook.
 - **Acceptance:** Appendix J example ⇒ `DATASUM='2503531142'` / `CHECKSUM='hcHjjc9ghcEghc9g'`; the
-  CFITSIO ASCII-table vector recomputes to `628729719` space-padded and `1302441855` zero-padded;
+  CFITSIO ASCII-table vector recomputes to `1837006711` space-padded and `1449617504` zero-padded;
   `updateChecksum()` is callable as a standalone op. (Committed-fixture parity lives in X-SUM.)
 
 ---

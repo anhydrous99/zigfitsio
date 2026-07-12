@@ -171,7 +171,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y libcfitsio-dev libcfitsio-bin pkg-config
+          sudo apt-get install -y fitsverify libcfitsio-dev libcfitsio-bin pkg-config
           python -m pip install --upgrade pip
           python -m pip install -r interop/requirements.txt
       - name: Inbound — Astropy reads & cross-validates every committed CFITSIO golden (X-XVAL)
