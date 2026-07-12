@@ -32,6 +32,7 @@ const Fits = @import("../fits.zig").Fits;
 const Hdu = @import("../hdu.zig").Hdu;
 const Device = @import("../io/device.zig").Device;
 const common = @import("common.zig");
+const batch = @import("batch.zig");
 const BinTform = common.BinTform;
 const BinaryType = common.BinaryType;
 const name_mod = @import("../header/name.zig");
@@ -197,10 +198,31 @@ pub const BinTable = struct {
         const nrows: u64 = out.len / sl;
         const last = std.math.add(u64, first_row, nrows) catch return error.RowOutOfRange;
         if (last > self.naxis2) return error.RowOutOfRange;
-        var r: u64 = 0;
-        while (r < nrows) : (r += 1) {
-            const base: usize = @intCast(r * slots);
-            try self.readCellInto(T, column, first_row + r, out[base..][0..sl], .bulk, opts);
+        const field_bytes = try column.tform.fieldBytes();
+        const plan = batch.Plan.init(self.naxis1, field_bytes, nrows, self.fits.limits.max_open_alloc) orelse {
+            var r: u64 = 0;
+            while (r < nrows) : (r += 1) {
+                const base: usize = @intCast(r * slots);
+                try self.readCellInto(T, column, first_row + r, out[base..][0..sl], .bulk, opts);
+            }
+            return;
+        };
+        var storage: [batch.target_bytes]u8 = undefined;
+        const window = storage[0..plan.window_bytes];
+        var done: u64 = 0;
+        while (done < nrows) {
+            const rows: usize = @intCast(@min(@as(u64, plan.rows_per_window), nrows - done));
+            const bytes = rows * @as(usize, @intCast(self.naxis1));
+            const row0 = first_row + done;
+            try self.fits.dev.readAll(window[0..bytes], try self.rowOffset(row0));
+            var borrowed: batch.BorrowedDevice = .{ .bytes = window[0..bytes] };
+            const dev = borrowed.device();
+            for (0..rows) |r| {
+                const out_base: usize = @intCast((done + r) * slots);
+                const off = @as(u64, r) * self.naxis1 + column.byte_offset;
+                try readCellFrom(T, dev, off, column, out[out_base..][0..sl], .bulk, opts);
+            }
+            done += rows;
         }
     }
 
@@ -232,10 +254,44 @@ pub const BinTable = struct {
         const nrows: u64 = in.len / sl;
         const last = std.math.add(u64, first_row, nrows) catch return error.RowOutOfRange;
         if (last > self.naxis2) return error.RowOutOfRange;
-        var r: u64 = 0;
-        while (r < nrows) : (r += 1) {
-            const base: usize = @intCast(r * slots);
-            try self.writeCellInto(T, column, first_row + r, in[base..][0..sl], .bulk, opts);
+        const field_bytes = try column.tform.fieldBytes();
+        const whole_row = column.byte_offset == 0 and field_bytes == self.naxis1;
+        // A partial-column whole-row read-modify-write can overwrite a concurrent update to an
+        // adjacent column made through another handle. Preserve the positioned, non-overlapping
+        // write contract for partial fields; only true whole-row columns can be safely batched.
+        if (!whole_row) {
+            var r: u64 = 0;
+            while (r < nrows) : (r += 1) {
+                const base: usize = @intCast(r * slots);
+                try self.writeCellInto(T, column, first_row + r, in[base..][0..sl], .bulk, opts);
+            }
+            return;
+        }
+        const plan = batch.Plan.init(self.naxis1, field_bytes, nrows, self.fits.limits.max_open_alloc) orelse {
+            var r: u64 = 0;
+            while (r < nrows) : (r += 1) {
+                const base: usize = @intCast(r * slots);
+                try self.writeCellInto(T, column, first_row + r, in[base..][0..sl], .bulk, opts);
+            }
+            return;
+        };
+        var storage: [batch.target_bytes]u8 = undefined;
+        const window = storage[0..plan.window_bytes];
+        var done: u64 = 0;
+        while (done < nrows) {
+            const rows: usize = @intCast(@min(@as(u64, plan.rows_per_window), nrows - done));
+            const bytes = rows * @as(usize, @intCast(self.naxis1));
+            const row0 = first_row + done;
+            const physical_off = try self.rowOffset(row0);
+            var borrowed: batch.BorrowedDevice = .{ .bytes = window[0..bytes] };
+            const dev = borrowed.device();
+            for (0..rows) |r| {
+                const in_base: usize = @intCast((done + r) * slots);
+                const off = @as(u64, r) * self.naxis1 + column.byte_offset;
+                try writeCellFrom(T, dev, off, column, in[in_base..][0..sl], .bulk, opts);
+            }
+            try self.fits.dev.writeAll(window[0..bytes], physical_off);
+            done += rows;
         }
     }
 
@@ -248,6 +304,72 @@ pub const BinTable = struct {
         if (in.len != cellSlots(column)) return error.CellOutOfRange;
         if (row >= self.naxis2) return error.RowOutOfRange;
         try self.writeCellInto(T, column, row, in, .scalar, opts);
+    }
+
+    /// Read complete consecutive rows into a caller-owned window.  This is primarily used by
+    /// the multi-column iterator so every bound column can be decoded from one physical read.
+    pub fn readRowWindow(self: *BinTable, first_row: u64, rows: usize, raw: []u8) AccessError!void {
+        const end = std.math.add(u64, first_row, @intCast(rows)) catch return error.RowOutOfRange;
+        if (end > self.naxis2) return error.RowOutOfRange;
+        const want64 = try limits.mul(@intCast(rows), self.naxis1);
+        const want = std.math.cast(usize, want64) orelse return error.LimitExceeded;
+        if (raw.len != want) return error.CellOutOfRange;
+        if (want > 0) try self.fits.dev.readAll(raw, try self.rowOffset(first_row));
+    }
+
+    /// Write complete consecutive rows previously obtained with `readRowWindow`.
+    pub fn writeRowWindow(self: *BinTable, first_row: u64, rows: usize, raw: []const u8) AccessError!void {
+        if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
+        const end = std.math.add(u64, first_row, @intCast(rows)) catch return error.RowOutOfRange;
+        if (end > self.naxis2) return error.RowOutOfRange;
+        const want64 = try limits.mul(@intCast(rows), self.naxis1);
+        const want = std.math.cast(usize, want64) orelse return error.LimitExceeded;
+        if (raw.len != want) return error.CellOutOfRange;
+        if (want > 0) try self.fits.dev.writeAll(raw, try self.rowOffset(first_row));
+    }
+
+    /// Decode one column from a complete-row window without touching the physical device.
+    pub fn decodeColumnWindow(self: *BinTable, comptime T: type, column_index: u16, rows: usize, raw: []u8, out: []T, opts: ReadOpts(T)) AccessError!void {
+        if (column_index >= self.columns.len) return error.NoSuchColumn;
+        const column = &self.columns[column_index];
+        if (column.tform.type.isVla()) return error.BadDescriptor;
+        const slots = cellSlots(column);
+        const want_out64 = std.math.mul(u64, @intCast(rows), slots) catch return error.CellOutOfRange;
+        const want_out = std.math.cast(usize, want_out64) orelse return error.CellOutOfRange;
+        if (out.len != want_out) return error.CellOutOfRange;
+        const want_raw64 = try limits.mul(@intCast(rows), self.naxis1);
+        const want_raw = std.math.cast(usize, want_raw64) orelse return error.CellOutOfRange;
+        if (raw.len != want_raw) return error.CellOutOfRange;
+        const sl = std.math.cast(usize, slots) orelse return error.CellOutOfRange;
+        var borrowed: batch.BorrowedDevice = .{ .bytes = raw };
+        const dev = borrowed.device();
+        for (0..rows) |r| {
+            const base = r * sl;
+            const off = @as(u64, r) * self.naxis1 + column.byte_offset;
+            try readCellFrom(T, dev, off, column, out[base..][0..sl], .bulk, opts);
+        }
+    }
+
+    /// Encode one column into a complete-row window without touching the physical device.
+    pub fn encodeColumnWindow(self: *BinTable, comptime T: type, column_index: u16, rows: usize, raw: []u8, in: []const T, opts: WriteOpts(T)) AccessError!void {
+        if (column_index >= self.columns.len) return error.NoSuchColumn;
+        const column = &self.columns[column_index];
+        if (column.tform.type.isVla()) return error.BadDescriptor;
+        const slots = cellSlots(column);
+        const want_in64 = std.math.mul(u64, @intCast(rows), slots) catch return error.CellOutOfRange;
+        const want_in = std.math.cast(usize, want_in64) orelse return error.CellOutOfRange;
+        if (in.len != want_in) return error.CellOutOfRange;
+        const want_raw64 = try limits.mul(@intCast(rows), self.naxis1);
+        const want_raw = std.math.cast(usize, want_raw64) orelse return error.CellOutOfRange;
+        if (raw.len != want_raw) return error.CellOutOfRange;
+        const sl = std.math.cast(usize, slots) orelse return error.CellOutOfRange;
+        var borrowed: batch.BorrowedDevice = .{ .bytes = raw };
+        const dev = borrowed.device();
+        for (0..rows) |r| {
+            const base = r * sl;
+            const off = @as(u64, r) * self.naxis1 + column.byte_offset;
+            try writeCellFrom(T, dev, off, column, in[base..][0..sl], .bulk, opts);
+        }
     }
 
     // ── BTB-3b: structural row & column editing (FR-BTB-6; design §13.5; FITS 4.0 §7.3) ──────
@@ -568,49 +690,59 @@ pub const BinTable = struct {
     // ── internals ──────────────────────────────────────────────────────────────────────────
 
     fn cellOffset(self: *const BinTable, column: *const Column, row: u64) errors.LimitError!u64 {
-        const row_off = try limits.mul(row, self.naxis1);
-        const base = try limits.add(self.hdu.data_off, row_off);
+        const base = try self.rowOffset(row);
         return limits.add(base, column.byte_offset);
+    }
+
+    fn rowOffset(self: *const BinTable, row: u64) errors.LimitError!u64 {
+        const row_off = try limits.mul(row, self.naxis1);
+        return limits.add(self.hdu.data_off, row_off);
     }
 
     fn readCellInto(self: *BinTable, comptime T: type, column: *const Column, row: u64, out: []T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
         const off = try self.cellOffset(column, row);
-        const dev = self.fits.dev;
-        switch (column.tform.type) {
-            .logical => try readLogical(T, dev, off, out, mode, opts),
-            .bit => try readBits(T, dev, off, out, mode),
-            .char => try readChars(T, dev, off, out, mode, column),
-            .byte => try readRun(u8, T, dev, off, out, column, mode, opts),
-            .int16 => try readRun(i16, T, dev, off, out, column, mode, opts),
-            .int32 => try readRun(i32, T, dev, off, out, column, mode, opts),
-            .int64 => try readRun(i64, T, dev, off, out, column, mode, opts),
-            .float32 => try readRun(f32, T, dev, off, out, column, mode, opts),
-            .float64 => try readRun(f64, T, dev, off, out, column, mode, opts),
-            .complex32 => try readRun(f32, T, dev, off, out, column, mode, opts),
-            .complex64 => try readRun(f64, T, dev, off, out, column, mode, opts),
-            .vla32, .vla64 => return error.BadDescriptor,
-        }
+        try readCellFrom(T, self.fits.dev, off, column, out, mode, opts);
     }
 
     fn writeCellInto(self: *BinTable, comptime T: type, column: *const Column, row: u64, in: []const T, mode: Mode, opts: WriteOpts(T)) AccessError!void {
         const off = try self.cellOffset(column, row);
-        const dev = self.fits.dev;
-        switch (column.tform.type) {
-            .logical => try writeLogical(T, dev, off, in, opts),
-            .bit => try writeBits(T, dev, off, in),
-            .char => try writeChars(T, dev, off, in, column),
-            .byte => try writeRun(u8, T, dev, off, in, column, mode, opts),
-            .int16 => try writeRun(i16, T, dev, off, in, column, mode, opts),
-            .int32 => try writeRun(i32, T, dev, off, in, column, mode, opts),
-            .int64 => try writeRun(i64, T, dev, off, in, column, mode, opts),
-            .float32 => try writeRun(f32, T, dev, off, in, column, mode, opts),
-            .float64 => try writeRun(f64, T, dev, off, in, column, mode, opts),
-            .complex32 => try writeRun(f32, T, dev, off, in, column, mode, opts),
-            .complex64 => try writeRun(f64, T, dev, off, in, column, mode, opts),
-            .vla32, .vla64 => return error.BadDescriptor,
-        }
+        try writeCellFrom(T, self.fits.dev, off, column, in, mode, opts);
     }
 };
+
+fn readCellFrom(comptime T: type, dev: Device, off: u64, column: *const Column, out: []T, mode: Mode, opts: ReadOpts(T)) AccessError!void {
+    switch (column.tform.type) {
+        .logical => try readLogical(T, dev, off, out, mode, opts),
+        .bit => try readBits(T, dev, off, out, mode),
+        .char => try readChars(T, dev, off, out, mode, column),
+        .byte => try readRun(u8, T, dev, off, out, column, mode, opts),
+        .int16 => try readRun(i16, T, dev, off, out, column, mode, opts),
+        .int32 => try readRun(i32, T, dev, off, out, column, mode, opts),
+        .int64 => try readRun(i64, T, dev, off, out, column, mode, opts),
+        .float32 => try readRun(f32, T, dev, off, out, column, mode, opts),
+        .float64 => try readRun(f64, T, dev, off, out, column, mode, opts),
+        .complex32 => try readRun(f32, T, dev, off, out, column, mode, opts),
+        .complex64 => try readRun(f64, T, dev, off, out, column, mode, opts),
+        .vla32, .vla64 => return error.BadDescriptor,
+    }
+}
+
+fn writeCellFrom(comptime T: type, dev: Device, off: u64, column: *const Column, in: []const T, mode: Mode, opts: WriteOpts(T)) AccessError!void {
+    switch (column.tform.type) {
+        .logical => try writeLogical(T, dev, off, in, opts),
+        .bit => try writeBits(T, dev, off, in),
+        .char => try writeChars(T, dev, off, in, column),
+        .byte => try writeRun(u8, T, dev, off, in, column, mode, opts),
+        .int16 => try writeRun(i16, T, dev, off, in, column, mode, opts),
+        .int32 => try writeRun(i32, T, dev, off, in, column, mode, opts),
+        .int64 => try writeRun(i64, T, dev, off, in, column, mode, opts),
+        .float32 => try writeRun(f32, T, dev, off, in, column, mode, opts),
+        .float64 => try writeRun(f64, T, dev, off, in, column, mode, opts),
+        .complex32 => try writeRun(f32, T, dev, off, in, column, mode, opts),
+        .complex64 => try writeRun(f64, T, dev, off, in, column, mode, opts),
+        .vla32, .vla64 => return error.BadDescriptor,
+    }
+}
 
 /// Per-row element count of a column in caller-buffer slots: `repeat` for scalar/`A`/`X`
 /// (one slot per byte / per bit), `2×repeat` for complex (real, imaginary).
@@ -1135,6 +1267,57 @@ const testing = std.testing;
 const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
 const Header = @import("../header/header.zig").Header;
 
+const CountingDevice = struct {
+    child: Device,
+    reads: usize = 0,
+    writes: usize = 0,
+    trigger_offset: ?u64 = null,
+    trigger_bytes: [4]u8 = undefined,
+
+    fn pread(ctx: *anyopaque, dst: []u8, offset: u64) errors.IoError!usize {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        return self.child.pread(dst, offset);
+    }
+    fn pwrite(ctx: *anyopaque, src: []const u8, offset: u64) errors.IoError!usize {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        self.writes += 1;
+        if (self.trigger_offset) |trigger_offset| {
+            self.trigger_offset = null;
+            try self.child.writeAll(&self.trigger_bytes, trigger_offset);
+        }
+        return self.child.pwrite(src, offset);
+    }
+    fn getSize(ctx: *anyopaque) errors.IoError!u64 {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        return self.child.getSize();
+    }
+    fn setSize(ctx: *anyopaque, size: u64) errors.IoError!void {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        return self.child.setSize(size);
+    }
+    fn sync(ctx: *anyopaque) errors.IoError!void {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        return self.child.sync();
+    }
+    fn close(_: *anyopaque) void {}
+    const vtable: Device.VTable = .{
+        .pread = pread,
+        .pwrite = pwrite,
+        .getSize = getSize,
+        .setSize = setSize,
+        .sync = sync,
+        .close = close,
+    };
+    fn device(self: *CountingDevice) Device {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn reset(self: *CountingDevice) void {
+        self.reads = 0;
+        self.writes = 0;
+    }
+};
+
 const ColSpec = struct {
     tform: []const u8,
     ttype: ?[]const u8 = null,
@@ -1176,6 +1359,93 @@ fn buildHeader(alloc: Allocator, specs: []const ColSpec, nrows: u64, naxis1_over
 fn buildBinTable(f: *Fits, alloc: Allocator, specs: []const ColSpec, nrows: u64, naxis1_override: ?u64) !*Hdu {
     const h = try buildHeader(alloc, specs, nrows, naxis1_override);
     return f.appendHdu(h);
+}
+
+test "dense column reads use row windows and partial writes stay field-only" {
+    const alloc = testing.allocator;
+    const nrows = 10_000;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{ .limits = .{ .max_open_alloc = 4096 } });
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const specs = [_]ColSpec{
+        .{ .tform = "1J", .ttype = "A" },
+        .{ .tform = "1J", .ttype = "B" },
+        .{ .tform = "1J", .ttype = "C" },
+        .{ .tform = "1J", .ttype = "D" },
+    };
+    const hdu = try buildBinTable(&f, alloc, &specs, nrows, null);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    const values = try alloc.alloc(i32, nrows);
+    defer alloc.free(values);
+    for (values, 0..) |*v, i| v.* = @intCast(i);
+
+    counted.reset();
+    try table.writeColumn(i32, .{ .index = 0 }, 0, values, .{});
+    try testing.expectEqual(@as(usize, 0), counted.reads);
+    try testing.expectEqual(@as(usize, nrows), counted.writes);
+
+    @memset(values, -1);
+    counted.reset();
+    try table.readColumn(i32, .{ .index = 0 }, 0, values, .{});
+    try testing.expectEqual(@as(usize, 40), counted.reads);
+    try testing.expectEqual(@as(usize, 0), counted.writes);
+    for (values, 0..) |v, i| try testing.expectEqual(@as(i32, @intCast(i)), v);
+
+    // Field-only writes must preserve adjacent fields.
+    try table.readColumn(i32, .{ .index = 1 }, 0, values, .{});
+    for (values) |v| try testing.expectEqual(@as(i32, 0), v);
+}
+
+test "whole-row column writes are batched without a read" {
+    const alloc = testing.allocator;
+    const nrows = 10_000;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const hdu = try buildBinTable(&f, alloc, &.{.{ .tform = "1J", .ttype = "VALUE" }}, nrows, null);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    const values = try alloc.alloc(i32, nrows);
+    defer alloc.free(values);
+    for (values, 0..) |*v, i| v.* = @intCast(i);
+
+    counted.reset();
+    try table.writeColumn(i32, .{ .index = 0 }, 0, values, .{});
+    try testing.expectEqual(@as(usize, 0), counted.reads);
+    try testing.expectEqual(@as(usize, 1), counted.writes);
+}
+
+test "partial-column writes do not overwrite an interleaved adjacent update" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const hdu = try buildBinTable(&f, alloc, &.{
+        .{ .tform = "1J", .ttype = "A" },
+        .{ .tform = "1J", .ttype = "B" },
+    }, 2, null);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    endian.write(i32, 777, &counted.trigger_bytes);
+    counted.trigger_offset = hdu.data_off + 4; // B in row 0
+    try table.writeColumn(i32, .{ .index = 0 }, 0, &.{ 10, 20 }, .{});
+
+    var adjacent: [2]i32 = undefined;
+    try table.readColumn(i32, .{ .index = 1 }, 0, &adjacent, .{});
+    try testing.expectEqualSlices(i32, &.{ 777, 0 }, &adjacent);
 }
 
 test "round-trip I/J/K/E/D/A columns via appendHdu" {

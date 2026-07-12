@@ -22,6 +22,7 @@ const errors = @import("../errors.zig");
 const convert = @import("../convert.zig");
 const limits = @import("../limits.zig");
 const common = @import("common.zig");
+const batch = @import("batch.zig");
 const AsciiTform = common.AsciiTform;
 const asciiFieldRange = common.asciiFieldRange;
 const Fits = @import("../fits.zig").Fits;
@@ -237,7 +238,28 @@ pub const AsciiTable = struct {
         const c = try self.columnPtr(col);
         const end = try limits.add(first_row, out.len);
         if (end > self.naxis2) return error.RowOutOfRange;
-        for (out, 0..) |*o, i| o.* = try self.readCellValue(T, c, first_row + i, .bulk);
+        if (c.tform.type == .char) return error.WrongValueType;
+        const w: usize = c.tform.width;
+        if (w > MAX_NUM_FIELD) return error.BadTform;
+        const plan = batch.Plan.init(self.naxis1, w, out.len, self.fits.limits.max_open_alloc) orelse {
+            for (out, 0..) |*o, i| o.* = try self.readCellValue(T, c, first_row + i, .bulk);
+            return;
+        };
+        var storage: [batch.target_bytes]u8 = undefined;
+        const window = storage[0..plan.window_bytes];
+        const stride: usize = @intCast(self.naxis1);
+        const field_start: usize = @intCast(c.tbcol - 1);
+        var done: usize = 0;
+        while (done < out.len) {
+            const rows = @min(plan.rows_per_window, out.len - done);
+            const bytes = rows * stride;
+            try self.fits.dev.readAll(window[0..bytes], try self.rowOffset(first_row + done));
+            for (0..rows) |r| {
+                const start = r * stride + field_start;
+                out[done + r] = try readFieldValue(T, c, window[start..][0..w], .bulk);
+            }
+            done += rows;
+        }
     }
 
     /// Write a contiguous run of numeric cells (symmetric with `readColumn`; bulk conversion).
@@ -249,7 +271,36 @@ pub const AsciiTable = struct {
         const c = try self.columnPtr(col);
         const end = try limits.add(first_row, values.len);
         if (end > self.naxis2) return error.RowOutOfRange;
-        for (values, 0..) |v, i| try self.writeCellValue(T, c, first_row + i, v, .bulk);
+        if (c.tform.type == .char) return error.WrongValueType;
+        const w: usize = c.tform.width;
+        if (w > MAX_NUM_FIELD) return error.BadTform;
+        const stride: usize = @intCast(self.naxis1);
+        const field_start: usize = @intCast(c.tbcol - 1);
+        const whole_row = field_start == 0 and w == stride;
+        // Avoid stale whole-row snapshots overwriting adjacent-column writes from another
+        // handle. Partial fields keep their original non-overlapping positioned writes.
+        if (!whole_row) {
+            for (values, 0..) |v, i| try self.writeCellValue(T, c, first_row + i, v, .bulk);
+            return;
+        }
+        const plan = batch.Plan.init(self.naxis1, w, values.len, self.fits.limits.max_open_alloc) orelse {
+            for (values, 0..) |v, i| try self.writeCellValue(T, c, first_row + i, v, .bulk);
+            return;
+        };
+        var storage: [batch.target_bytes]u8 = undefined;
+        const window = storage[0..plan.window_bytes];
+        var done: usize = 0;
+        while (done < values.len) {
+            const rows = @min(plan.rows_per_window, values.len - done);
+            const bytes = rows * stride;
+            const physical_off = try self.rowOffset(first_row + done);
+            for (0..rows) |r| {
+                const start = r * stride + field_start;
+                try writeFieldValue(T, c, window[start..][0..w], values[done + r], .bulk);
+            }
+            try self.fits.dev.writeAll(window[0..bytes], physical_off);
+            done += rows;
+        }
     }
 
     /// Read one cell at `row` as text into `out` (which must be at least `width` bytes). Returns
@@ -319,10 +370,13 @@ pub const AsciiTable = struct {
     /// Absolute device byte offset of the field for `col` at `row` (bounds-checked).
     fn fieldOffset(self: *const AsciiTable, col: *const AsciiColumn, row: u64) (errors.TableError || errors.LimitError)!u64 {
         if (row >= self.naxis2) return error.RowOutOfRange;
-        const row_off = try limits.mul(row, self.naxis1);
         const start = col.tbcol - 1; // tbcol >= 1 guaranteed by `of` validation
-        const within = try limits.add(row_off, start);
-        return limits.add(self.hdu.data_off, within);
+        return limits.add(try self.rowOffset(row), start);
+    }
+
+    fn rowOffset(self: *const AsciiTable, row: u64) errors.LimitError!u64 {
+        const row_off = try limits.mul(row, self.naxis1);
+        return limits.add(self.hdu.data_off, row_off);
     }
 
     fn readCellValue(self: *AsciiTable, comptime T: type, col: *const AsciiColumn, row: u64, mode: convert.Mode) Error!?T {
@@ -332,30 +386,7 @@ pub const AsciiTable = struct {
         var buf: [MAX_NUM_FIELD]u8 = undefined;
         const off = try self.fieldOffset(col, row);
         try self.fits.dev.readAll(buf[0..w], off);
-        const raw = buf[0..w];
-        if (fieldIsNull(col, raw, false)) return null;
-
-        const tok = std.mem.trim(u8, raw, " \x00");
-        const identity = col.tscal == 1 and col.tzero == 0;
-        switch (col.tform.type) {
-            .int => {
-                // std.fmt.parseInt accepts interior '_' digit separators (e.g. "1_000"→1000),
-                // which FITS §7.2.5 forbids; screen the token so a malformed Iw field is a typed
-                // error rather than a silently-wrong value (matches header/value.zig).
-                if (!isFitsIntToken(tok)) return error.BadValueSyntax;
-                const iv = std.fmt.parseInt(i64, tok, 10) catch return error.BadValueSyntax;
-                if (identity) return try convert.cast(T, iv, mode);
-                const phys = col.tzero + col.tscal * @as(f64, @floatFromInt(iv));
-                return try convert.cast(T, phys, mode);
-            },
-            .fixed, .exp_single, .exp_double => {
-                const fv = try parseAsciiFloat(tok, col.tform.decimals);
-                if (identity) return try convert.cast(T, fv, mode);
-                const phys = col.tzero + col.tscal * fv;
-                return try convert.cast(T, phys, mode);
-            },
-            .char => unreachable, // handled above
-        }
+        return readFieldValue(T, col, buf[0..w], mode);
     }
 
     fn writeCellValue(self: *AsciiTable, comptime T: type, col: *const AsciiColumn, row: u64, value: ?T, mode: convert.Mode) Error!void {
@@ -363,39 +394,10 @@ pub const AsciiTable = struct {
         const w: usize = col.tform.width;
         if (w > MAX_NUM_FIELD) return error.BadTform;
         var field: [MAX_NUM_FIELD]u8 = undefined;
-        const out = field[0..w];
-
-        if (value) |v| {
-            const identity = col.tscal == 1 and col.tzero == 0;
-            switch (col.tform.type) {
-                .int => {
-                    var iv: i64 = undefined;
-                    if (identity) {
-                        iv = try convert.cast(i64, v, mode);
-                    } else {
-                        const vf = try convert.cast(f64, v, mode);
-                        iv = try convert.cast(i64, (vf - col.tzero) / col.tscal, mode);
-                    }
-                    try formatIntField(iv, out);
-                },
-                .fixed => {
-                    const vf = try convert.cast(f64, v, mode);
-                    const raw = if (identity) vf else (vf - col.tzero) / col.tscal;
-                    try formatDecimalField(raw, col.tform.decimals, out);
-                },
-                .exp_single, .exp_double => {
-                    const vf = try convert.cast(f64, v, mode);
-                    const raw = if (identity) vf else (vf - col.tzero) / col.tscal;
-                    try formatExpField(raw, col.tform.decimals, col.tform.type == .exp_double, out);
-                },
-                .char => unreachable, // handled above
-            }
-        } else {
-            try fillNull(col, out, false);
-        }
+        try writeFieldValue(T, col, field[0..w], value, mode);
 
         const off = try self.fieldOffset(col, row);
-        try self.fits.dev.writeAll(out, off);
+        try self.fits.dev.writeAll(field[0..w], off);
     }
 
     /// Write `count` ASCII spaces at `off`, in bounded chunks (no allocation).
@@ -411,6 +413,60 @@ pub const AsciiTable = struct {
 };
 
 // ── field helpers ──────────────────────────────────────────────────────────────────────────
+
+fn readFieldValue(comptime T: type, col: *const AsciiColumn, raw: []const u8, mode: convert.Mode) Error!?T {
+    if (fieldIsNull(col, raw, false)) return null;
+
+    const tok = std.mem.trim(u8, raw, " \x00");
+    const identity = col.tscal == 1 and col.tzero == 0;
+    switch (col.tform.type) {
+        .int => {
+            // std.fmt.parseInt accepts interior '_' digit separators, which FITS forbids.
+            if (!isFitsIntToken(tok)) return error.BadValueSyntax;
+            const iv = std.fmt.parseInt(i64, tok, 10) catch return error.BadValueSyntax;
+            if (identity) return try convert.cast(T, iv, mode);
+            const phys = col.tzero + col.tscal * @as(f64, @floatFromInt(iv));
+            return try convert.cast(T, phys, mode);
+        },
+        .fixed, .exp_single, .exp_double => {
+            const fv = try parseAsciiFloat(tok, col.tform.decimals);
+            if (identity) return try convert.cast(T, fv, mode);
+            const phys = col.tzero + col.tscal * fv;
+            return try convert.cast(T, phys, mode);
+        },
+        .char => return error.WrongValueType,
+    }
+}
+
+fn writeFieldValue(comptime T: type, col: *const AsciiColumn, out: []u8, value: ?T, mode: convert.Mode) Error!void {
+    if (value) |v| {
+        const identity = col.tscal == 1 and col.tzero == 0;
+        switch (col.tform.type) {
+            .int => {
+                const iv = if (identity)
+                    try convert.cast(i64, v, mode)
+                else blk: {
+                    const vf = try convert.cast(f64, v, mode);
+                    break :blk try convert.cast(i64, (vf - col.tzero) / col.tscal, mode);
+                };
+                try formatIntField(iv, out);
+            },
+            .fixed => {
+                const vf = try convert.cast(f64, v, mode);
+                const raw = if (identity) vf else (vf - col.tzero) / col.tscal;
+                try formatDecimalField(raw, col.tform.decimals, out);
+            },
+            .exp_single, .exp_double => {
+                const vf = try convert.cast(f64, v, mode);
+                const raw = if (identity) vf else (vf - col.tzero) / col.tscal;
+                try formatExpField(raw, col.tform.decimals, col.tform.type == .exp_double, out);
+            },
+            .char => return error.WrongValueType,
+        }
+    } else {
+        try fillNull(col, out, false);
+    }
+}
 
 /// Read an optional string keyword `<prefix><n>`; a missing/blank/non-string value yields `null`.
 fn optString(alloc: Allocator, header: *const Header, comptime prefix: []const u8, n: u16) (errors.HeaderError || Allocator.Error)!?[]u8 {
