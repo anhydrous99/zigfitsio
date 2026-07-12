@@ -28,7 +28,8 @@ pub const Plan = struct {
         const allowed = std.math.mul(u64, field_bytes, max_amplification) catch std.math.maxInt(u64);
         if (row_bytes > allowed or row_bytes > alloc_limit or row_bytes > target_bytes) return null;
 
-        const rows64 = @min(row_count, @max(@as(u64, 1), @as(u64, target_bytes) / row_bytes));
+        const byte_budget = @min(@as(u64, target_bytes), alloc_limit);
+        const rows64 = @min(row_count, @max(@as(u64, 1), byte_budget / row_bytes));
         const bytes64 = std.math.mul(u64, rows64, row_bytes) catch return null;
         if (bytes64 > alloc_limit) return null;
         return .{
@@ -92,6 +93,10 @@ test "planner batches dense rows and rejects sparse rows" {
     try testing.expect(dense.window_bytes <= target_bytes);
     try testing.expect(Plan.init(4096, 4, 100_000, 1 << 32) == null);
     try testing.expect(Plan.init(32, 4, 1, 1 << 32) == null);
+
+    const limited = Plan.init(16, 4, 10_000, 4096).?;
+    try testing.expectEqual(@as(usize, 256), limited.rows_per_window);
+    try testing.expectEqual(@as(usize, 4096), limited.window_bytes);
 }
 
 test "borrowed device reads and writes without resizing" {

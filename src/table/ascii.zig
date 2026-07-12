@@ -274,21 +274,26 @@ pub const AsciiTable = struct {
         if (c.tform.type == .char) return error.WrongValueType;
         const w: usize = c.tform.width;
         if (w > MAX_NUM_FIELD) return error.BadTform;
+        const stride: usize = @intCast(self.naxis1);
+        const field_start: usize = @intCast(c.tbcol - 1);
+        const whole_row = field_start == 0 and w == stride;
+        // Avoid stale whole-row snapshots overwriting adjacent-column writes from another
+        // handle. Partial fields keep their original non-overlapping positioned writes.
+        if (!whole_row) {
+            for (values, 0..) |v, i| try self.writeCellValue(T, c, first_row + i, v, .bulk);
+            return;
+        }
         const plan = batch.Plan.init(self.naxis1, w, values.len, self.fits.limits.max_open_alloc) orelse {
             for (values, 0..) |v, i| try self.writeCellValue(T, c, first_row + i, v, .bulk);
             return;
         };
         var storage: [batch.target_bytes]u8 = undefined;
         const window = storage[0..plan.window_bytes];
-        const stride: usize = @intCast(self.naxis1);
-        const field_start: usize = @intCast(c.tbcol - 1);
-        const whole_row = field_start == 0 and w == stride;
         var done: usize = 0;
         while (done < values.len) {
             const rows = @min(plan.rows_per_window, values.len - done);
             const bytes = rows * stride;
             const physical_off = try self.rowOffset(first_row + done);
-            if (!whole_row) try self.fits.dev.readAll(window[0..bytes], physical_off);
             for (0..rows) |r| {
                 const start = r * stride + field_start;
                 try writeFieldValue(T, c, window[start..][0..w], values[done + r], .bulk);

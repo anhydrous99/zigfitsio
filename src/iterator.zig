@@ -20,8 +20,10 @@
 //! bound column plus, for dense bindings, one complete-row window shared by every column. The
 //! image walk allocates nothing at all (the caller owns the scratch). There is **no per-element
 //! and no per-chunk allocation**: buffers are allocated once, before the chunk loop, and reused.
-//! The shared row window reduces a multi-column chunk to one physical read and at most one
-//! physical write; sparse wide rows retain the per-column fallback to avoid read amplification.
+//! The shared row window reduces a multi-column chunk to one physical read and, when output
+//! bindings cover the complete row, one physical write. Partial outputs retain field-only
+//! writes so concurrent updates to unbound columns through distinct handles are not clobbered;
+//! sparse wide rows retain the per-column fallback to avoid read amplification.
 //!
 //! Null substitution (FR-IMG-8/FR-ITR-1): both walks expose it. The image walk takes a typed
 //! `ImageOpts.null_sentinel`; the table walk takes a per-`Binding` `null_sentinel` — a
@@ -170,6 +172,7 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             var slots: [fields.len]u64 = undefined;
             var sentinels: [fields.len]NullSentinel = undefined;
             var selected_wire_bytes: u64 = 0;
+            var has_read = false;
             var has_write = false;
             inline for (fields, 0..) |f, i| {
                 const b = self.findBinding(f.name) orelse return error.NoSuchColumn;
@@ -179,7 +182,20 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                 slots[i] = cellSlots(&table.columns[idx]);
                 sentinels[i] = b.null_sentinel;
                 selected_wire_bytes = try limits.add(selected_wire_bytes, try table.columns[idx].tform.fieldBytes());
+                if (b.role == .in or b.role == .inout) has_read = true;
                 if (b.role == .out or b.role == .inout) has_write = true;
+            }
+
+            // A fused write is safe only when the bindings intentionally replace every field
+            // in each row. Otherwise writing the full row could clobber an adjacent-column
+            // update made concurrently through another handle.
+            var writes_whole_row = has_write;
+            for (0..table.columns.len) |column_index| {
+                var covered = false;
+                inline for (fields, 0..) |_, i| {
+                    if (@as(usize, col_idx[i]) == column_index and (roles[i] == .out or roles[i] == .inout)) covered = true;
+                }
+                if (!covered) writes_whole_row = false;
             }
 
             if (total_rows == 0) return; // empty table: nothing to drive
@@ -209,7 +225,8 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             const amplification_limit = std.math.mul(u64, selected_wire_bytes, table_batch.max_amplification) catch std.math.maxInt(u64);
             const row_window_bytes = limits.mul(rows_per_chunk, table.naxis1) catch std.math.maxInt(u64);
             const fused_total = limits.add(total_bytes, row_window_bytes) catch std.math.maxInt(u64);
-            const use_row_window = table.naxis1 <= amplification_limit and
+            const use_row_window = (has_read or writes_whole_row) and
+                table.naxis1 <= amplification_limit and
                 fused_total <= table.fits.limits.max_open_alloc and
                 std.math.cast(usize, row_window_bytes) != null;
             try limits.ensureWithin(if (use_row_window) fused_total else total_bytes, table.fits.limits.max_open_alloc, null);
@@ -246,7 +263,7 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                     owned_rows[0 .. n * @as(usize, @intCast(table.naxis1))]
                 else
                     null;
-                if (raw) |row_bytes| try table.readRowWindow(first_row, n, row_bytes);
+                if (has_read) if (raw) |row_bytes| try table.readRowWindow(first_row, n, row_bytes);
                 var view: Cols = undefined;
                 inline for (fields, 0..) |f, i| {
                     const Elem = std.meta.Elem(f.type);
@@ -266,13 +283,13 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                 inline for (fields, 0..) |f, i| {
                     const Elem = std.meta.Elem(f.type);
                     if (roles[i] == .out or roles[i] == .inout) {
-                        if (raw) |row_bytes|
-                            try table.encodeColumnWindow(Elem, col_idx[i], n, row_bytes, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
+                        if (writes_whole_row and raw != null)
+                            try table.encodeColumnWindow(Elem, col_idx[i], n, raw.?, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
                         else
                             try table.writeColumn(Elem, .{ .index = col_idx[i] }, first_row, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
                     }
                 }
-                if (has_write) if (raw) |row_bytes| try table.writeRowWindow(first_row, n, row_bytes);
+                if (writes_whole_row) if (raw) |row_bytes| try table.writeRowWindow(first_row, n, row_bytes);
                 first_row += n;
             }
         }
@@ -517,8 +534,8 @@ test "dense multi-column chunk uses one physical read and write" {
         }
     };
     var iter = Iterator(Cols, error{}){ .bindings = &.{
-        .{ .ref = .{ .index = 0 }, .role = .in, .field = "a" },
-        .{ .ref = .{ .index = 1 }, .role = .in, .field = "b" },
+        .{ .ref = .{ .index = 0 }, .role = .inout, .field = "a" },
+        .{ .ref = .{ .index = 1 }, .role = .inout, .field = "b" },
         .{ .ref = .{ .index = 2 }, .role = .out, .field = "c" },
         .{ .ref = .{ .index = 3 }, .role = .inout, .field = "d" },
     } };

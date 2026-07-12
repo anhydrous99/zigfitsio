@@ -255,6 +255,18 @@ pub const BinTable = struct {
         const last = std.math.add(u64, first_row, nrows) catch return error.RowOutOfRange;
         if (last > self.naxis2) return error.RowOutOfRange;
         const field_bytes = try column.tform.fieldBytes();
+        const whole_row = column.byte_offset == 0 and field_bytes == self.naxis1;
+        // A partial-column whole-row read-modify-write can overwrite a concurrent update to an
+        // adjacent column made through another handle. Preserve the positioned, non-overlapping
+        // write contract for partial fields; only true whole-row columns can be safely batched.
+        if (!whole_row) {
+            var r: u64 = 0;
+            while (r < nrows) : (r += 1) {
+                const base: usize = @intCast(r * slots);
+                try self.writeCellInto(T, column, first_row + r, in[base..][0..sl], .bulk, opts);
+            }
+            return;
+        }
         const plan = batch.Plan.init(self.naxis1, field_bytes, nrows, self.fits.limits.max_open_alloc) orelse {
             var r: u64 = 0;
             while (r < nrows) : (r += 1) {
@@ -265,14 +277,12 @@ pub const BinTable = struct {
         };
         var storage: [batch.target_bytes]u8 = undefined;
         const window = storage[0..plan.window_bytes];
-        const whole_row = column.byte_offset == 0 and field_bytes == self.naxis1;
         var done: u64 = 0;
         while (done < nrows) {
             const rows: usize = @intCast(@min(@as(u64, plan.rows_per_window), nrows - done));
             const bytes = rows * @as(usize, @intCast(self.naxis1));
             const row0 = first_row + done;
             const physical_off = try self.rowOffset(row0);
-            if (!whole_row) try self.fits.dev.readAll(window[0..bytes], physical_off);
             var borrowed: batch.BorrowedDevice = .{ .bytes = window[0..bytes] };
             const dev = borrowed.device();
             for (0..rows) |r| {
@@ -1261,6 +1271,8 @@ const CountingDevice = struct {
     child: Device,
     reads: usize = 0,
     writes: usize = 0,
+    trigger_offset: ?u64 = null,
+    trigger_bytes: [4]u8 = undefined,
 
     fn pread(ctx: *anyopaque, dst: []u8, offset: u64) errors.IoError!usize {
         const self: *CountingDevice = @ptrCast(@alignCast(ctx));
@@ -1270,6 +1282,10 @@ const CountingDevice = struct {
     fn pwrite(ctx: *anyopaque, src: []const u8, offset: u64) errors.IoError!usize {
         const self: *CountingDevice = @ptrCast(@alignCast(ctx));
         self.writes += 1;
+        if (self.trigger_offset) |trigger_offset| {
+            self.trigger_offset = null;
+            try self.child.writeAll(&self.trigger_bytes, trigger_offset);
+        }
         return self.child.pwrite(src, offset);
     }
     fn getSize(ctx: *anyopaque) errors.IoError!u64 {
@@ -1345,13 +1361,13 @@ fn buildBinTable(f: *Fits, alloc: Allocator, specs: []const ColSpec, nrows: u64,
     return f.appendHdu(h);
 }
 
-test "dense column I/O uses row windows instead of one device call per row" {
+test "dense column reads use row windows and partial writes stay field-only" {
     const alloc = testing.allocator;
     const nrows = 10_000;
     var mem = MemoryDevice.init(alloc);
     defer mem.deinit();
     var counted: CountingDevice = .{ .child = mem.device() };
-    var f = try Fits.create(alloc, counted.device(), .{});
+    var f = try Fits.create(alloc, counted.device(), .{ .limits = .{ .max_open_alloc = 4096 } });
     defer f.deinit();
     _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
     const specs = [_]ColSpec{
@@ -1370,19 +1386,66 @@ test "dense column I/O uses row windows instead of one device call per row" {
 
     counted.reset();
     try table.writeColumn(i32, .{ .index = 0 }, 0, values, .{});
-    try testing.expectEqual(@as(usize, 3), counted.reads);
-    try testing.expectEqual(@as(usize, 3), counted.writes);
+    try testing.expectEqual(@as(usize, 0), counted.reads);
+    try testing.expectEqual(@as(usize, nrows), counted.writes);
 
     @memset(values, -1);
     counted.reset();
     try table.readColumn(i32, .{ .index = 0 }, 0, values, .{});
-    try testing.expectEqual(@as(usize, 3), counted.reads);
+    try testing.expectEqual(@as(usize, 40), counted.reads);
     try testing.expectEqual(@as(usize, 0), counted.writes);
     for (values, 0..) |v, i| try testing.expectEqual(@as(i32, @intCast(i)), v);
 
-    // The read-modify-write path must preserve adjacent fields.
+    // Field-only writes must preserve adjacent fields.
     try table.readColumn(i32, .{ .index = 1 }, 0, values, .{});
     for (values) |v| try testing.expectEqual(@as(i32, 0), v);
+}
+
+test "whole-row column writes are batched without a read" {
+    const alloc = testing.allocator;
+    const nrows = 10_000;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const hdu = try buildBinTable(&f, alloc, &.{.{ .tform = "1J", .ttype = "VALUE" }}, nrows, null);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    const values = try alloc.alloc(i32, nrows);
+    defer alloc.free(values);
+    for (values, 0..) |*v, i| v.* = @intCast(i);
+
+    counted.reset();
+    try table.writeColumn(i32, .{ .index = 0 }, 0, values, .{});
+    try testing.expectEqual(@as(usize, 0), counted.reads);
+    try testing.expectEqual(@as(usize, 1), counted.writes);
+}
+
+test "partial-column writes do not overwrite an interleaved adjacent update" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const hdu = try buildBinTable(&f, alloc, &.{
+        .{ .tform = "1J", .ttype = "A" },
+        .{ .tform = "1J", .ttype = "B" },
+    }, 2, null);
+    var table = try BinTable.of(&f, hdu);
+    defer table.deinit(alloc);
+
+    endian.write(i32, 777, &counted.trigger_bytes);
+    counted.trigger_offset = hdu.data_off + 4; // B in row 0
+    try table.writeColumn(i32, .{ .index = 0 }, 0, &.{ 10, 20 }, .{});
+
+    var adjacent: [2]i32 = undefined;
+    try table.readColumn(i32, .{ .index = 1 }, 0, &adjacent, .{});
+    try testing.expectEqualSlices(i32, &.{ 777, 0 }, &adjacent);
 }
 
 test "round-trip I/J/K/E/D/A columns via appendHdu" {
