@@ -440,7 +440,7 @@ the friendliest shape for concurrent reads of distinct ranges from one file
 | file | `io/file.zig` | `Device` (r/w) | wraps `std.Io.File` (`readPositionalAll`/`writePositionalAll`/`length`/`setLength`) driven by a `std.Io.Threaded` implementation; 64-bit offsets (`FR-IO-6`). |
 | stream | `io/stream.zig` | free functions over `std.Io.Reader`/`Writer` | stdin/stdout (`FR-RMT-1`); also the output side of whole-file gzip. |
 | gzip-file | `io/stream.zig` + `std.compress.flate` | `Stream` in, materialize to `Device` | `.fits.gz` (`FR-RMT-2`): decompress into a memory `Device` for random access; compress on flush. |
-| http | `io/http.zig` | `Device` (read-only) via Range GET | `std.http` (TLS 1.3 only); falls back to full download into memory `Device` if server lacks range support (`FR-RMT-3`). |
+| http | `io/http.zig` | `Device` (read-only) via Range GET | `std.http` (TLS 1.3 only); caches the identity representation's size per handle and falls back to one full download into memory if the server lacks range support (`FR-RMT-3`). |
 
 A `Stream`-only source that the higher layers need to seek over is **materialized** into a
 memory `Device` (documented cost). This keeps the seekable code paths uniform and is how

@@ -27,6 +27,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
   bound column and fuse writes when their outputs cover the complete row. Sparse wide rows and
   partial writes retain field-level I/O to cap amplification and preserve non-overlapping
   concurrent updates through distinct handles.
+- **HTTP I/O**: remote object size is now discovered once per `HttpDevice` and reused by HDU,
+  validation, and tiled-read paths. Range responses can seed the cache, no-range fallbacks reuse
+  the response already in flight, and range-readable FITS files are no longer rejected merely
+  because their logical size exceeds the bounded whole-body cache limit. Truncated partial bodies
+  fail without caching metadata, while server-capped subranges remain valid short reads.
 
 ## [0.1.5] - 2026-07-11
 
