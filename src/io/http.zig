@@ -10,7 +10,8 @@
 //!
 //! Fallback for servers that ignore `Range`: if a ranged GET answers `200 OK` (whole body),
 //! the body is downloaded once into an internal `MemoryDevice` and all further `pread`s are
-//! served from that in-memory copy.
+//! served from that in-memory copy. The selected representation is requested with identity
+//! encoding, and its size is learned once and cached for the lifetime of the device.
 const std = @import("std");
 const IoError = @import("../errors.zig").IoError;
 const Device = @import("device.zig").Device;
@@ -31,6 +32,9 @@ pub const HttpDevice = struct {
     /// Whole-file cache, populated when the server ignores `Range` (200 fallback) or when
     /// the size can only be learned by downloading the body.
     cache: ?MemoryDevice = null,
+    /// Object size learned from a successful HEAD, Content-Range, or whole-body response.
+    /// Stable for this device's lifetime; close and reopen to refresh remote metadata.
+    known_size: ?u64 = null,
     /// Upper bound on a whole-body download into `cache`, so a server that ignores `Range` and
     /// streams a huge/endless `200 OK` body cannot grow memory without limit (NFR-SAFE-1).
     /// Defaults to the `Limits.max_open_alloc` default (4 GiB); tune on the struct if needed.
@@ -69,33 +73,59 @@ pub const HttpDevice = struct {
         const self: *HttpDevice = @ptrCast(@alignCast(ctx));
         if (buf.len == 0) return 0;
         if (self.cache) |*c| return cachePread(c, buf, offset);
+        var read_len = buf.len;
+        if (self.known_size) |size| {
+            if (offset >= size) return 0;
+            read_len = @intCast(@min(@as(u64, buf.len), size - offset));
+        }
         // An offset whose byte range would overflow u64 is past any possible EOF; report 0
         // (end-of-stream) like the other backends rather than overflowing in formatRange.
-        if (offset > std.math.maxInt(u64) - buf.len) return 0;
+        if (offset > std.math.maxInt(u64) - read_len) return 0;
 
         var range_buf: [64]u8 = undefined;
-        const range = formatRange(&range_buf, offset, buf.len);
+        const range = formatRange(&range_buf, offset, read_len);
         const u = try self.uri();
         var req = self.client.request(.GET, u, .{
             .keep_alive = true,
+            .headers = identityHeaders(),
             .extra_headers = &.{.{ .name = "range", .value = range }},
         }) catch return error.ReadFailed;
         defer req.deinit();
         req.sendBodiless() catch return error.ReadFailed;
         var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
+        if (resp.head.content_encoding != .identity) return error.ReadFailed;
         switch (resp.head.status) {
             // The expected case: the body is exactly the requested byte range.
             .partial_content => {
+                const parsed = contentRange(&resp) orelse return error.ReadFailed;
+                const validated = validateSatisfiedRange(parsed, offset, read_len) orelse
+                    return error.ReadFailed;
+                if (resp.head.content_length) |len| {
+                    if (len != validated.span) return error.ReadFailed;
+                }
+                if (validated.total) |total| try self.ensureSizeCompatible(total);
                 const r = resp.reader(&self.transfer_buf);
-                return r.readSliceShort(buf) catch error.ReadFailed;
+                const response_len: usize = @intCast(validated.span);
+                const n = r.readSliceShort(buf[0..response_len]) catch return error.ReadFailed;
+                if (validated.total) |total| _ = try self.recordSize(total);
+                return n;
             },
             // The server ignored `Range` and sent the whole file: cache it and serve locally.
             .ok => {
                 try self.fillCacheFrom(&resp);
                 return cachePread(&self.cache.?, buf, offset);
             },
-            // Requested range starts past end-of-file: report end-of-stream as a 0 count.
-            .range_not_satisfiable => return 0,
+            // Requested range starts past end-of-file: learn the current size when supplied.
+            .range_not_satisfiable => {
+                const parsed = contentRange(&resp) orelse return error.ReadFailed;
+                const total = switch (parsed) {
+                    .unsatisfied => |n| n,
+                    .satisfied => return error.ReadFailed,
+                };
+                if (offset < total) return error.ReadFailed;
+                _ = try self.recordSize(total);
+                return 0;
+            },
             else => return error.ReadFailed,
         }
     }
@@ -103,20 +133,22 @@ pub const HttpDevice = struct {
     fn getSize(ctx: *anyopaque) IoError!u64 {
         const self: *HttpDevice = @ptrCast(@alignCast(ctx));
         if (self.cache) |*c| return c.bytes().len;
+        if (self.known_size) |size| return size;
         const u = try self.uri();
 
         // Primary: a HEAD request and its Content-Length.
         {
-            var req = self.client.request(.HEAD, u, .{ .keep_alive = true }) catch return error.ReadFailed;
+            var req = self.client.request(.HEAD, u, .{
+                .keep_alive = true,
+                .headers = identityHeaders(),
+            }) catch return error.ReadFailed;
             defer req.deinit();
             req.sendBodiless() catch return error.ReadFailed;
             const resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
+            if (resp.head.content_encoding != .identity) return error.ReadFailed;
             if (resp.head.status == .ok) {
-                // Reject a size beyond what this backend can cache/serve rather than admitting an
-                // attacker-chosen ~2^64 Content-Length that would feed unbounded offset arithmetic.
                 if (resp.head.content_length) |len| {
-                    if (len > self.max_cache_bytes) return error.DeviceFull;
-                    return len;
+                    return self.recordSize(len);
                 }
             }
         }
@@ -127,16 +159,39 @@ pub const HttpDevice = struct {
             const range = formatRange(&range_buf, 0, 1);
             var req = self.client.request(.GET, u, .{
                 .keep_alive = true,
+                .headers = identityHeaders(),
                 .extra_headers = &.{.{ .name = "range", .value = range }},
             }) catch return error.ReadFailed;
             defer req.deinit();
             req.sendBodiless() catch return error.ReadFailed;
             var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
-            if (resp.head.status == .partial_content) {
-                if (contentRangeTotal(&resp)) |total| {
-                    if (total > self.max_cache_bytes) return error.DeviceFull;
-                    return total;
-                }
+            if (resp.head.content_encoding != .identity) return error.ReadFailed;
+            switch (resp.head.status) {
+                .partial_content => {
+                    const parsed = contentRange(&resp) orelse return error.ReadFailed;
+                    const validated = validateSatisfiedRange(parsed, 0, 1) orelse
+                        return error.ReadFailed;
+                    if (resp.head.content_length) |len| {
+                        if (len != validated.span) return error.ReadFailed;
+                    }
+                    if (validated.total) |total| return self.recordSize(total);
+                },
+                .range_not_satisfiable => {
+                    const parsed = contentRange(&resp) orelse return error.ReadFailed;
+                    const total = switch (parsed) {
+                        .unsatisfied => |n| n,
+                        .satisfied => return error.ReadFailed,
+                    };
+                    if (total != 0) return error.ReadFailed;
+                    return self.recordSize(0);
+                },
+                // Reuse the body already returned by a server that ignored Range rather than
+                // discarding it and issuing a second full GET.
+                .ok => {
+                    try self.fillCacheFrom(&resp);
+                    return self.cache.?.bytes().len;
+                },
+                else => {},
             }
         }
 
@@ -161,19 +216,24 @@ pub const HttpDevice = struct {
     /// Issue a plain (un-ranged) GET and buffer the whole body into `self.cache`.
     fn fetchFull(self: *HttpDevice) IoError!void {
         const u = try self.uri();
-        var req = self.client.request(.GET, u, .{ .keep_alive = true }) catch return error.ReadFailed;
+        var req = self.client.request(.GET, u, .{
+            .keep_alive = true,
+            .headers = identityHeaders(),
+        }) catch return error.ReadFailed;
         defer req.deinit();
         req.sendBodiless() catch return error.ReadFailed;
         var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
-        switch (resp.head.status) {
-            .ok, .partial_content => {},
-            else => return error.ReadFailed,
-        }
+        if (resp.head.status != .ok or resp.head.content_encoding != .identity)
+            return error.ReadFailed;
         try self.fillCacheFrom(&resp);
     }
 
     /// Drain the remaining body of `resp` into a fresh `MemoryDevice` stored in `self.cache`.
     fn fillCacheFrom(self: *HttpDevice, resp: *std.http.Client.Response) IoError!void {
+        if (resp.head.content_encoding != .identity) return error.ReadFailed;
+        if (resp.head.content_length) |len| {
+            if (len > self.max_cache_bytes) return error.DeviceFull;
+        }
         var mem = MemoryDevice.init(self.alloc);
         errdefer mem.deinit();
         const dev = mem.device();
@@ -185,11 +245,27 @@ pub const HttpDevice = struct {
             if (n == 0) break;
             // Bound the download: a server that ignores Range and streams a huge/endless body
             // must not grow the cache without limit (NFR-SAFE-1).
-            if (pos + n > self.max_cache_bytes) return error.DeviceFull;
+            if (n > self.max_cache_bytes - pos) return error.DeviceFull;
             try dev.writeAll(tmp[0..n], pos);
             pos += n;
         }
+        _ = try self.recordSize(pos);
         self.cache = mem; // ownership moves into self; errdefer above no longer fires
+    }
+
+    /// Record one authoritative size observation without allowing a later response to silently
+    /// switch this seekable handle to a different representation.
+    fn recordSize(self: *HttpDevice, observed: u64) IoError!u64 {
+        try self.ensureSizeCompatible(observed);
+        if (self.known_size) |known| return known;
+        self.known_size = observed;
+        return observed;
+    }
+
+    fn ensureSizeCompatible(self: *const HttpDevice, observed: u64) IoError!void {
+        if (self.known_size) |known| {
+            if (known != observed) return error.ReadFailed;
+        }
     }
 
     /// Serve a `pread` from the in-memory cache.
@@ -209,6 +285,10 @@ pub const HttpDevice = struct {
 
 // ── Deterministic, network-free logic (unit-tested directly) ───────────────────────────
 
+fn identityHeaders() std.http.Client.Request.Headers {
+    return .{ .accept_encoding = .{ .override = "identity" } };
+}
+
 /// Format an HTTP byte-range header value `"bytes=<offset>-<offset+len-1>"` into `buf`.
 /// Asserts `len > 0`; `buf` must hold at least 47 bytes (it always does at the call sites).
 fn formatRange(buf: []u8, offset: u64, len: usize) []const u8 {
@@ -219,25 +299,73 @@ fn formatRange(buf: []u8, offset: u64, len: usize) []const u8 {
     return std.fmt.bufPrint(buf, "bytes={d}-{d}", .{ offset, end }) catch unreachable;
 }
 
-/// Parse the total resource size out of an HTTP `Content-Range` value of the form
-/// `"bytes <start>-<end>/<total>"`. Returns `null` when the total is unknown (`"*"`) or the
-/// value is malformed.
-fn parseContentRangeTotal(value: []const u8) ?u64 {
-    const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return null;
-    const total = std.mem.trim(u8, value[slash + 1 ..], " \t");
-    if (total.len == 0 or std.mem.eql(u8, total, "*")) return null;
-    return std.fmt.parseInt(u64, total, 10) catch null;
+const ContentRange = union(enum) {
+    satisfied: struct { first: u64, last: u64, total: ?u64 },
+    unsatisfied: u64,
+};
+
+/// Parse RFC Content-Range byte forms: `bytes first-last/total`, `bytes first-last/*`, and
+/// the unsatisfied-range form `bytes */total`.
+fn parseContentRange(value: []const u8) ?ContentRange {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    var unit_end: usize = 0;
+    while (unit_end < trimmed.len and trimmed[unit_end] != ' ' and trimmed[unit_end] != '\t')
+        unit_end += 1;
+    if (unit_end == trimmed.len or !std.ascii.eqlIgnoreCase(trimmed[0..unit_end], "bytes"))
+        return null;
+    const spec = std.mem.trimStart(u8, trimmed[unit_end..], " \t");
+    const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return null;
+    if (std.mem.indexOfScalar(u8, spec[slash + 1 ..], '/') != null) return null;
+
+    const range_part = std.mem.trim(u8, spec[0..slash], " \t");
+    const total_part = std.mem.trim(u8, spec[slash + 1 ..], " \t");
+    if (range_part.len == 0 or total_part.len == 0) return null;
+
+    if (std.mem.eql(u8, range_part, "*")) {
+        if (std.mem.eql(u8, total_part, "*")) return null;
+        return .{ .unsatisfied = std.fmt.parseInt(u64, total_part, 10) catch return null };
+    }
+
+    const dash = std.mem.indexOfScalar(u8, range_part, '-') orelse return null;
+    if (std.mem.indexOfScalar(u8, range_part[dash + 1 ..], '-') != null) return null;
+    const first = std.fmt.parseInt(u64, std.mem.trim(u8, range_part[0..dash], " \t"), 10) catch
+        return null;
+    const last = std.fmt.parseInt(u64, std.mem.trim(u8, range_part[dash + 1 ..], " \t"), 10) catch
+        return null;
+    if (last < first) return null;
+
+    const total: ?u64 = if (std.mem.eql(u8, total_part, "*")) null else (std.fmt.parseInt(u64, total_part, 10) catch return null);
+    if (total) |n| {
+        if (last >= n) return null;
+    }
+    return .{ .satisfied = .{ .first = first, .last = last, .total = total } };
 }
 
-/// Scan a response's headers for `Content-Range` and return its parsed total size, if any.
+/// Scan a response's headers for a parsed `Content-Range` value.
 /// Must be called before `resp.reader(...)` (which invalidates the header bytes).
-fn contentRangeTotal(resp: *std.http.Client.Response) ?u64 {
+fn contentRange(resp: *std.http.Client.Response) ?ContentRange {
     var it = std.http.HeaderIterator.init(resp.head.bytes);
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "content-range"))
-            return parseContentRangeTotal(h.value);
+            return parseContentRange(h.value);
     }
     return null;
+}
+
+const ValidatedRange = struct { span: u64, total: ?u64 };
+
+/// Validate that a satisfied Content-Range answers the exact requested range, shortened only
+/// when the selected representation ends before the requested end.
+fn validateSatisfiedRange(parsed: ContentRange, offset: u64, len: usize) ?ValidatedRange {
+    const range = switch (parsed) {
+        .satisfied => |r| r,
+        .unsatisfied => return null,
+    };
+    if (range.first != offset or len == 0) return null;
+    const requested_last = offset + @as(u64, len) - 1;
+    const expected_last = if (range.total) |total| @min(requested_last, total - 1) else requested_last;
+    if (range.last != expected_last) return null;
+    return .{ .span = range.last - range.first + 1, .total = range.total };
 }
 
 const testing = std.testing;
@@ -257,14 +385,52 @@ test "formatRange builds a correct bytes= header" {
     _ = formatRange(&buf, max - 2, 8);
 }
 
-test "parseContentRangeTotal extracts the size after the slash" {
-    try testing.expectEqual(@as(?u64, 12345), parseContentRangeTotal("bytes 0-99/12345"));
-    try testing.expectEqual(@as(?u64, 1), parseContentRangeTotal("bytes 0-0/1"));
-    // Unknown total or malformed input yields null (caller then falls back).
-    try testing.expectEqual(@as(?u64, null), parseContentRangeTotal("bytes 0-99/*"));
-    try testing.expectEqual(@as(?u64, null), parseContentRangeTotal("12345"));
-    try testing.expectEqual(@as(?u64, null), parseContentRangeTotal("bytes 0-99/"));
-    try testing.expectEqual(@as(?u64, null), parseContentRangeTotal("bytes 0-99/abc"));
+test "parseContentRange validates satisfied and unsatisfied byte ranges" {
+    try testing.expectEqualDeep(
+        ContentRange{ .satisfied = .{ .first = 0, .last = 99, .total = 12345 } },
+        parseContentRange("bytes 0-99/12345").?,
+    );
+    try testing.expectEqualDeep(
+        ContentRange{ .satisfied = .{ .first = 0, .last = 0, .total = null } },
+        parseContentRange("BYTES 0-0/*").?,
+    );
+    try testing.expectEqualDeep(ContentRange{ .unsatisfied = 0 }, parseContentRange(" bytes */0 ").?);
+
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("items 0-99/12345"));
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("bytes 99-0/12345"));
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("bytes 0-99/99"));
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("bytes */*"));
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("bytes 0-99/1/2"));
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("bytes 0-99/abc"));
+    try testing.expectEqual(@as(?ContentRange, null), parseContentRange("bytes 0-99/18446744073709551616"));
+}
+
+test "validateSatisfiedRange accepts exact and EOF-shortened responses" {
+    const exact = parseContentRange("bytes 10-19/100").?;
+    try testing.expectEqualDeep(
+        ValidatedRange{ .span = 10, .total = 100 },
+        validateSatisfiedRange(exact, 10, 10).?,
+    );
+    const shortened = parseContentRange("bytes 90-99/100").?;
+    try testing.expectEqualDeep(
+        ValidatedRange{ .span = 10, .total = 100 },
+        validateSatisfiedRange(shortened, 90, 20).?,
+    );
+    try testing.expectEqual(@as(?ValidatedRange, null), validateSatisfiedRange(exact, 11, 10));
+    try testing.expectEqual(@as(?ValidatedRange, null), validateSatisfiedRange(exact, 10, 20));
+}
+
+test "recordSize memoizes zero and rejects conflicting observations" {
+    const dev = try HttpDevice.open(testing.allocator, "http://example.invalid/data.fits");
+    defer dev.close();
+    const http: *HttpDevice = @ptrCast(@alignCast(dev.ptr));
+
+    try testing.expectEqual(@as(u64, 0), try http.recordSize(0));
+    try testing.expectEqual(@as(u64, 0), try http.recordSize(0));
+    try testing.expectError(error.ReadFailed, http.recordSize(1));
+    try testing.expectEqual(@as(?u64, 0), http.known_size);
+    // A memoized getSize must stay network-free even though the URL cannot resolve.
+    try testing.expectEqual(@as(u64, 0), try dev.getSize());
 }
 
 test "open/close round-trip is leak-free and read-only (no network)" {
@@ -281,8 +447,196 @@ test "open rejects a malformed URL" {
     try testing.expectError(error.ReadFailed, HttpDevice.open(testing.allocator, "http://[::bad"));
 }
 
-// NOTE: a `std.http.Server` loopback integration test (bind 127.0.0.1:0, serve a fixed body,
-// assert a ranged read) is intentionally deferred as blocked-external: the deterministic
-// pieces that must be exact — the range-header builder and the Content-Range size
-// derivation — are covered by the pure-function tests above, and a live socket server risks
-// flakiness/slowness in this suite.
+const LoopbackScript = enum {
+    head_size,
+    large_head_size,
+    range_size,
+    zero_range_size,
+    read_seeds_size,
+    no_range_fallback,
+};
+
+const LoopbackContext = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    script: LoopbackScript,
+    head_count: usize = 0,
+    get_count: usize = 0,
+    err_name: ?[]const u8 = null,
+};
+
+fn requestHeader(req: *const std.http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = req.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
+fn checkLoopbackRequest(
+    req: *const std.http.Server.Request,
+    method: std.http.Method,
+    range: ?[]const u8,
+) !void {
+    if (req.head.method != method) return error.UnexpectedMethod;
+    const encoding = requestHeader(req, "accept-encoding") orelse return error.MissingIdentityEncoding;
+    if (!std.ascii.eqlIgnoreCase(encoding, "identity")) return error.MissingIdentityEncoding;
+    if (range) |expected| {
+        const actual = requestHeader(req, "range") orelse return error.MissingRange;
+        if (!std.mem.eql(u8, actual, expected)) return error.UnexpectedRange;
+    }
+}
+
+fn serveLoopback(ctx: *LoopbackContext) void {
+    serveLoopbackFallible(ctx) catch |err| {
+        ctx.err_name = @errorName(err);
+    };
+}
+
+fn serveLoopbackFallible(ctx: *LoopbackContext) !void {
+    var stream = try ctx.listener.accept(ctx.io);
+    defer stream.close(ctx.io);
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
+    var connection_reader = stream.reader(ctx.io, &read_buf);
+    var connection_writer = stream.writer(ctx.io, &write_buf);
+    var server = std.http.Server.init(&connection_reader.interface, &connection_writer.interface);
+
+    switch (ctx.script) {
+        .head_size, .large_head_size => {
+            var req = try server.receiveHead();
+            try checkLoopbackRequest(&req, .HEAD, null);
+            ctx.head_count += 1;
+            if (ctx.script == .head_size) {
+                try req.respond("abcde", .{ .keep_alive = false });
+            } else {
+                try req.respond("", .{
+                    .keep_alive = false,
+                    .transfer_encoding = .none,
+                    .extra_headers = &.{.{ .name = "content-length", .value = "4294967297" }},
+                });
+            }
+        },
+        .range_size, .zero_range_size, .no_range_fallback => {
+            var head = try server.receiveHead();
+            try checkLoopbackRequest(&head, .HEAD, null);
+            ctx.head_count += 1;
+            try head.respond("", .{ .status = .method_not_allowed, .keep_alive = true });
+
+            var get = try server.receiveHead();
+            try checkLoopbackRequest(&get, .GET, "bytes=0-0");
+            ctx.get_count += 1;
+            if (ctx.script == .range_size) {
+                try get.respond("a", .{
+                    .status = .partial_content,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "content-range", .value = "bytes 0-0/5" }},
+                });
+            } else if (ctx.script == .zero_range_size) {
+                try get.respond("", .{
+                    .status = .range_not_satisfiable,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "content-range", .value = "bytes */0" }},
+                });
+            } else {
+                try get.respond("abcde", .{ .keep_alive = false });
+            }
+        },
+        .read_seeds_size => {
+            var req = try server.receiveHead();
+            try checkLoopbackRequest(&req, .GET, "bytes=1-2");
+            ctx.get_count += 1;
+            try req.respond("bc", .{
+                .status = .partial_content,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "content-range", .value = "bytes 1-2/5" }},
+            });
+        },
+    }
+}
+
+fn runLoopbackScenario(script: LoopbackScript) !void {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    var ctx: LoopbackContext = .{ .io = io, .listener = &listener, .script = script };
+    var thread = try std.Thread.spawn(.{}, serveLoopback, .{&ctx});
+    var joined = false;
+    defer if (!joined) {
+        listener.deinit(io);
+        thread.join();
+    } else {
+        listener.deinit(io);
+    };
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/data.fits", .{
+        listener.socket.address.getPort(),
+    });
+    const dev = try HttpDevice.open(testing.allocator, url);
+    defer dev.close();
+
+    switch (script) {
+        .head_size, .range_size => {
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+        },
+        .large_head_size => {
+            const large = (@as(u64, 1) << 32) + 1;
+            try testing.expectEqual(large, try dev.getSize());
+            try testing.expectEqual(large, try dev.getSize());
+        },
+        .zero_range_size => {
+            try testing.expectEqual(@as(u64, 0), try dev.getSize());
+            try testing.expectEqual(@as(u64, 0), try dev.getSize());
+        },
+        .read_seeds_size => {
+            var buf: [2]u8 = undefined;
+            try testing.expectEqual(@as(usize, 2), try dev.pread(&buf, 1));
+            try testing.expectEqualStrings("bc", &buf);
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+        },
+        .no_range_fallback => {
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+            var buf: [2]u8 = undefined;
+            try testing.expectEqual(@as(usize, 2), try dev.pread(&buf, 2));
+            try testing.expectEqualStrings("cd", &buf);
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+        },
+    }
+
+    thread.join();
+    joined = true;
+    if (ctx.err_name) |name| {
+        std.debug.print("loopback HTTP server failed: {s}\n", .{name});
+        return error.LoopbackServerFailed;
+    }
+    switch (script) {
+        .head_size, .large_head_size => {
+            try testing.expectEqual(@as(usize, 1), ctx.head_count);
+            try testing.expectEqual(@as(usize, 0), ctx.get_count);
+        },
+        .range_size, .zero_range_size, .no_range_fallback => {
+            try testing.expectEqual(@as(usize, 1), ctx.head_count);
+            try testing.expectEqual(@as(usize, 1), ctx.get_count);
+        },
+        .read_seeds_size => {
+            try testing.expectEqual(@as(usize, 0), ctx.head_count);
+            try testing.expectEqual(@as(usize, 1), ctx.get_count);
+        },
+    }
+}
+
+test "HTTP size is discovered once per device lifetime" {
+    try runLoopbackScenario(.head_size);
+    try runLoopbackScenario(.large_head_size);
+    try runLoopbackScenario(.range_size);
+    try runLoopbackScenario(.zero_range_size);
+}
+
+test "range reads seed size and no-range fallback reuses its response" {
+    try runLoopbackScenario(.read_seeds_size);
+    try runLoopbackScenario(.no_range_fallback);
+}
