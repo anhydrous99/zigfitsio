@@ -55,11 +55,47 @@ fn benchImage(comptime T: type, io: std.Io, a: std.mem.Allocator, bitpix: i64, w
     std.debug.print(
         "  {s:<4} {d:>4}-bit {d}x{d}   write {d:>8.1} MB/s    read {d:>8.1} MB/s\n",
         .{
-            @typeName(T),     abspix,
-            w,                h,
-            mbPerSec(bytes_per_rep * reps, write_ns),
-            mbPerSec(bytes_per_rep * reps, read_ns),
+            @typeName(T),                             abspix,
+            w,                                        h,
+            mbPerSec(bytes_per_rep * reps, write_ns), mbPerSec(bytes_per_rep * reps, read_ns),
         },
+    );
+}
+
+fn benchTiledI16(io: std.Io, a: std.mem.Allocator, w: u64, h: u64, reps: usize) !void {
+    const n = w * h;
+    const src = try a.alloc(i16, n);
+    defer a.free(src);
+    const dst = try a.alloc(i16, n);
+    defer a.free(dst);
+    for (src, 0..) |*p, i| p.* = @intCast(i % 1000);
+
+    var mem = fits.MemoryDevice.init(a);
+    defer mem.deinit();
+    var f = try fits.create(a, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    const hdu = try fits.writeCompressed(i16, &f, .{
+        .bitpix = 16,
+        .axes = &.{ w, h },
+        .tile = &.{ 32, 32 },
+        .codec = .gzip_1,
+    }, src);
+    var image = try fits.TiledImage.of(&f, hdu);
+    defer image.deinit(a);
+
+    // Warm the codec/build caches before timing. Deterministic request-count assertions live in
+    // the tiled unit tests; this benchmark measures the complete tiled read path.
+    try image.readAll(i16, dst);
+    const t0 = std.Io.Timestamp.now(io, .awake);
+    var r: usize = 0;
+    while (r < reps) : (r += 1) try image.readAll(i16, dst);
+    const read_ns = elapsedNs(io, t0);
+    if (!std.mem.eql(i16, src, dst)) return error.RoundTripMismatch;
+
+    std.debug.print(
+        "  tiled i16 16-bit {d}x{d} 32x32 tiles   read {d:>8.1} MB/s\n",
+        .{ w, h, mbPerSec(n * @sizeOf(i16) * reps, read_ns) },
     );
 }
 
@@ -74,5 +110,6 @@ pub fn main() !void {
     try benchImage(f64, io, a, -64, 1024, 1024, 20);
     try benchImage(i16, io, a, 16, 1024, 1024, 40);
     try benchImage(i32, io, a, 32, 1024, 1024, 40);
+    try benchTiledI16(io, a, 512, 512, 20);
     std.debug.print("ok — all round-trips verified\n", .{});
 }

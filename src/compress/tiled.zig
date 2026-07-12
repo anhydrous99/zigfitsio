@@ -206,6 +206,199 @@ pub const OfError = binary.OpenError || errors.CompressError;
 pub const ReadError = heap.ReadError || errors.CompressError || errors.StructError ||
     errors.ConvError || errors.ValueError || errors.HeaderError;
 
+const TileSource = enum { compressed, gzip, uncompressed, none };
+
+const RawPayload = struct {
+    abs: u64,
+    bytes: u64,
+};
+
+const ResolvedPayload = struct {
+    source: TileSource,
+    raw: ?RawPayload = null,
+};
+
+// One operation-scoped heap context: descriptor validation shares heap geometry and a lazy device
+// size lookup across every tile, while each selected payload still owns its normal decode buffer.
+const RawPayloadReader = struct {
+    base: *BinTable,
+    heap_ctx: ?heap.ReadContext = null,
+
+    fn init(base: *BinTable) RawPayloadReader {
+        return .{ .base = base };
+    }
+
+    fn resolve(self: *RawPayloadReader, col: u16, desc: heap.Descriptor) heap.ReadError!RawPayload {
+        const column = &self.base.columns[col];
+        const spec = try heap.VlaSpec.of(column);
+        if (self.heap_ctx == null) self.heap_ctx = try heap.ReadContext.init(self.base);
+        const plan = try self.heap_ctx.?.planRaw(spec, desc);
+        return .{ .abs = plan.abs orelse return error.BadDescriptor, .bytes = plan.bytes };
+    }
+
+    fn read(self: *RawPayloadReader, alloc: Allocator, payload: RawPayload) heap.ReadError![]u8 {
+        const len = std.math.cast(usize, payload.bytes) orelse return error.LimitExceeded;
+        const out = try alloc.alloc(u8, len);
+        errdefer alloc.free(out);
+        try self.base.fits.dev.readAll(out, payload.abs);
+        return out;
+    }
+};
+
+// Keep metadata staging bounded and aligned with the iterator/table batching target: 16 FITS
+// logical blocks. Tables with a wider row fall back to reading each required field once.
+const TILE_ROW_WINDOW_BYTES: usize = 16 * 2880;
+
+const TileReadContext = struct {
+    image: *TiledImage,
+    payloads: RawPayloadReader,
+    storage: ?[]u8 = null,
+    window_first: u64 = 0,
+    window_rows: usize = 0,
+
+    fn init(image: *TiledImage) ReadError!TileReadContext {
+        var required: u64 = 0;
+        const cols = [_]?u16{
+            image.comp_col,
+            image.gzip_col,
+            image.uncomp_col,
+            image.zscale_col,
+            image.zzero_col,
+            image.zblank_col,
+        };
+        var valid_layout = true;
+        for (cols) |maybe_col| {
+            const col = maybe_col orelse continue;
+            const field_bytes = image.base.columns[col].tform.fieldBytes() catch {
+                valid_layout = false;
+                break;
+            };
+            required = std.math.add(u64, required, field_bytes) catch {
+                valid_layout = false;
+                break;
+            };
+        }
+        const amplification_limit = std.math.mul(u64, required, 4) catch std.math.maxInt(u64);
+        const budget_u64 = @min(@as(u64, TILE_ROW_WINDOW_BYTES), image.fits.limits.max_open_alloc);
+        const window_enabled = valid_layout and required != 0 and
+            image.base.naxis1 <= budget_u64 and image.base.naxis1 <= amplification_limit;
+        var storage: ?[]u8 = null;
+        if (window_enabled) {
+            const budget = std.math.cast(usize, budget_u64) orelse return error.LimitExceeded;
+            storage = try image.fits.alloc.alloc(u8, budget);
+        }
+        return .{
+            .image = image,
+            .payloads = RawPayloadReader.init(&image.base),
+            .storage = storage,
+        };
+    }
+
+    fn deinit(self: *TileReadContext) void {
+        if (self.storage) |storage| self.image.fits.alloc.free(storage);
+        self.storage = null;
+    }
+
+    fn row(self: *TileReadContext, row_index: u64) ReadError!TileRow {
+        if (row_index >= self.image.base.naxis2) return error.RowOutOfRange;
+        const row_bytes = std.math.cast(usize, self.image.base.naxis1) orelse return error.LimitExceeded;
+        const storage = self.storage orelse {
+            return .{ .ctx = self, .row_index = row_index, .raw = null };
+        };
+        if (row_bytes == 0 or row_bytes > storage.len) {
+            return .{ .ctx = self, .row_index = row_index, .raw = null };
+        }
+
+        if (self.window_rows == 0 or row_index < self.window_first or
+            row_index - self.window_first >= self.window_rows)
+        {
+            const capacity = storage.len / row_bytes;
+            self.window_first = row_index;
+            self.window_rows = @intCast(@min(@as(u64, capacity), self.image.base.naxis2 - row_index));
+            const bytes = try limits.mul(@intCast(self.window_rows), self.image.base.naxis1);
+            const len = std.math.cast(usize, bytes) orelse return error.LimitExceeded;
+            const row_off = try limits.mul(row_index, self.image.base.naxis1);
+            const abs = try limits.add(self.image.base.hdu.data_off, row_off);
+            try self.image.fits.dev.readAll(storage[0..len], abs);
+        }
+
+        const relative: usize = @intCast(row_index - self.window_first);
+        const start = relative * row_bytes;
+        return .{
+            .ctx = self,
+            .row_index = row_index,
+            .raw = storage[start..][0..row_bytes],
+        };
+    }
+
+    fn resolvePayload(self: *TileReadContext, tile_row: TileRow) ReadError!ResolvedPayload {
+        const candidates = [_]struct { source: TileSource, col: ?u16 }{
+            .{ .source = .compressed, .col = self.image.comp_col },
+            .{ .source = .gzip, .col = self.image.gzip_col },
+            .{ .source = .uncompressed, .col = self.image.uncomp_col },
+        };
+        for (candidates) |candidate| {
+            const col = candidate.col orelse continue;
+            const desc = try tile_row.descriptor(col);
+            if (desc.len > 0) {
+                return .{ .source = candidate.source, .raw = try self.payloads.resolve(col, desc) };
+            }
+        }
+        return .{ .source = .none };
+    }
+};
+
+const TileRow = struct {
+    ctx: *TileReadContext,
+    row_index: u64,
+    raw: ?[]const u8,
+
+    fn descriptor(self: TileRow, col: u16) heap.DescriptorError!heap.Descriptor {
+        if (self.raw) |row_bytes| {
+            const column = &self.ctx.image.base.columns[col];
+            const width: usize = switch (column.tform.type) {
+                .vla32 => 8,
+                .vla64 => 16,
+                else => return error.BadDescriptor,
+            };
+            const start = std.math.cast(usize, column.byte_offset) orelse return error.LimitExceeded;
+            if (start > row_bytes.len or width > row_bytes.len - start) return error.BadDescriptor;
+            return heap.decodeDescriptor(column, row_bytes[start..][0..width]);
+        }
+        return heap.readDescriptor(&self.ctx.image.base, .{ .index = col }, self.row_index);
+    }
+
+    fn scalar(self: TileRow, comptime T: type, col: u16) binary.AccessError!T {
+        var out: [1]T = undefined;
+        if (self.raw) |row_bytes| {
+            const column = &self.ctx.image.base.columns[col];
+            const field_bytes = try column.tform.fieldBytes();
+            const len = std.math.cast(usize, field_bytes) orelse return error.LimitExceeded;
+            const start = std.math.cast(usize, column.byte_offset) orelse return error.LimitExceeded;
+            if (start > row_bytes.len or len > row_bytes.len - start) return error.CellOutOfRange;
+            try binary.decodeCellBytes(T, column, row_bytes[start..][0..len], &out, .{});
+        } else {
+            try self.ctx.image.base.readColumn(T, .{ .index = col }, self.row_index, &out, .{});
+        }
+        return out[0];
+    }
+
+    fn scale(self: TileRow) binary.AccessError!f64 {
+        if (self.ctx.image.zscale_col) |col| return self.scalar(f64, col);
+        return self.ctx.image.zscale_kw orelse 1.0;
+    }
+
+    fn zero(self: TileRow) binary.AccessError!f64 {
+        if (self.ctx.image.zzero_col) |col| return self.scalar(f64, col);
+        return self.ctx.image.zzero_kw orelse 0.0;
+    }
+
+    fn blank(self: TileRow) binary.AccessError!?i64 {
+        if (self.ctx.image.zblank_col) |col| return try self.scalar(i64, col);
+        return self.ctx.image.zblank_kw;
+    }
+};
+
 /// A read view over a tiled-compressed image stored in a `ZIMAGE` `BINTABLE`.
 pub const TiledImage = struct {
     /// The underlying binary-table view (owns the column descriptors).
@@ -468,6 +661,8 @@ pub const TiledImage = struct {
         for (0..n) |i| ntiles[i] = ceilDiv(self.znaxisn[i], self.ztilen[i]);
 
         const scaled = self.isScaled();
+        var read_ctx = try TileReadContext.init(self);
+        defer read_ctx.deinit();
 
         var row: u64 = 0;
         while (row < self.ntiles_total) : (row += 1) {
@@ -484,16 +679,19 @@ pub const TiledImage = struct {
             }
             if (npix_tile == 0) continue;
 
-            const zs: f64 = if (scaled) try self.tileScale(row) else 1.0;
-            const zz: f64 = if (scaled) try self.tileZero(row) else 0.0;
+            const tile_row = try read_ctx.row(row);
+
+            const zs: f64 = if (scaled) try tile_row.scale() else 1.0;
+            const zz: f64 = if (scaled) try tile_row.zero() else 0.0;
             // Resolve the per-tile/keyword `ZBLANK` (integer images only; `BLANK` is undefined for
             // floating images). A decoded stored value equal to `ZBLANK` is the null marker.
-            const blank: ?i64 = if (@typeInfo(Stored) == .int) try self.tileBlank(row) else null;
+            const blank: ?i64 = if (@typeInfo(Stored) == .int) try tile_row.blank() else null;
 
             const expected = try limits.mul(npix_tile, w);
             try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
 
-            const stored_bytes = try self.decodeTile(alloc, row, w, expected, npix_tile, tdim);
+            const payload = try read_ctx.resolvePayload(tile_row);
+            const stored_bytes = try self.decodeTile(&read_ctx.payloads, alloc, payload, w, expected, npix_tile, tdim);
             defer alloc.free(stored_bytes);
             if (stored_bytes.len != @as(usize, @intCast(expected))) return error.CorruptTile;
 
@@ -569,6 +767,8 @@ pub const TiledImage = struct {
         // write path (`CompressSpec.zdither0 = 1`) and how funpack reads such a file.
         const zd = self.zdither0 orelse 1;
         const nan = std.math.nan(f64);
+        var read_ctx = try TileReadContext.init(self);
+        defer read_ctx.deinit();
 
         var row: u64 = 0;
         while (row < self.ntiles_total) : (row += 1) {
@@ -584,17 +784,18 @@ pub const TiledImage = struct {
             }
             if (npix_tile == 0) continue;
 
-            const src = try self.tileSource(row);
-            if (src == .compressed) {
+            const tile_row = try read_ctx.row(row);
+            const payload = try read_ctx.resolvePayload(tile_row);
+            if (payload.source == .compressed) {
                 // Quantized-integer tile: 32-bit stored values, per-tile linear map + dither.
-                const zs = try self.tileScale(row);
-                const zz = try self.tileZero(row);
+                const zs = try tile_row.scale();
+                const zz = try tile_row.zero();
                 // The null sentinel is the declared `ZBLANK` when present, otherwise the reserved
                 // `null_value` handled inside `unquantizeNext`.
-                const blank: ?i64 = try self.tileBlank(row);
+                const blank: ?i64 = try tile_row.blank();
                 const expected = try limits.mul(npix_tile, w);
                 try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
-                const stored_bytes = try self.decodeTile(alloc, row, w, expected, npix_tile, tdim);
+                const stored_bytes = try self.decodeTile(&read_ctx.payloads, alloc, payload, w, expected, npix_tile, tdim);
                 defer alloc.free(stored_bytes);
                 if (stored_bytes.len != @as(usize, @intCast(expected))) return error.CorruptTile;
                 var cur = dither.Dither.init(table, kind, zd, row);
@@ -624,7 +825,7 @@ pub const TiledImage = struct {
                 const fw = bitpixWidth(self.zbitpix); // 4 for -32, 8 for -64
                 const expected = try limits.mul(npix_tile, fw);
                 try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
-                const raw = try self.decodeTile(alloc, row, fw, expected, npix_tile, tdim);
+                const raw = try self.decodeTile(&read_ctx.payloads, alloc, payload, fw, expected, npix_tile, tdim);
                 defer alloc.free(raw);
                 if (raw.len != @as(usize, @intCast(expected))) return error.CorruptTile;
                 var p: u64 = 0;
@@ -655,29 +856,26 @@ pub const TiledImage = struct {
     // byte; the caller's `stored_bytes.len == expected` check still enforces exactness. RICE/PLIO/
     // HCOMPRESS produce stored values that this routine re-encodes big-endian (width `w`) so the
     // common placement loop can read them with `endian.read`.
-    fn decodeTile(self: *TiledImage, alloc: Allocator, row: u64, w: usize, expected: u64, npix_tile: u64, tdim: []const u64) ReadError![]u8 {
+    fn decodeTile(self: *TiledImage, reader: *RawPayloadReader, alloc: Allocator, payload: ResolvedPayload, w: usize, expected: u64, npix_tile: u64, tdim: []const u64) ReadError![]u8 {
         const cap = expected + 1;
-        if (self.comp_col) |col| {
-            if (try self.hasData(col, row)) {
-                const cbytes = try self.readDescBytes(alloc, col, row);
+        switch (payload.source) {
+            .compressed => {
+                const cbytes = try reader.read(alloc, payload.raw.?);
                 defer alloc.free(cbytes);
                 return self.decodeCompressed(alloc, cbytes, w, npix_tile, tdim, cap);
-            }
-        }
-        if (self.gzip_col) |col| {
-            if (try self.hasData(col, row)) {
-                const cbytes = try self.readDescBytes(alloc, col, row);
+            },
+            .gzip => {
+                const cbytes = try reader.read(alloc, payload.raw.?);
                 defer alloc.free(cbytes);
                 return try gzip.gzipDecode(alloc, cbytes, cap);
-            }
-        }
-        if (self.uncomp_col) |col| {
-            if (try self.hasData(col, row)) {
-                const rbytes = try self.readDescBytes(alloc, col, row);
+            },
+            .uncompressed => {
+                const rbytes = try reader.read(alloc, payload.raw.?);
                 errdefer alloc.free(rbytes);
                 if (rbytes.len != @as(usize, @intCast(expected))) return error.CorruptTile;
                 return rbytes;
-            }
+            },
+            .none => {},
         }
         const z = try alloc.alloc(u8, @intCast(expected));
         @memset(z, 0);
@@ -767,70 +965,10 @@ pub const TiledImage = struct {
         return null;
     }
 
-    // Whether the VLA cell at (`row`, `col`) holds a non-empty payload.
-    fn hasData(self: *TiledImage, col: u16, row: u64) heap.DescriptorError!bool {
-        const d = try heap.readDescriptor(&self.base, .{ .index = col }, row);
-        return d.len > 0;
-    }
-
-    // Which column supplies tile `row`'s payload, per the §10.1 precedence. On the quantized-float
-    // read path this distinguishes a quantized-integer tile (`.compressed`) from a losslessly-
-    // stored raw-float fallback tile (`.gzip`/`.uncompressed`), which must be read as raw IEEE
-    // floats rather than unquantized. `.none` is an empty (all-zero) tile.
-    const TileSource = enum { compressed, gzip, uncompressed, none };
-    fn tileSource(self: *TiledImage, row: u64) heap.DescriptorError!TileSource {
-        if (self.comp_col) |col| {
-            if (try self.hasData(col, row)) return .compressed;
-        }
-        if (self.gzip_col) |col| {
-            if (try self.hasData(col, row)) return .gzip;
-        }
-        if (self.uncomp_col) |col| {
-            if (try self.hasData(col, row)) return .uncompressed;
-        }
-        return .none;
-    }
-
-    // Read the raw (big-endian, untranslated) payload bytes of the VLA cell at (`row`, `col`):
-    // `descriptor.len × elemBytes` bytes, bounds-checked against the heap, the data unit, and
-    // the device length before allocating (NFR-SAFE-1).
-    fn readDescBytes(self: *TiledImage, alloc: Allocator, col: u16, row: u64) heap.ReadError![]u8 {
-        return readVlaRawBytes(&self.base, alloc, col, row);
-    }
-
     // Whether any per-tile scaling (ZSCALE/ZZERO column or keyword) is in effect.
     fn isScaled(self: *const TiledImage) bool {
         return self.zscale_col != null or self.zzero_col != null or
             self.zscale_kw != null or self.zzero_kw != null;
-    }
-
-    fn tileScale(self: *TiledImage, row: u64) binary.AccessError!f64 {
-        if (self.zscale_col) |col| {
-            var buf: [1]f64 = undefined;
-            try self.base.readColumn(f64, .{ .index = col }, row, &buf, .{});
-            return buf[0];
-        }
-        return self.zscale_kw orelse 1.0;
-    }
-
-    fn tileZero(self: *TiledImage, row: u64) binary.AccessError!f64 {
-        if (self.zzero_col) |col| {
-            var buf: [1]f64 = undefined;
-            try self.base.readColumn(f64, .{ .index = col }, row, &buf, .{});
-            return buf[0];
-        }
-        return self.zzero_kw orelse 0.0;
-    }
-
-    // The effective `ZBLANK` for tile `row`: the per-tile column value when a `ZBLANK` column is
-    // present, else the `ZBLANK` keyword (or `null` when neither is declared).
-    fn tileBlank(self: *TiledImage, row: u64) binary.AccessError!?i64 {
-        if (self.zblank_col) |col| {
-            var buf: [1]i64 = undefined;
-            try self.base.readColumn(i64, .{ .index = col }, row, &buf, .{});
-            return buf[0];
-        }
-        return self.zblank_kw;
     }
 };
 
@@ -868,32 +1006,10 @@ fn bitpixWidth(b: i64) usize {
 // `descriptor.len × elemBytes` bytes, bounds-checked against the heap, the data unit, and the
 // device length before allocating (NFR-SAFE-1). Shared by the image and table read paths.
 fn readVlaRawBytes(base: *BinTable, alloc: Allocator, col: u16, row: u64) heap.ReadError![]u8 {
-    const fits = base.fits;
-    const column = &base.columns[col];
-    const spec = try heap.VlaSpec.of(column);
-    const d = try heap.readDescriptor(base, .{ .index = col }, row);
-    if (d.len < 0 or d.off < 0) return error.BadDescriptor;
-    const count: u64 = @intCast(d.len);
-    const off: u64 = @intCast(d.off);
-    const bytes = try limits.mul(count, spec.elem.elemBytes());
-    try limits.ensureWithin(bytes, fits.limits.max_heap_bytes, null);
-
-    const geom = try heap.heapGeometry(base);
-    const heap_end = std.math.add(u64, off, bytes) catch return error.BadDescriptor;
-    if (heap_end > geom.heap_size) return error.BadDescriptor;
-    const abs = geom.heap_abs_off + off;
-    const abs_end = abs + bytes;
-    if (abs_end > geom.data_abs_end) return error.BadDescriptor;
-    const dev_size = try fits.dev.getSize();
-    if (abs_end > dev_size) return error.BadDescriptor;
-
-    // Narrow FALLIBLY: max_heap_bytes (default 1<<34) exceeds a 32-bit usize, so a plain @intCast
-    // could panic on wasm32 for a large heap; reject an out-of-usize-range size instead (NFR-SAFE-1).
-    const buf_len = std.math.cast(usize, bytes) orelse return error.LimitExceeded;
-    const buf = try alloc.alloc(u8, buf_len);
-    errdefer alloc.free(buf);
-    try fits.dev.readAll(buf, abs);
-    return buf;
+    const desc = try heap.readDescriptor(base, .{ .index = col }, row);
+    if (desc.len == 0) return alloc.alloc(u8, 0);
+    var reader = RawPayloadReader.init(base);
+    return reader.read(alloc, try reader.resolve(col, desc));
 }
 
 // Re-encode `native` (native-endian, width `w` per element) as big-endian element bytes so the
@@ -1803,6 +1919,7 @@ pub const TileTable = struct {
         const total = try limits.mul(self.orig_rows, c.repeat);
         if (out.len != total) return error.BadDimensions;
         const alloc = self.fits.alloc;
+        var payloads = RawPayloadReader.init(&self.base);
 
         var tile: u64 = 0;
         while (tile < self.ntiles) : (tile += 1) {
@@ -1813,8 +1930,10 @@ pub const TileTable = struct {
             const out_off: usize = @intCast(try limits.mul(first, c.repeat));
             const slot = out[out_off..][0..@intCast(nelem)];
 
-            if (try cellHasData(&self.base, c.data_col, tile)) {
-                const cbytes = try readVlaRawBytes(&self.base, alloc, c.data_col, tile);
+            const desc = try heap.readDescriptor(&self.base, .{ .index = c.data_col }, tile);
+            if (desc.len > 0) {
+                const payload = try payloads.resolve(c.data_col, desc);
+                const cbytes = try payloads.read(alloc, payload);
                 defer alloc.free(cbytes);
                 const stored = switch (c.codec) {
                     .gzip_1 => try gzip.gzipDecode(alloc, cbytes, expected + 1),
@@ -1830,11 +1949,6 @@ pub const TileTable = struct {
         }
     }
 };
-
-fn cellHasData(base: *BinTable, col: u16, row: u64) heap.DescriptorError!bool {
-    const d = try heap.readDescriptor(base, .{ .index = col }, row);
-    return d.len > 0;
-}
 
 fn convertTableTile(comptime T: type, elem: BinaryType, stored_be: []const u8, out: []T) errors.ConvError!void {
     switch (elem) {
@@ -1858,6 +1972,45 @@ fn convertRun(comptime Stored: type, comptime T: type, src_be: []const u8, out: 
 // ── tests ──────────────────────────────────────────────────────────────────────────────────
 const testing = std.testing;
 const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
+const Device = @import("../io/device.zig").Device;
+
+const ProbeDevice = struct {
+    inner: Device,
+    preads: usize = 0,
+    get_sizes: usize = 0,
+
+    fn pread(ctx: *anyopaque, out: []u8, offset: u64) errors.IoError!usize {
+        const self: *ProbeDevice = @ptrCast(@alignCast(ctx));
+        self.preads += 1;
+        return self.inner.pread(out, offset);
+    }
+
+    fn getSize(ctx: *anyopaque) errors.IoError!u64 {
+        const self: *ProbeDevice = @ptrCast(@alignCast(ctx));
+        self.get_sizes += 1;
+        return self.inner.getSize();
+    }
+
+    fn sync(ctx: *anyopaque) errors.IoError!void {
+        const self: *ProbeDevice = @ptrCast(@alignCast(ctx));
+        return self.inner.sync();
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    const vtable: Device.VTable = .{
+        .pread = pread,
+        .pwrite = null,
+        .getSize = getSize,
+        .setSize = null,
+        .sync = sync,
+        .close = close,
+    };
+
+    fn device(self: *ProbeDevice) Device {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
 
 // A handle + memory device with a primary HDU already in place.
 const Fixture = struct {
@@ -2030,6 +2183,179 @@ test "GZIP_1 multi-tile decode places edge/partial tiles per row-major geometry"
     var out: [6]i16 = undefined;
     try ti.readAll(i16, &out);
     try testing.expectEqualSlices(i16, &[_]i16{ 10, 11, 12, 13, 14, 15 }, &out);
+}
+
+test "tiled image reads compact Q-descriptor rows once and payloads once" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const spec = ZSpec{
+        .ztype = "GZIP_1",
+        .zbitpix = 16,
+        .znaxisn = &.{16},
+        .ztilen = &.{1},
+        .nrows = 16,
+        .pcount = 4096,
+        .tforms = &.{"1QB"},
+        .ttypes = &.{"COMPRESSED_DATA"},
+    };
+    const hdu = try fx.f.appendHdu(try buildZHeader(alloc, spec));
+    var bt = try BinTable.of(&fx.f, hdu);
+    var mgr = try HeapManager.initForTable(&bt);
+    for (0..16) |i| {
+        const value = [_]i16{@intCast(i + 1)};
+        try writeTileI16(alloc, &bt, &mgr, 0, i, &value, false);
+    }
+    mgr.deinit(alloc);
+    bt.deinit(alloc);
+
+    var image = try TiledImage.of(&fx.f, hdu);
+    defer image.deinit(alloc);
+    // Encoded tile payloads are opaque streams, not caller-visible VLA element transfers.
+    fx.f.limits.max_vla_elems = 1;
+    var probe: ProbeDevice = .{ .inner = fx.mem.device() };
+    fx.f.dev = probe.device();
+
+    var out: [16]i16 = undefined;
+    try image.readAll(i16, &out);
+    for (out, 0..) |value, i| try testing.expectEqual(@as(i16, @intCast(i + 1)), value);
+    // One compact main-table window plus one heap read for each selected tile payload.
+    try testing.expectEqual(@as(usize, 17), probe.preads);
+    try testing.expectEqual(@as(usize, 1), probe.get_sizes);
+}
+
+test "wide tiled rows avoid metadata read amplification" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const spec = ZSpec{
+        .ztype = "GZIP_1",
+        .zbitpix = 16,
+        .znaxisn = &.{2},
+        .ztilen = &.{1},
+        .nrows = 2,
+        .pcount = 2048,
+        .tforms = &.{ "1PB", "1024A" },
+        .ttypes = &.{ "COMPRESSED_DATA", "UNUSED" },
+    };
+    const hdu = try fx.f.appendHdu(try buildZHeader(alloc, spec));
+    var bt = try BinTable.of(&fx.f, hdu);
+    var mgr = try HeapManager.initForTable(&bt);
+    try writeTileI16(alloc, &bt, &mgr, 0, 0, &[_]i16{41}, false);
+    try writeTileI16(alloc, &bt, &mgr, 0, 1, &[_]i16{42}, false);
+    mgr.deinit(alloc);
+    bt.deinit(alloc);
+
+    var image = try TiledImage.of(&fx.f, hdu);
+    defer image.deinit(alloc);
+    var probe: ProbeDevice = .{ .inner = fx.mem.device() };
+    fx.f.dev = probe.device();
+
+    var out: [2]i16 = undefined;
+    try image.readAll(i16, &out);
+    try testing.expectEqualSlices(i16, &[_]i16{ 41, 42 }, &out);
+    // The unrelated 1 KiB field makes full-row prefetch exceed the 4x amplification ceiling, so
+    // each tile performs one descriptor read and one payload read instead.
+    try testing.expectEqual(@as(usize, 4), probe.preads);
+    try testing.expectEqual(@as(usize, 1), probe.get_sizes);
+}
+
+test "tiled metadata window honors max_open_alloc" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const spec = ZSpec{
+        .ztype = "GZIP_1",
+        .zbitpix = 16,
+        .znaxisn = &.{2},
+        .ztilen = &.{1},
+        .nrows = 2,
+        .pcount = 2048,
+        .tforms = &.{"1PB"},
+        .ttypes = &.{"COMPRESSED_DATA"},
+    };
+    const hdu = try fx.f.appendHdu(try buildZHeader(alloc, spec));
+    var bt = try BinTable.of(&fx.f, hdu);
+    var mgr = try HeapManager.initForTable(&bt);
+    try writeTileI16(alloc, &bt, &mgr, 0, 0, &[_]i16{51}, false);
+    try writeTileI16(alloc, &bt, &mgr, 0, 1, &[_]i16{52}, false);
+    mgr.deinit(alloc);
+    bt.deinit(alloc);
+
+    var image = try TiledImage.of(&fx.f, hdu);
+    defer image.deinit(alloc);
+    // Disable metadata staging without affecting the ordinary per-tile decode buffers.
+    fx.f.limits.max_open_alloc = 0;
+    var probe: ProbeDevice = .{ .inner = fx.mem.device() };
+    fx.f.dev = probe.device();
+
+    var out: [2]i16 = undefined;
+    try image.readAll(i16, &out);
+    try testing.expectEqualSlices(i16, &[_]i16{ 51, 52 }, &out);
+    // With no staging budget, each tile performs one descriptor and one payload read.
+    try testing.expectEqual(@as(usize, 4), probe.preads);
+    try testing.expectEqual(@as(usize, 1), probe.get_sizes);
+}
+
+test "all-empty tiled image reads one metadata window and never queries device size" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const spec = ZSpec{
+        .ztype = "GZIP_1",
+        .zbitpix = 16,
+        .znaxisn = &.{8},
+        .ztilen = &.{1},
+        .nrows = 8,
+        .pcount = 64,
+        .tforms = &.{"1PB"},
+        .ttypes = &.{"COMPRESSED_DATA"},
+    };
+    const hdu = try fx.f.appendHdu(try buildZHeader(alloc, spec));
+    var image = try TiledImage.of(&fx.f, hdu);
+    defer image.deinit(alloc);
+    var probe: ProbeDevice = .{ .inner = fx.mem.device() };
+    fx.f.dev = probe.device();
+
+    var out: [8]i16 = undefined;
+    try image.readAll(i16, &out);
+    try testing.expectEqualSlices(i16, &([_]i16{0} ** 8), &out);
+    try testing.expectEqual(@as(usize, 1), probe.preads);
+    try testing.expectEqual(@as(usize, 0), probe.get_sizes);
+}
+
+test "dithered tiles share one descriptor and scalar metadata window" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [64]f32 = undefined;
+    for (&src, 0..) |*value, i| {
+        const wave: i32 = @intCast((i * 17) % 23);
+        value.* = @as(f32, @floatFromInt(wave - 11)) * 0.75 + @as(f32, @floatFromInt(i / 8));
+    }
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 8, 8 },
+        .codec = .gzip_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 1,
+    }, &src);
+    var image = try TiledImage.of(&fx.f, hdu);
+    defer image.deinit(alloc);
+    var probe: ProbeDevice = .{ .inner = fx.mem.device() };
+    fx.f.dev = probe.device();
+
+    var out: [64]f32 = undefined;
+    try image.readAll(f32, &out);
+    for (src, out) |expected, actual| try testing.expect(@abs(expected - actual) <= 0.02);
+    // Default tiling produces eight row-strip tiles: one row window plus eight heap payloads.
+    try testing.expectEqual(@as(usize, 9), probe.preads);
+    try testing.expectEqual(@as(usize, 1), probe.get_sizes);
 }
 
 test "single-tile GZIP_2 (shuffled) round-trip" {
@@ -3695,14 +4021,24 @@ test "ofTable decompresses GZIP_2 per-tile column data back to rows" {
     defer tt.deinit(alloc);
     try testing.expectEqual(@as(u64, 5), tt.orig_rows);
     try testing.expectEqual(@as(u64, 3), tt.ntiles);
+    // Compressed table tiles use the raw payload planner and do not consume the decoded VLA
+    // element allowance.
+    fx.f.limits.max_vla_elems = 1;
+    var probe: ProbeDevice = .{ .inner = fx.mem.device() };
+    fx.f.dev = probe.device();
 
     var o0: [5]i32 = undefined;
     try tt.readColumn(i32, 0, &o0);
     try testing.expectEqualSlices(i32, &col0, &o0);
+    // Three descriptor reads plus three heap payload reads; device size is shared by the call.
+    try testing.expectEqual(@as(usize, 6), probe.preads);
+    try testing.expectEqual(@as(usize, 1), probe.get_sizes);
 
     var o1: [5]f32 = undefined;
     try tt.readColumn(f32, 1, &o1);
     try testing.expectEqualSlices(f32, &col1, &o1);
+    try testing.expectEqual(@as(usize, 12), probe.preads);
+    try testing.expectEqual(@as(usize, 2), probe.get_sizes);
 }
 
 test "ofTable rejects a non-ZTABLE binary table" {

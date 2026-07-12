@@ -17,6 +17,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
   crossings for large headers and batch edits. (#59)
 
 ### Changed
+- **Core / Compression**: tiled-image reads now fetch compact descriptor and per-tile metadata
+  rows in bounded windows, carry the selected descriptor through heap validation and decoding,
+  and share heap geometry/device-size checks across the operation. Tiled-table cells likewise
+  reuse their first descriptor read, eliminating repeated small reads and HTTP Range requests.
 - **Core / Performance**: binary and ASCII table column reads now batch dense strided fields
   through bounded row windows instead of issuing one device call per row; true whole-row
   column writes are batched as well. Binary-table iterators share one read window across every
