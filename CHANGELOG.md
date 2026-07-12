@@ -6,7 +6,15 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Core / C ABI**: versioned logical-header snapshots expose parsed cards in one bounded
+  read, and atomic batch edits validate a staged header before committing once. Revision
+  checks prevent stale writers, while HDU-aware structural policy protects table and
+  compression layout keywords. (#59)
+- **Python / TypeScript**: header reads now use the shared logical-header core, with
+  `Header.edit()` in Python and `Header.transaction()` in TypeScript for atomic multi-key
+  updates. This centralizes HIERARCH/CONTINUE handling and substantially reduces binding
+  crossings for large headers and batch edits. (#59)
 
 ## [0.1.5] - 2026-07-11
 
