@@ -188,6 +188,7 @@ jobs:
           zig build emit-fixtures -- "$OUT"
           python interop/check_funpack.py "$OUT"           # CFITSIO funpack decodes every codec to the ramp
           python interop/verify_outbound.py "$OUT"         # Astropy opens/verifies every emitted file
+          fitsverify -q "$OUT/image_checksum.fits"          # checksum-bearing fixture is a hard gate
           for f in "$OUT"/*.fits; do fitsverify -q "$f" || true; done   # informational structural report
       - name: Golden drift-guard — regenerate & byte-diff (informational; needs CFITSIO 4.6.4)
         if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'

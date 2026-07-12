@@ -39,6 +39,18 @@ pub const Plan = struct {
     }
 };
 
+/// Validate a caller-owned row-strided destination and return its row count as `usize`.
+/// Only the addressed cell bytes must be present; padding after the final row is optional.
+pub fn validateStrided(row_count: u64, cell_bytes: usize, row_stride: usize, out_len: usize) errors.TableError!usize {
+    const rows = std.math.cast(usize, row_count) orelse return error.CellOutOfRange;
+    if (rows == 0) return 0;
+    if (row_stride < cell_bytes) return error.CellOutOfRange;
+    const last = std.math.mul(usize, rows - 1, row_stride) catch return error.CellOutOfRange;
+    const span = std.math.add(usize, last, cell_bytes) catch return error.CellOutOfRange;
+    if (span > out_len) return error.CellOutOfRange;
+    return rows;
+}
+
 /// Non-owning, fixed-size writable memory device used to run the existing cell codecs over a
 /// physical row window.  It never grows and does not own or close the caller's buffer.
 pub const BorrowedDevice = struct {
@@ -97,6 +109,15 @@ test "planner batches dense rows and rejects sparse rows" {
     const limited = Plan.init(16, 4, 10_000, 4096).?;
     try testing.expectEqual(@as(usize, 256), limited.rows_per_window);
     try testing.expectEqual(@as(usize, 4096), limited.window_bytes);
+}
+
+test "row-strided destination validation checks span and overflow" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 3), try validateStrided(3, 4, 9, 22));
+    try testing.expectEqual(@as(usize, 0), try validateStrided(0, 8, 0, 0));
+    try testing.expectError(error.CellOutOfRange, validateStrided(2, 4, 3, 8));
+    try testing.expectError(error.CellOutOfRange, validateStrided(3, 4, 9, 21));
+    try testing.expectError(error.CellOutOfRange, validateStrided(2, 1, std.math.maxInt(usize), std.math.maxInt(usize)));
 }
 
 test "borrowed device reads and writes without resizing" {

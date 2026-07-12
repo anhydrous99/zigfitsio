@@ -352,6 +352,27 @@ describe("compression / bytes / integrity / wcs", () => {
     }
   });
 
+  test("fromBytes owns its input and toBytes returns a stable copy", () => {
+    const data = new zf.FitsArray(Float32Array.from([1, 2, 3, 4]), [2, 2]);
+    const source = new zf.HDUList([new zf.PrimaryHDU({ data })]).toBytes();
+    const hdul = zf.fromBytes(source, "update");
+    source.fill(0);
+    try {
+      expect(asNums((hdul.get(0).data as zf.FitsArray).data)).toEqual([1, 2, 3, 4]);
+      const copy = hdul.toBytes();
+      hdul.get(0).header.set("OBSERVER", "changed after copy");
+      expect(new TextDecoder().decode(copy.subarray(0, 6))).toBe("SIMPLE");
+      const copied = zf.fromBytes(copy);
+      try {
+        expect(copied.get(0).header.get("OBSERVER")).toBeUndefined();
+      } finally {
+        copied.close();
+      }
+    } finally {
+      hdul.close();
+    }
+  });
+
   test("checksum write + verify has no error findings", () => {
     const data = new zf.FitsArray(fill(new Float32Array(16), (i) => i), [4, 4]);
     const p = tmp.path();

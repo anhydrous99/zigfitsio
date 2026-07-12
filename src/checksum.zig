@@ -14,10 +14,11 @@
 //!   string-valued keyword whose quotes fall in card columns 11–28 (its own bytes are part of
 //!   the accumulated sum).
 //!
-//! Ordering is enforced by `update`: `DATASUM` is written **before** `CHECKSUM` is accumulated,
-//! because the `CHECKSUM` covers the `DATASUM` card text (FR-SUM-1). Every multi-byte wire value
-//! is read big-endian through `endian.read` (GC-5); the data unit is summed in block-aligned
-//! chunks so a multi-GB HDU stays in bounded memory (NFR-PERF-3).
+//! Ordering is enforced by `update`: `DATASUM` is written **before** the final whole-HDU sum is
+//! formed, because the `CHECKSUM` covers the `DATASUM` card text (FR-SUM-1). The padded data unit
+//! is read once, then its folded sum is combined with the finalized in-memory header sum. Every
+//! multi-byte wire value is read big-endian through `endian.read` (GC-5); the data unit is summed
+//! in block-aligned chunks so a multi-GB HDU stays in bounded memory (NFR-PERF-3).
 const std = @import("std");
 const errors = @import("errors.zig");
 const endian = @import("endian.zig");
@@ -36,8 +37,8 @@ const Allocator = std.mem.Allocator;
 /// for the other shifts the running sum by exactly the encoded value (Appendix J).
 const ZERO_CHECKSUM: *const [16]u8 = "0000000000000000";
 
-/// Bytes summed per device read in `datasum`/`hduSum`. A block multiple, so every chunk is a
-/// multiple of four bytes (no per-chunk tail) and the accumulation stays bounded.
+/// Bytes summed per device read in `datasum`. A block multiple, so every chunk is a multiple of
+/// four bytes (no per-chunk tail) and the accumulation stays bounded.
 const CHUNK: usize = block.BLOCK * 4;
 
 /// The three-way outcome of checking one integrity keyword (FR-SUM-2): the recomputed value
@@ -218,10 +219,16 @@ fn headerSum(header: *const Header) u32 {
     return sum;
 }
 
-// Whole-HDU checksum: the padded header (in memory) followed by the padded data unit (on disk).
-fn hduSum(fits: *Fits, hdu: *Hdu) errors.IoError!u32 {
-    const hs = headerSum(&hdu.header);
-    return sumRange(fits, hdu.data_off, block.roundUpBlocks(hdu.data_bytes), hs);
+// One's-complement addition of two independently folded sums. This is valid here because FITS
+// headers and padded data units are both multiples of 2880 bytes, hence share a 4-byte word phase.
+fn combineSums(a: u32, b: u32) u32 {
+    const wide = @as(u64, a) + @as(u64, b);
+    return @intCast((wide & 0xFFFFFFFF) + (wide >> 32));
+}
+
+// Whole-HDU checksum from the in-memory header and an already-computed padded-data sum.
+fn hduSumFromDataSum(hdu: *const Hdu, data_sum: u32) u32 {
+    return combineSums(headerSum(&hdu.header), data_sum);
 }
 
 // Index of the first non-END value/commentary card named `name`, or null.
@@ -240,7 +247,8 @@ fn findCardIndex(header: *const Header, name: []const u8) ?usize {
 /// `DATASUM = '0'`, `CHECKSUM = '0000000000000000'`); their values are replaced **in place** so
 /// the card count — and therefore the data-unit offset — never changes. `DATASUM` is set first
 /// (the `CHECKSUM` covers its card text); the `CHECKSUM` value is the Seaman–Pence encoding of
-/// the complement of the whole-HDU sum, so the complete HDU then sums to all-ones. Returns
+/// the complement of the whole-HDU sum, so the complete HDU then sums to all-ones. The padded data
+/// unit is read exactly once; its folded sum is reused when the whole-HDU sum is formed. Returns
 /// `error.MissingRequiredKeyword` if either placeholder card is absent.
 pub fn update(fits: *Fits, hdu: *Hdu) UpdateError!void {
     const ds_idx = findCardIndex(&hdu.header, "DATASUM") orelse return error.MissingRequiredKeyword;
@@ -255,9 +263,9 @@ pub fn update(fits: *Fits, hdu: *Hdu) UpdateError!void {
     // cannot leave a query/fill snapshot generation falsely current.
     hdu.bumpHeaderRevision();
 
-    // 2. Reset CHECKSUM to the placeholder, then accumulate the whole-HDU sum over it.
+    // 2. Reset CHECKSUM to the placeholder, then combine the finalized header with the data sum.
     hdu.header.cards.items[cs_idx] = try Card.buildValue("CHECKSUM", .{ .string = ZERO_CHECKSUM }, "HDU checksum");
-    const s = try hduSum(fits, hdu);
+    const s = hduSumFromDataSum(hdu, ds);
 
     // 3. Encode the complement so the complete HDU sums to all-ones, and store it in place.
     var enc: [16]u8 = undefined;
@@ -302,25 +310,30 @@ pub fn updateAll(fits: *Fits) FitsError!void {
 /// each.
 ///
 /// `DATASUM` (if present) is read as a decimal string and compared with a fresh data-unit sum.
-/// `CHECKSUM` (if present) is verified by recomputing the whole-HDU sum: a correctly-written
-/// `CHECKSUM` makes the complete HDU sum to all-ones, so any other value is a mismatch. A
-/// `DATASUM` value that does not parse as a number is reported as `mismatch`.
+/// `CHECKSUM` (if present) is verified by combining that same data sum with the in-memory header:
+/// a correctly-written `CHECKSUM` makes the complete HDU sum to all-ones, so any other value is a
+/// mismatch. A `DATASUM` value that does not parse as a number is reported as `mismatch`.
 pub fn verify(fits: *Fits, hdu: *Hdu) VerifyError!Report {
     var report = Report{ .sum = .not_present, .data = .not_present };
+    const has_data = hdu.header.has("DATASUM");
+    const has_sum = hdu.header.has("CHECKSUM");
+    if (!has_data and !has_sum) return report;
 
-    if (hdu.header.has("DATASUM")) {
-        const stored = try hdu.header.getString(fits.alloc, "DATASUM");
-        defer fits.alloc.free(stored);
+    var stored_data: ?[]u8 = null;
+    if (has_data) stored_data = try hdu.header.getString(fits.alloc, "DATASUM");
+    defer if (stored_data) |stored| fits.alloc.free(stored);
+
+    const actual = try datasum(fits, hdu);
+    if (stored_data) |stored| {
         const trimmed = std.mem.trim(u8, stored, " ");
-        const actual = try datasum(fits, hdu);
         report.data = blk: {
             const parsed = std.fmt.parseInt(u64, trimmed, 10) catch break :blk .mismatch;
             break :blk if (parsed == @as(u64, actual)) .match else .mismatch;
         };
     }
 
-    if (hdu.header.has("CHECKSUM")) {
-        const s = try hduSum(fits, hdu);
+    if (has_sum) {
+        const s = hduSumFromDataSum(hdu, actual);
         report.sum = if (s == 0xFFFFFFFF) .match else .mismatch;
     }
 
@@ -330,6 +343,68 @@ pub fn verify(fits: *Fits, hdu: *Hdu) VerifyError!Report {
 // ── tests ──────────────────────────────────────────────────────────────────────────────
 const testing = std.testing;
 const MemoryDevice = @import("io/memory.zig").MemoryDevice;
+const Device = @import("io/device.zig").Device;
+
+const CountingDevice = struct {
+    child: Device,
+    pread_calls: usize = 0,
+    read_bytes: u64 = 0,
+    syncs: usize = 0,
+    max_read: ?usize = null,
+    fail_after_bytes: ?u64 = null,
+
+    fn pread(ctx: *anyopaque, dst: []u8, offset: u64) errors.IoError!usize {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        if (self.fail_after_bytes) |limit| if (self.read_bytes >= limit) return error.ReadFailed;
+        self.pread_calls += 1;
+        const out = if (self.max_read) |limit| dst[0..@min(dst.len, limit)] else dst;
+        const n = try self.child.pread(out, offset);
+        self.read_bytes += n;
+        return n;
+    }
+
+    fn pwrite(ctx: *anyopaque, src: []const u8, offset: u64) errors.IoError!usize {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        return self.child.pwrite(src, offset);
+    }
+
+    fn getSize(ctx: *anyopaque) errors.IoError!u64 {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        return self.child.getSize();
+    }
+
+    fn setSize(ctx: *anyopaque, size: u64) errors.IoError!void {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        return self.child.setSize(size);
+    }
+
+    fn sync(ctx: *anyopaque) errors.IoError!void {
+        const self: *CountingDevice = @ptrCast(@alignCast(ctx));
+        self.syncs += 1;
+        return self.child.sync();
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    const vtable: Device.VTable = .{
+        .pread = pread,
+        .pwrite = pwrite,
+        .getSize = getSize,
+        .setSize = setSize,
+        .sync = sync,
+        .close = close,
+    };
+
+    fn device(self: *CountingDevice) Device {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn reset(self: *CountingDevice) void {
+        self.pread_calls = 0;
+        self.read_bytes = 0;
+        self.syncs = 0;
+    }
+};
 
 test "sumBytes: zero buffer, known group, carry fold, accumulation, tail" {
     // All-zero ⇒ 0.
@@ -348,6 +423,28 @@ test "sumBytes: zero buffer, known group, carry fold, accumulation, tail" {
     try testing.expectEqual(
         sumBytes(0, &[_]u8{ 0x12, 0x34, 0x56, 0x78, 0xAB, 0, 0, 0 }),
         sumBytes(0, &[_]u8{ 0x12, 0x34, 0x56, 0x78, 0xAB }),
+    );
+}
+
+test "combineSums equals direct summation at every aligned split" {
+    var bytes: [4096]u8 = undefined;
+    for (&bytes, 0..) |*b, i| b.* = @truncate(i * 37 + 11);
+    const direct = sumBytes(0, &bytes);
+
+    var split: usize = 0;
+    while (split <= bytes.len) : (split += 4) {
+        try testing.expectEqual(
+            direct,
+            combineSums(sumBytes(0, bytes[0..split]), sumBytes(0, bytes[split..])),
+        );
+    }
+
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), combineSums(0xFFFFFFFF, 0));
+    try testing.expectEqual(@as(u32, 1), combineSums(0xFFFFFFFF, 1));
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), combineSums(0xFFFFFFFF, 0xFFFFFFFF));
+    try testing.expectEqual(
+        combineSums(combineSums(0xFFFF0000, 0x0001FFFF), 0xDEADBEEF),
+        combineSums(0xFFFF0000, combineSums(0x0001FFFF, 0xDEADBEEF)),
     );
 }
 
@@ -464,13 +561,151 @@ test "verify reports not_present when the integrity cards are absent" {
     const alloc = testing.allocator;
     var mem = MemoryDevice.init(alloc);
     defer mem.deinit();
-    var f = try Fits.create(alloc, mem.device(), .{});
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
     defer f.deinit();
 
     const hdu = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{50} });
+    counted.reset();
     const r = try verify(&f, hdu);
     try testing.expectEqual(Verify.not_present, r.data);
     try testing.expectEqual(Verify.not_present, r.sum);
+    try testing.expectEqual(@as(usize, 0), counted.pread_calls);
+    try testing.expectEqual(@as(u64, 0), counted.read_bytes);
+}
+
+test "update and verify share one padded-data traversal" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
+    defer f.deinit();
+
+    const logical = 2 * CHUNK + 7;
+    const header = try makeImageHeader(alloc, logical, true);
+    const hdu = try f.appendHdu(header);
+    const data = try alloc.alloc(u8, logical);
+    defer alloc.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i * 29 + 3);
+    try f.dev.writeAll(data, hdu.data_off);
+
+    const padded = block.roundUpBlocks(hdu.data_bytes);
+    const expected_calls: usize = @intCast((padded + CHUNK - 1) / CHUNK);
+
+    counted.reset();
+    try update(&f, hdu);
+    try testing.expectEqual(expected_calls, counted.pread_calls);
+    try testing.expectEqual(padded, counted.read_bytes);
+
+    counted.reset();
+    const both = try verify(&f, hdu);
+    try testing.expectEqual(Verify.match, both.data);
+    try testing.expectEqual(Verify.match, both.sum);
+    try testing.expectEqual(expected_calls, counted.pread_calls);
+    try testing.expectEqual(padded, counted.read_bytes);
+
+    // Short backend reads may increase pread calls, but must not restart the data traversal.
+    counted.max_read = 1024;
+    counted.reset();
+    const short = try verify(&f, hdu);
+    try testing.expectEqual(Verify.match, short.data);
+    try testing.expectEqual(Verify.match, short.sum);
+    try testing.expect(counted.pread_calls > expected_calls);
+    try testing.expectEqual(padded, counted.read_bytes);
+    counted.max_read = null;
+
+    // Presence is independent: either card alone still needs one pass; neither needs none.
+    const ds_idx = findCardIndex(&hdu.header, "DATASUM").?;
+    const cs_idx = findCardIndex(&hdu.header, "CHECKSUM").?;
+    const ds_card = hdu.header.cards.items[ds_idx];
+    const cs_card = hdu.header.cards.items[cs_idx];
+    hdu.header.cards.items[cs_idx] = try Card.buildValue("DUMMY", .{ .string = "x" }, null);
+    counted.reset();
+    const data_only = try verify(&f, hdu);
+    try testing.expectEqual(Verify.match, data_only.data);
+    try testing.expectEqual(Verify.not_present, data_only.sum);
+    try testing.expectEqual(padded, counted.read_bytes);
+
+    hdu.header.cards.items[cs_idx] = cs_card;
+    hdu.header.cards.items[ds_idx] = try Card.buildValue("DUMMY", .{ .string = "x" }, null);
+    counted.reset();
+    const sum_only = try verify(&f, hdu);
+    try testing.expectEqual(Verify.not_present, sum_only.data);
+    try testing.expectEqual(Verify.mismatch, sum_only.sum);
+    try testing.expectEqual(padded, counted.read_bytes);
+
+    hdu.header.cards.items[cs_idx] = try Card.buildValue("DUMMY2", .{ .string = "x" }, null);
+    counted.reset();
+    const neither = try verify(&f, hdu);
+    try testing.expectEqual(Verify.not_present, neither.data);
+    try testing.expectEqual(Verify.not_present, neither.sum);
+    try testing.expectEqual(@as(u64, 0), counted.read_bytes);
+
+    hdu.header.cards.items[ds_idx] = try Card.buildValue("DATASUM", .{ .string = "not-a-number" }, "data unit checksum");
+    hdu.header.cards.items[cs_idx] = cs_card;
+    counted.reset();
+    const malformed = try verify(&f, hdu);
+    try testing.expectEqual(Verify.mismatch, malformed.data);
+    try testing.expectEqual(Verify.mismatch, malformed.sum);
+    try testing.expectEqual(padded, counted.read_bytes);
+    hdu.header.cards.items[ds_idx] = ds_card;
+
+    // A failed first pass occurs before either card or the header revision is mutated.
+    const ds_before = hdu.header.cards.items[ds_idx].bytes().*;
+    const cs_before = hdu.header.cards.items[cs_idx].bytes().*;
+    const revision_before = hdu.header_revision;
+    counted.fail_after_bytes = CHUNK;
+    counted.reset();
+    try testing.expectError(error.ReadFailed, update(&f, hdu));
+    try testing.expectEqualSlices(u8, &ds_before, hdu.header.cards.items[ds_idx].bytes());
+    try testing.expectEqualSlices(u8, &cs_before, hdu.header.cards.items[cs_idx].bytes());
+    try testing.expectEqual(revision_before, hdu.header_revision);
+}
+
+test "zero-length checksummed data performs no device reads" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{});
+    defer f.deinit();
+
+    const header = try makeImageHeader(alloc, 0, true);
+    const hdu = try f.appendHdu(header);
+    counted.reset();
+    try update(&f, hdu);
+    try testing.expectEqual(@as(u64, 0), counted.read_bytes);
+    const r = try verify(&f, hdu);
+    try testing.expectEqual(Verify.match, r.data);
+    try testing.expectEqual(Verify.match, r.sum);
+    try testing.expectEqual(@as(u64, 0), counted.read_bytes);
+}
+
+test "checksum-on-close reads every HDU data unit once before syncing" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var counted: CountingDevice = .{ .child = mem.device() };
+    var f = try Fits.create(alloc, counted.device(), .{ .checksum_on_close = true });
+    defer f.deinit();
+
+    const first = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{CHUNK + 1} });
+    const second = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{17} });
+    const expected = block.roundUpBlocks(first.data_bytes) + block.roundUpBlocks(second.data_bytes);
+
+    counted.reset();
+    try f.flush();
+    try testing.expectEqual(expected, counted.read_bytes);
+    try testing.expectEqual(@as(usize, 1), counted.syncs);
+
+    counted.reset();
+    for ([_]*Hdu{ first, second }) |hdu| {
+        const r = try verify(&f, hdu);
+        try testing.expectEqual(Verify.match, r.data);
+        try testing.expectEqual(Verify.match, r.sum);
+    }
+    try testing.expectEqual(expected, counted.read_bytes);
 }
 
 test "update then verify reports match, and tampering is detected" {
@@ -493,8 +728,12 @@ test "update then verify reports match, and tampering is detected" {
     try testing.expectEqual(Verify.match, r.data);
     try testing.expectEqual(Verify.match, r.sum);
 
-    // The whole HDU now sums to all-ones by construction.
-    try testing.expectEqual(@as(u32, 0xFFFFFFFF), try hduSum(&f, hdu));
+    // The serialized whole HDU now sums to all-ones by construction. Read the actual device range
+    // rather than reusing the composition helper, so this remains an independent wire-level check.
+    try testing.expectEqual(
+        @as(u32, 0xFFFFFFFF),
+        try sumRange(&f, hdu.header_off, hdu.nextOff() - hdu.header_off, 0),
+    );
 
     // Corrupt one data byte: both keywords must now fail.
     var corrupt: [1]u8 = .{data[0] ^ 0xFF};

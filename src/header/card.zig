@@ -60,7 +60,9 @@ pub const Card = struct {
     /// The name is normalized (`Name.parseStrict` errors on a bad alphabet or on blanks
     /// that are not trailing padding); the value indicator `= ` is placed in bytes 9–10;
     /// `v` is rendered into the value field by `value.zig` (fixed-format for numbers and
-    /// logicals), followed by `/ comment` when `comment` is non-null. A non-finite real
+    /// logicals), followed by `/ comment` when `comment` is non-null. When it fits, a short
+    /// free-format value is padded through column 30 so the comment slash occupies canonical
+    /// column 32, matching standard FITS writers. A non-finite real
     /// (NaN/Inf) yields `error.BadValueSyntax` — the FITS real grammar cannot express it
     /// (`value.requireFinite`). A value or comment
     /// too long for the 70-byte field yields `error.CardOverflow`; the result is re-parsed
@@ -76,6 +78,11 @@ pub const Card = struct {
         var w = std.Io.Writer.fixed(raw[10..]);
         value.formatValue(&w, v) catch return error.CardOverflow;
         if (comment) |c| {
+            // Canonical cards start comments in column 32. Preserve the full free-format capacity
+            // for unusually long comments rather than turning a formerly valid card into overflow.
+            if (v == .string and w.buffered().len < value.FIXED_WIDTH and c.len <= raw[10..].len - value.FIXED_WIDTH - 3) {
+                while (w.buffered().len < value.FIXED_WIDTH) w.writeByte(' ') catch return error.CardOverflow;
+            }
             w.writeAll(" / ") catch return error.CardOverflow;
             w.writeAll(c) catch return error.CardOverflow;
         }
@@ -223,6 +230,16 @@ test "buildValue: string value, no comment, re-parses" {
     const v = try value.parseValue(testing.allocator, c.valueField());
     defer v.deinit(testing.allocator);
     try testing.expectEqualStrings("M31", v.string);
+}
+
+test "buildValue: short string comment starts in canonical column 32" {
+    const c = try Card.buildValue("CHECKSUM", .{ .string = "0000000000000000" }, "HDU checksum");
+    try testing.expect(std.mem.startsWith(
+        u8,
+        c.bytes(),
+        "CHECKSUM= '0000000000000000'   / HDU checksum",
+    ));
+    try testing.expectEqual(@as(u8, '/'), c.bytes()[31]);
 }
 
 test "buildValue: undefined value is still a value card (indicator present)" {

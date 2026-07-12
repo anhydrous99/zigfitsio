@@ -292,8 +292,18 @@ int  zf_table_col_info(ZfTable* t, int col, ZfColInfo* info);
 int  zf_table_col_name(ZfTable* t, int col, uint8_t* buf, size_t buf_len, size_t* out_len);
 int  zf_table_col_unit(ZfTable* t, int col, uint8_t* buf, size_t buf_len, size_t* out_len);
 int  zf_read_col(ZfTable* t, int dtype, int col, long long firstrow, long long nelem, const void* nulval, void* array);
+/* Read complete fixed-width cells into a row-strided byte span. The destination need not be
+ * naturally aligned; `dst_len` must cover the final cell, not trailing row padding. */
+int  zf_read_col_strided_v1(ZfTable* t, int dtype, int col, long long firstrow,
+                            long long nrows, const void* nulval, uint8_t* dst,
+                            size_t dst_len, size_t row_stride);
 int  zf_write_col(ZfTable* t, int dtype, int col, long long firstrow, long long nelem, const void* nulval, void* array);
+#define ZF_STR_TRIM 0x00000001u
 int  zf_read_col_str(ZfTable* t, int col, long long firstrow, long long nrows, long long width, long long stride, uint8_t* buf);
+/* String equivalent. ZF_STR_TRIM removes trailing FITS spaces/NULs and NUL-pads the destination. */
+int  zf_read_col_str_strided_v1(ZfTable* t, int col, long long firstrow, long long nrows,
+                                size_t width, size_t row_stride, uint32_t flags,
+                                uint8_t* dst, size_t dst_len);
 int  zf_write_col_str(ZfTable* t, int col, long long firstrow, long long nrows, long long width, long long stride, const uint8_t* buf);
 int  zf_append_rows(ZfTable* t, long long n);
 int  zf_insert_rows(ZfTable* t, long long before_row, long long n);

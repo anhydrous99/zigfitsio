@@ -998,15 +998,16 @@ that value as an unsigned decimal string; `CHECKSUM` stores the 16-character ASC
 of its one's-complement, so the complete HDU sums to all-ones.
 
 > **Verified golden vector — CFITSIO 4.6.4.** A CFITSIO-written `TABLE` HDU with `NAXIS1=26`,
-> `NAXIS2=3` (78 logical data bytes; one 2880-byte block, hence 2802 trailing `0x20` spaces)
-> emits `DATASUM = 628729719`. An independent recompute over the **space-padded** data unit
-> reproduces `628729719`; over the same data **zero-padded** it gives `1302441855`. This
+> `NAXIS2=4` (104 logical data bytes; one 2880-byte block, hence 2776 trailing `0x20` spaces)
+> emits `DATASUM = 1837006711`. An independent recompute over the **space-padded** data unit
+> reproduces `1837006711`; over the same data **zero-padded** it gives `1449617504`. This
 > locks `FR-SUM-1`'s rule that the ASCII-table space fill is summed (the original
 > pre-padding length would be wrong) and is committed as a parity fixture (§23).
 
-Ordering is enforced: **`DATASUM` is written/updated before `CHECKSUM` is accumulated**
-(`FR-SUM-1`), because `CHECKSUM` covers the `DATASUM` card text. The checksum is computed
-incrementally over block-aligned reads so verifying a multi-GB HDU stays in bounded memory.
+Ordering is enforced: **`DATASUM` is written/updated before the final whole-HDU checksum is
+formed** (`FR-SUM-1`), because `CHECKSUM` covers the `DATASUM` card text. The padded data unit is
+read once; its folded sum is combined with the finalized in-memory header sum. Data is processed
+incrementally in block-aligned chunks so verifying a multi-GB HDU stays in bounded memory.
 `update` is an explicit operation and MAY run automatically on close when the handle is
 opened with `checksum_on_close = true` (`FR-SUM-3`).
 

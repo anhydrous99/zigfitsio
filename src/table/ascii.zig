@@ -262,6 +262,83 @@ pub const AsciiTable = struct {
         }
     }
 
+    /// Read `nrows` numeric cells directly into a caller-owned row-strided byte buffer. Stores
+    /// use alignment 1 so packed structured-array fields are valid destinations. Blank and
+    /// `TNULLn` fields become `null_sentinel`, or NaN for floats and zero for integers.
+    pub fn readColumnStrided(self: *AsciiTable, comptime T: type, col: ColumnRef, first_row: u64, nrows: u64, out: []u8, row_stride: usize, null_sentinel: ?T) Error!void {
+        const c = try self.columnPtr(col);
+        const end = try limits.add(first_row, nrows);
+        if (end > self.naxis2) return error.RowOutOfRange;
+        if (c.tform.type == .char) return error.WrongValueType;
+        const w: usize = c.tform.width;
+        if (w > MAX_NUM_FIELD) return error.BadTform;
+        const rows = try batch.validateStrided(nrows, @sizeOf(T), row_stride, out.len);
+        if (rows == 0) return;
+        const fill = defaultReadValue(T, null_sentinel);
+        const plan = batch.Plan.init(self.naxis1, w, nrows, self.fits.limits.max_open_alloc) orelse {
+            for (0..rows) |r| {
+                const value = try self.readCellValue(T, c, first_row + r, .bulk);
+                const dst: *align(1) T = @ptrCast(out[r * row_stride ..].ptr);
+                dst.* = value orelse fill;
+            }
+            return;
+        };
+        var storage: [batch.target_bytes]u8 = undefined;
+        const window = storage[0..plan.window_bytes];
+        const source_stride: usize = @intCast(self.naxis1);
+        const field_start: usize = @intCast(c.tbcol - 1);
+        var done: usize = 0;
+        while (done < rows) {
+            const window_rows = @min(plan.rows_per_window, rows - done);
+            const bytes = window_rows * source_stride;
+            try self.fits.dev.readAll(window[0..bytes], try self.rowOffset(first_row + done));
+            for (0..window_rows) |r| {
+                const start = r * source_stride + field_start;
+                const value = try readFieldValue(T, c, window[start..][0..w], .bulk);
+                const dst: *align(1) T = @ptrCast(out[(done + r) * row_stride ..].ptr);
+                dst.* = value orelse fill;
+            }
+            done += window_rows;
+        }
+    }
+
+    /// Read fixed-width formatted text into a row-strided byte destination. When
+    /// `normalize_nulpad` is set, trailing FITS spaces/NULs become NUL padding suitable for a
+    /// fixed-width byte-string array. `width` must equal the column's declared field width.
+    pub fn readColumnStrStrided(self: *AsciiTable, col: ColumnRef, first_row: u64, nrows: u64, out: []u8, width: usize, row_stride: usize, normalize_nulpad: bool) Error!void {
+        const c = try self.columnPtr(col);
+        if (width != c.tform.width) return error.CellOutOfRange;
+        const end = try limits.add(first_row, nrows);
+        if (end > self.naxis2) return error.RowOutOfRange;
+        const rows = try batch.validateStrided(nrows, width, row_stride, out.len);
+        if (rows == 0) return;
+        const plan = batch.Plan.init(self.naxis1, width, nrows, self.fits.limits.max_open_alloc) orelse {
+            for (0..rows) |r| {
+                const cell = out[r * row_stride ..][0..width];
+                try self.fits.dev.readAll(cell, try self.fieldOffset(c, first_row + r));
+                if (normalize_nulpad) normalizeTextCell(cell);
+            }
+            return;
+        };
+        var storage: [batch.target_bytes]u8 = undefined;
+        const window = storage[0..plan.window_bytes];
+        const source_stride: usize = @intCast(self.naxis1);
+        const field_start: usize = @intCast(c.tbcol - 1);
+        var done: usize = 0;
+        while (done < rows) {
+            const window_rows = @min(plan.rows_per_window, rows - done);
+            const bytes = window_rows * source_stride;
+            try self.fits.dev.readAll(window[0..bytes], try self.rowOffset(first_row + done));
+            for (0..window_rows) |r| {
+                const source_start = r * source_stride + field_start;
+                const cell = out[(done + r) * row_stride ..][0..width];
+                @memcpy(cell, window[source_start..][0..width]);
+                if (normalize_nulpad) normalizeTextCell(cell);
+            }
+            done += window_rows;
+        }
+    }
+
     /// Write a contiguous run of numeric cells (symmetric with `readColumn`; bulk conversion).
     /// A `null` element writes the column's `TNULLn` (or blanks). `error.RowOutOfRange` if the
     /// run extends past `NAXIS2`; `error.Overflow` if any value overflows the field width.
@@ -436,6 +513,20 @@ fn readFieldValue(comptime T: type, col: *const AsciiColumn, raw: []const u8, mo
         },
         .char => return error.WrongValueType,
     }
+}
+
+fn defaultReadValue(comptime T: type, sentinel: ?T) T {
+    if (sentinel) |value| return value;
+    return switch (@typeInfo(T)) {
+        .float => std.math.nan(T),
+        .bool => false,
+        else => 0,
+    };
+}
+
+fn normalizeTextCell(cell: []u8) void {
+    const trimmed = std.mem.trimEnd(u8, cell, " \x00");
+    @memset(cell[trimmed.len..], 0);
 }
 
 fn writeFieldValue(comptime T: type, col: *const AsciiColumn, out: []u8, value: ?T, mode: convert.Mode) Error!void {
@@ -869,6 +960,51 @@ test "round-trip Aw character cells (string read/write)" {
     // Numeric access to a character column is a typed error.
     try testing.expectError(error.WrongValueType, t.readCell(i64, .{ .index = 0 }, 0));
     try testing.expectError(error.WrongValueType, t.writeCell(i64, .{ .index = 0 }, 0, 1));
+}
+
+test "row-strided ASCII reads support unaligned numeric and normalized text fields" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+
+    const cols = [_]TCol{
+        .{ .tbcol = 1, .tform = "I6", .ttype = "COUNT", .tnull = "-999" },
+        .{ .tbcol = 7, .tform = "A8", .ttype = "LABEL" },
+    };
+    const hdu = try appendAsciiTable(&f, alloc, &cols, 14, 3);
+    var table = try AsciiTable.of(&f, hdu);
+    defer table.deinit(alloc);
+    try table.writeColumn(i64, .{ .name = "COUNT" }, 0, &[_]?i64{ 11, null, 33 });
+    try table.writeCellStr(.{ .name = "LABEL" }, 0, "alpha");
+    try table.writeCellStr(.{ .name = "LABEL" }, 1, "b");
+    try table.writeCellStr(.{ .name = "LABEL" }, 2, "");
+
+    var packed_bytes: [64]u8 = undefined;
+    @memset(&packed_bytes, 0xa5);
+    try table.readColumnStrided(i64, .{ .name = "COUNT" }, 0, 3, packed_bytes[1..31], 11, -7);
+    for ([_]i64{ 11, -7, 33 }, 0..) |want, r| {
+        var got: i64 = undefined;
+        @memcpy(std.mem.asBytes(&got), packed_bytes[1 + r * 11 ..][0..8]);
+        try testing.expectEqual(want, got);
+    }
+    try testing.expectEqual(@as(u8, 0xa5), packed_bytes[0]);
+    try testing.expectEqual(@as(u8, 0xa5), packed_bytes[31]);
+
+    @memset(&packed_bytes, 0xa5);
+    try table.readColumnStrided(f64, .{ .name = "COUNT" }, 0, 3, packed_bytes[1..29], 10, null);
+    var null_value: f64 = undefined;
+    @memcpy(std.mem.asBytes(&null_value), packed_bytes[11..19]);
+    try testing.expect(std.math.isNan(null_value));
+
+    @memset(&packed_bytes, 0xa5);
+    try table.readColumnStrStrided(.{ .name = "LABEL" }, 0, 3, packed_bytes[1..31], 8, 11, true);
+    try testing.expectEqualSlices(u8, "alpha\x00\x00\x00", packed_bytes[1..9]);
+    try testing.expectEqualSlices(u8, "b\x00\x00\x00\x00\x00\x00\x00", packed_bytes[12..20]);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00\x00", packed_bytes[23..31]);
+    try testing.expectError(error.CellOutOfRange, table.readColumnStrided(i64, .{ .index = 0 }, 0, 2, packed_bytes[0..15], 7, null));
+    try testing.expectError(error.CellOutOfRange, table.readColumnStrStrided(.{ .index = 1 }, 0, 2, packed_bytes[0..15], 8, 11, true));
 }
 
 test "TNULLn and all-blank fields read back as null" {

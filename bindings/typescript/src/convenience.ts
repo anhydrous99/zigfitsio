@@ -18,6 +18,18 @@ const MODE_CODES: Record<OpenMode, number> = {
   append: ll.READWRITE,
 };
 
+function openMemory(data: Uint8Array, mode: number, opts: Uint8Array | null): bigint {
+  const owned = ll.native.openMemoryOwned;
+  if (owned) {
+    const result = owned(data, mode, opts);
+    ll.check(result.status);
+    return result.handle;
+  }
+  const out = ll.outU64();
+  ll.check(ll.lib.zf_open_memory(data, data.length, mode, opts, out));
+  return out[0];
+}
+
 /**
  * Open a FITS file. `mode`: "readonly", "update" (read-write), or "append".
  * A `.fits.gz` path opens read-only through an in-memory inflate.
@@ -32,7 +44,6 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
     throw new FitsTypeError(410, `invalid mode ${JSON.stringify(mode)}: expected 'readonly', 'update', or 'append'`);
   }
   const optBuf = opts === undefined ? null : ll.encodeOpenOpts(opts);
-  const out = ll.outU64();
   let bytes: Uint8Array;
   try {
     bytes = readFile(path);
@@ -49,11 +60,9 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
       throw new FitsIOError(112, "a .gz file can only be opened in 'readonly' mode");
     }
     const plain = gunzip(bytes);
-    ll.check(ll.lib.zf_open_memory(plain, plain.length, ll.READONLY, optBuf, out));
-    return HDUList._fromHandle(out[0], modeCode, opts?.checksumOnClose === true);
+    return HDUList._fromHandle(openMemory(plain, ll.READONLY, optBuf), modeCode, opts?.checksumOnClose === true);
   }
-  ll.check(ll.lib.zf_open_memory(bytes, bytes.length, modeCode, optBuf, out));
-  const hdul = HDUList._fromHandle(out[0], modeCode, opts?.checksumOnClose === true);
+  const hdul = HDUList._fromHandle(openMemory(bytes, modeCode, optBuf), modeCode, opts?.checksumOnClose === true);
   hdul._path = path; // origin for update/append write-back on close()
   return hdul;
 }
@@ -61,9 +70,7 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
 /** Open a FITS file held in a byte buffer. */
 export function fromBytes(data: Uint8Array, mode: "readonly" | "update" = "readonly"): HDUList {
   const modeCode = mode === "readonly" ? ll.READONLY : ll.READWRITE;
-  const out = ll.outU64();
-  ll.check(ll.lib.zf_open_memory(data, data.length, modeCode, null, out));
-  return HDUList._fromHandle(out[0], modeCode);
+  return HDUList._fromHandle(openMemory(data, modeCode, null), modeCode);
 }
 
 export function getHeader(path: string, ext: number | string = 0): Header {

@@ -18,7 +18,7 @@ const ValueError = @import("../errors.zig").ValueError;
 
 /// Fixed-format value-field width: columns 11–30 inclusive (`FR-HDR-4`). Mandatory numeric and
 /// logical values are right-justified within these 20 columns.
-const FIXED_WIDTH: usize = 20;
+pub const FIXED_WIDTH: usize = 20;
 /// Fixed-format minimum string length: a string value is padded with blanks to at least 8
 /// characters between the quotes (FITS 4.0 §4.2.1).
 pub const MIN_STRING_CHARS: usize = 8;

@@ -53,6 +53,48 @@ test "create in-memory image, write and read back f32" {
     try testing.expectEqualSlices(f32, &pixels, &out);
 }
 
+test "Wasm memory builder adopts bytes and scoped view exposes the final device" {
+    var source: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    const src = source.?;
+    const axes = [_]c_long{4};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 1, &axes));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_flush(src));
+
+    var src_ptr: ?[*]const u8 = null;
+    var src_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wmemory_view_v1(src, &src_ptr, &src_len));
+    try testing.expect(src_len >= 2880);
+
+    var builder: ?*capi.MemoryBuilder = null;
+    var dst_ptr: ?[*]u8 = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wopen_memory_begin_v1(src_len, &builder, &dst_ptr));
+    @memcpy(dst_ptr.?[0..src_len], src_ptr.?[0..src_len]);
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wopen_memory_commit_v1(builder, 0, null, &opened));
+    builder = null;
+    defer capi.zf_close(opened);
+    var count: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_hdu_count(opened, &count));
+    try testing.expectEqual(@as(c_long, 1), count);
+
+    var abandoned: ?*capi.MemoryBuilder = null;
+    var abandoned_ptr: ?[*]u8 = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wopen_memory_begin_v1(16, &abandoned, &abandoned_ptr));
+    try testing.expect(abandoned_ptr != null);
+    capi.zf_wopen_memory_abort_v1(abandoned);
+
+    var malformed: ?*capi.MemoryBuilder = null;
+    var malformed_ptr: ?[*]u8 = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wopen_memory_begin_v1(2880, &malformed, &malformed_ptr));
+    @memset(malformed_ptr.?[0..2880], 0);
+    var rejected: ?*Handle = null;
+    try testing.expect(capi.zf_wopen_memory_commit_v1(malformed, 0, null, &rejected) != 0);
+    try testing.expect(rejected == null); // commit consumed and freed the malformed builder
+    capi.zf_close(source);
+}
+
 test "geometry and header keyword round-trip" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
@@ -149,6 +191,32 @@ test "binary table create, write columns, read back" {
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_str(th, 2, 1, 3, 8, 8, &name_out));
     try testing.expectEqualStrings("alpha", std.mem.trimEnd(u8, name_out[0..8], " \x00"));
     try testing.expectEqualStrings("gamma", std.mem.trimEnd(u8, name_out[16..24], " \x00"));
+
+    // Versioned strided reads accept deliberately unaligned packed-record fields and leave every
+    // padding/guard byte untouched.
+    var strided_num = [_]u8{0xa5} ** 24;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_strided_v1(
+        th, I32, 0, 1, 3, null, strided_num[1..].ptr, 18, 7,
+    ));
+    for (idx, 0..) |want, row| {
+        var got_value: i32 = undefined;
+        @memcpy(std.mem.asBytes(&got_value), strided_num[1 + row * 7 ..][0..4]);
+        try testing.expectEqual(want, got_value);
+        if (row < 2) for (strided_num[1 + row * 7 + 4 .. 1 + (row + 1) * 7]) |b| try testing.expectEqual(@as(u8, 0xa5), b);
+    }
+    try testing.expectEqual(@as(u8, 0xa5), strided_num[0]);
+    try testing.expectEqual(@as(u8, 0xa5), strided_num[19]);
+
+    var strided_text = [_]u8{0xa5} ** 34;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_str_strided_v1(
+        th, 2, 1, 3, 8, 11, 1, strided_text[1..].ptr, 30,
+    ));
+    try testing.expectEqualSlices(u8, "alpha\x00\x00\x00", strided_text[1..9]);
+    try testing.expectEqualSlices(u8, "beta\x00\x00\x00\x00", strided_text[12..20]);
+    try testing.expectEqualSlices(u8, "gamma\x00\x00\x00", strided_text[23..31]);
+    try testing.expect(capi.zf_read_col_strided_v1(th, I32, 0, 1, 3, null, strided_num[1..].ptr, 17, 7) != 0);
+    try testing.expect(capi.zf_read_col_str_strided_v1(th, 2, 1, 3, 8, 11, 2, strided_text[1..].ptr, 30) != 0);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_strided_v1(th, I32, 0, 1, 0, null, null, 0, 0));
 }
 
 test "read-only ASCII-table writes return READONLY_FILE without mutation" {

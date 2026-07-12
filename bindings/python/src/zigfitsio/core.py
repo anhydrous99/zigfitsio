@@ -10,6 +10,7 @@ Data is exchanged as native-endian NumPy arrays; image arrays use C-order with r
 from __future__ import annotations
 
 import ctypes as c
+from hashlib import blake2b
 import math
 import os
 from typing import Any, Sequence
@@ -160,16 +161,42 @@ def _vla_elem_dtype(fmt: str):
     return dt.bin_elem_dtype(ord(letter)) if letter else (np.dtype("f8"), False)
 
 
+def _hash_array_into(digest, arr) -> None:
+    """Feed an ndarray's logical C-order bytes to ``digest`` with bounded scratch space."""
+    arr = np.asarray(arr)
+    if not arr.nbytes:
+        return
+    if arr.flags.c_contiguous:
+        digest.update(memoryview(arr).cast("B"))
+        return
+    elems = max(1, (64 * 1024) // max(arr.dtype.itemsize, 1))
+    chunks = np.nditer(
+        arr,
+        flags=["external_loop", "buffered", "zerosize_ok"],
+        op_flags=[["readonly", "contig"]],
+        order="C",
+        buffersize=elems,
+    )
+    for chunk in chunks:
+        digest.update(memoryview(chunk).cast("B"))
+
+
 def _ndarray_fp(arr):
-    """Content fingerprint of a numeric ndarray (normalized to C-order bytes so the same logical
-    array always hashes the same, regardless of memory layout)."""
-    return hash(np.ascontiguousarray(arr).tobytes())
+    """Bounded content fingerprint normalized to logical C-order, independent of layout."""
+    digest = blake2b(digest_size=16)
+    _hash_array_into(digest, arr)
+    return digest.digest()
 
 
 def _col_fp(col):
     """A change-detection fingerprint for one materialized table column (object=VLA safe)."""
     if col.dtype == object:
-        return hash(tuple(np.asarray(x).tobytes() for x in col))
+        digest = blake2b(digest_size=16)
+        for cell in col:
+            arr = np.asarray(cell)
+            digest.update(int(arr.nbytes).to_bytes(8, "little"))
+            _hash_array_into(digest, arr)
+        return digest.digest()
     return _ndarray_fp(col)
 
 
@@ -1069,7 +1096,7 @@ class _TableHDU(_HDU):
             _assert_unique_column_names([name for name, _ in fields])
             rec = np.empty(max(nrows, 0), dtype=np.dtype(fields))
             for (name, _), reader in zip(fields, readers):
-                rec[name] = reader()
+                reader(rec[name])
             if rec.dtype.names:  # baselines for write-back AND the writeto pristine gate (all modes)
                 self._col_fingerprints = {name: _col_fp(rec[name]) for name in rec.dtype.names}
             return rec
@@ -1084,12 +1111,16 @@ class _TableHDU(_HDU):
             width = int(info.width)
             field_dtype = f"S{max(width, 1)}"
 
-            def read_str():
-                buf = c.create_string_buffer(max(nrows * width, 1))
+            def read_str(out):
+                if width == 0:
+                    out.fill(b"")
+                    return
                 if nrows:
-                    ll.check(ll.lib.zf_read_col_str(t, col, 1, nrows, width, width, buf))
-                raw = buf.raw
-                return np.array([raw[i * width:(i + 1) * width].rstrip(b" \x00") for i in range(nrows)], dtype=field_dtype)
+                    stride = int(out.strides[0])
+                    span = (nrows - 1) * stride + max(width, 1)
+                    ll.check(ll.lib.zf_read_col_str_strided_v1(
+                        t, col, 1, nrows, width, stride, ll.ZF_STR_TRIM, _ptr(out), span,
+                    ))
 
             return field_dtype, read_str
 
@@ -1106,7 +1137,7 @@ class _TableHDU(_HDU):
                 elem_dtype = dt.zf_to_dtype(code)
                 read_code = dt.zf_code(elem_dtype)
 
-            def read_vla():
+            def read_vla(out):
                 # Measure the whole column once, then transfer every cell into one flat buffer.
                 # Offsets count transfer scalar slots (complex cells use two float slots per
                 # logical element), so they can be used directly as numpy slice boundaries.
@@ -1126,7 +1157,6 @@ class _TableHDU(_HDU):
                     ll.check(ll.lib.zf_read_col_vla_packed(
                         t, read_code, col, 1, nrows, _ptr(flat), total,
                     ))
-                out = np.empty(nrows, dtype=object)
                 for r in range(nrows):
                     start = int(offsets[r])
                     stop = int(offsets[r + 1])
@@ -1137,7 +1167,6 @@ class _TableHDU(_HDU):
                         out[r] = cell.view(cdtype)
                     else:
                         out[r] = cell
-                return out
 
             return object, read_vla
 
@@ -1150,11 +1179,13 @@ class _TableHDU(_HDU):
             if elem_dtype.kind in ("i", "u") and (info.tscal != 1.0 or info.tzero != 0.0):
                 elem_dtype = np.dtype("f8")
 
-            def read_ascii():
-                flat = np.empty(nrows, dtype=elem_dtype)
-                if flat.size:
-                    ll.check(ll.lib.zf_read_col(t, dt.zf_code(elem_dtype), col, 1, flat.size, None, _ptr(flat)))
-                return flat
+            def read_ascii(out):
+                if nrows:
+                    stride = int(out.strides[0])
+                    ll.check(ll.lib.zf_read_col_strided_v1(
+                        t, dt.zf_code(elem_dtype), col, 1, nrows, None, _ptr(out),
+                        (nrows - 1) * stride + elem_dtype.itemsize, stride,
+                    ))
 
             return elem_dtype, read_ascii
 
@@ -1163,12 +1194,13 @@ class _TableHDU(_HDU):
             cdtype = np.dtype("c8") if elem_dtype == np.dtype("f4") else np.dtype("c16")
             field_dtype = cdtype if repeat == 1 else (cdtype, repeat)
 
-            def read_cplx():
-                flat = np.empty(nrows * repeat * 2, dtype=elem_dtype)
-                if flat.size:
-                    ll.check(ll.lib.zf_read_col(t, dt.zf_code(elem_dtype), col, 1, flat.size, None, _ptr(flat)))
-                view = flat.view(cdtype)
-                return view.reshape(nrows) if repeat == 1 else view.reshape(nrows, repeat)
+            def read_cplx(out):
+                if nrows:
+                    stride = int(out.strides[0])
+                    ll.check(ll.lib.zf_read_col_strided_v1(
+                        t, dt.zf_code(elem_dtype), col, 1, nrows, None, _ptr(out),
+                        (nrows - 1) * stride + repeat * cdtype.itemsize, stride,
+                    ))
 
             return field_dtype, read_cplx
 
@@ -1184,11 +1216,13 @@ class _TableHDU(_HDU):
 
         field_dtype = elem_dtype if repeat == 1 else (elem_dtype, repeat)
 
-        def read_num():
-            flat = np.empty(nrows * repeat, dtype=elem_dtype)
-            if flat.size:
-                ll.check(ll.lib.zf_read_col(t, dt.zf_code(elem_dtype), col, 1, flat.size, None, _ptr(flat)))
-            return flat.reshape(nrows) if repeat == 1 else flat.reshape(nrows, repeat)
+        def read_num(out):
+            if nrows:
+                stride = int(out.strides[0])
+                ll.check(ll.lib.zf_read_col_strided_v1(
+                    t, dt.zf_code(elem_dtype), col, 1, nrows, None, _ptr(out),
+                    (nrows - 1) * stride + repeat * elem_dtype.itemsize, stride,
+                ))
 
         return field_dtype, read_num
 
@@ -1624,6 +1658,32 @@ class HDUList(list):
         ll.check(ll.lib.zf_read_bytes(self._handle, 0, buf, size.value, c.byref(got)))
         return buf.raw[: got.value]
 
+    def _copy_source_to(self, fh) -> None:
+        """Copy the current raw FITS bytes to a binary file without materializing the whole file."""
+        self.flush()
+        size = c.c_uint64()
+        ll.check(ll.lib.zf_data_size(self._handle, c.byref(size)))
+        chunk_size = min(int(size.value), 4 * 1024 * 1024)
+        if not chunk_size:
+            return
+        buf = bytearray(chunk_size)
+        raw = (c.c_char * chunk_size).from_buffer(buf)
+        view = memoryview(buf)
+        offset = 0
+        while offset < size.value:
+            want = min(chunk_size, int(size.value) - offset)
+            got = c.c_size_t()
+            ll.check(ll.lib.zf_read_bytes(self._handle, offset, raw, want, c.byref(got)))
+            if not got.value:
+                raise ll.FitsIOError(107, f"short raw FITS read at byte {offset}")
+            pending = view[: got.value]
+            while pending:
+                written = fh.write(pending)
+                if not written:
+                    raise OSError(f"short raw FITS write at byte {offset}")
+                offset += written
+                pending = pending[written:]
+
     def close(self):
         """Flush writable changes and release the underlying FITS handle."""
 
@@ -1669,7 +1729,7 @@ class HDUList(list):
         try:
             if not checksum and self._is_pristine_attached():
                 with __import__("builtins").open(tmp, "wb") as fh:
-                    fh.write(self._source_bytes())
+                    self._copy_source_to(fh)
             else:
                 opts = ll.ZfOpenOpts()
                 if checksum:
@@ -1678,7 +1738,7 @@ class HDUList(list):
                 pb = _enc(tmp)
                 ll.check(ll.lib.zf_create_file(pb, len(pb), c.byref(opts) if checksum else None, c.byref(handle)))
                 try:
-                    self._emit(handle.value, checksum)
+                    self._emit(handle.value)
                     ll.check(ll.lib.zf_flush(handle))
                 finally:
                     ll.lib.zf_close(handle)
@@ -1697,7 +1757,7 @@ class HDUList(list):
         handle = _VOID()
         ll.check(ll.lib.zf_create_memory(None, c.byref(handle)))
         try:
-            self._emit(handle.value, False)
+            self._emit(handle.value)
             ll.check(ll.lib.zf_flush(handle))
             size = c.c_uint64()
             ll.check(ll.lib.zf_data_size(handle, c.byref(size)))
@@ -1708,7 +1768,7 @@ class HDUList(list):
         finally:
             ll.lib.zf_close(handle)
 
-    def _emit(self, handle, checksum: bool):
+    def _emit(self, handle):
         hdus = list(self)
         if not hdus:
             raise ValueError("cannot serialize an empty HDUList (a FITS file needs a primary HDU)")
@@ -1719,8 +1779,6 @@ class HDUList(list):
             PrimaryHDU()._write_to(handle, primary=True)
         for i, hdu in enumerate(hdus):
             hdu._write_to(handle, primary=(i == 0))
-            if checksum:
-                ll.check(ll.lib.zf_write_chksum(handle))
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════

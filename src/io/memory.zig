@@ -27,6 +27,12 @@ pub const MemoryDevice = struct {
         return .{ .alloc = allocator, .buf = list };
     }
 
+    /// An in-memory device that takes ownership of an allocator-owned byte slice without copying.
+    /// `owned` must have been allocated by `allocator`; the device frees it on `deinit`.
+    pub fn initOwnedBytes(allocator: std.mem.Allocator, owned: []u8) MemoryDevice {
+        return .{ .alloc = allocator, .buf = std.ArrayList(u8).fromOwnedSlice(owned) };
+    }
+
     /// Free the backing buffer.
     pub fn deinit(self: *MemoryDevice) void {
         self.buf.deinit(self.alloc);
@@ -132,6 +138,17 @@ test "initBytes and setSize" {
     var z: [2]u8 = undefined;
     try dev.readAll(&z, 4);
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 0 }, &z);
+}
+
+test "initOwnedBytes adopts and grows an exact allocation" {
+    const owned = try testing.allocator.dupe(u8, "owned");
+    var mem = MemoryDevice.initOwnedBytes(testing.allocator, owned);
+    defer mem.deinit();
+    try testing.expectEqual(@intFromPtr(owned.ptr), @intFromPtr(mem.bytes().ptr));
+
+    const dev = mem.device();
+    try dev.writeAll("!", owned.len);
+    try testing.expectEqualStrings("owned!", mem.bytes());
 }
 
 test "reads past end return short / zero" {

@@ -355,13 +355,38 @@ export class HDUList implements Iterable<AnyHDU> {
   /** @internal */
   _sourceBytes(): Uint8Array {
     this.flush(); // persist pending header/data edits so the raw bytes are current
-    const handle = this._handle as bigint;
+    return this._sourceBytesAfterFlush();
+  }
+
+  /** Read current device bytes after the caller has already flushed. */
+  private _sourceBytesAfterFlush(): Uint8Array {
+    return this._copyHandleBytes(this._handle as bigint);
+  }
+
+  /** Copy an in-memory handle once, falling back to the legacy staged ABI. */
+  private _copyHandleBytes(handle: bigint): Uint8Array {
+    const direct = ll.native.copyMemoryBytes;
+    if (direct) {
+      const result = direct(handle);
+      ll.check(result.status);
+      return result.bytes;
+    }
     const size = ll.outU64();
     ll.check(ll.lib.zf_data_size(handle, size));
     const buf = new Uint8Array(Number(size[0]));
     const got = ll.outU64();
     ll.check(ll.lib.zf_read_bytes(handle, 0n, buf, buf.length, got));
     return buf.subarray(0, Number(got[0]));
+  }
+
+  /** Write a borrowed Wasm view synchronously, falling back to a stable JS copy. */
+  private _writeHandleBytes(handle: bigint, path: string): void {
+    const direct = ll.native.withMemoryBytes;
+    if (direct) {
+      ll.check(direct(handle, (bytes) => writeFile(path, bytes)));
+      return;
+    }
+    writeFile(path, this._copyHandleBytes(handle));
   }
 
   close(): void {
@@ -373,7 +398,7 @@ export class HDUList implements Iterable<AnyHDU> {
     try {
       if (this._mode !== ll.READONLY) {
         this.flush();
-        if (this._path !== null) writeFile(this._path, this._sourceBytes());
+        if (this._path !== null) this._writeHandleBytes(this._handle, this._path);
       }
     } finally {
       ll.lib.zf_close(this._handle);
@@ -390,15 +415,15 @@ export class HDUList implements Iterable<AnyHDU> {
     }
     // Write to a temp file in the same directory, then atomically rename into
     // place: a failure never leaves a partial/corrupt file at `path`, and
-    // overwrite does not destroy the existing file until the new one is done.
-    // Build the bytes in memory (the wasm module has no filesystem), then write
-    // to a temp file and atomically rename into place: a failure never leaves a
-    // partial/corrupt file at `path`, and overwrite does not destroy the existing
-    // file until the new one is complete.
+    // overwrite does not destroy the existing file until the new one is complete.
     const tmp = path + ".zigfitsio.tmp";
     try {
-      const bytes = !checksum && this._isPristineAttached() ? this._sourceBytes() : this._emitBytes(checksum);
-      writeFile(tmp, bytes);
+      if (!checksum && this._isPristineAttached()) {
+        this.flush();
+        this._writeHandleBytes(this._handle as bigint, tmp);
+      } else {
+        this._emitTo(tmp, checksum);
+      }
       renameSync(tmp, path);
     } catch (e) {
       try {
@@ -422,26 +447,29 @@ export class HDUList implements Iterable<AnyHDU> {
    * `zf_create_file` path, which the wasm build cannot use).
    */
   _emitBytes(checksum: boolean): Uint8Array {
+    return this._withEmittedHandle(checksum, (handle) => this._copyHandleBytes(handle));
+  }
+
+  private _emitTo(path: string, checksum: boolean): void {
+    this._withEmittedHandle(checksum, (handle) => this._writeHandleBytes(handle, path));
+  }
+
+  private _withEmittedHandle<T>(checksum: boolean, use: (handle: bigint) => T): T {
     const opts = checksum ? ll.encodeOpenOpts({ checksumOnClose: true }) : null;
     const out = ll.outU64();
     ll.check(ll.lib.zf_create_memory(opts, out));
     const handle = out[0];
     try {
-      this._emit(handle, checksum);
+      this._emit(handle);
       ll.check(ll.lib.zf_flush(handle));
-      const size = ll.outU64();
-      ll.check(ll.lib.zf_data_size(handle, size));
-      const buf = new Uint8Array(Number(size[0]));
-      const got = ll.outU64();
-      ll.check(ll.lib.zf_read_bytes(handle, 0n, buf, buf.length, got));
-      return buf.subarray(0, Number(got[0]));
+      return use(handle);
     } finally {
       ll.lib.zf_close(handle);
     }
   }
 
   /** @internal */
-  _emit(handle: bigint, checksum: boolean): void {
+  _emit(handle: bigint): void {
     const hdus = this.hdus;
     if (hdus.length === 0) {
       throw new FitsIOError(104, "cannot serialize an empty HDUList (a FITS file needs a primary HDU)");
@@ -454,7 +482,6 @@ export class HDUList implements Iterable<AnyHDU> {
     }
     for (let i = 0; i < hdus.length; i++) {
       hdus[i]._writeTo(handle, i === 0);
-      if (checksum) ll.check(ll.lib.zf_write_chksum(handle));
     }
   }
 }

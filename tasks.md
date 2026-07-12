@@ -812,7 +812,7 @@ Every task must satisfy all of these before it is `done`:
 - **Req:** NFR-TEST-1, NFR-INTEROP-1 · **Design:** §16, §23 · **Spec:** Appendix J
 - **Goal:** Run the committed CFITSIO ASCII-table vector and the Appendix J example as locked fixtures
   (SUM-1 owns the algorithmic golden in its own unit test; X-SUM owns the committed-file recompute).
-- **Acceptance:** suite recomputes `DATASUM=628729719` space-padded and `1302441855` zero-padded;
+- **Acceptance:** suite recomputes `DATASUM=1837006711` space-padded and `1449617504` zero-padded;
   Appendix J example reproduces `CHECKSUM='hcHjjc9ghcEghc9g'`.
 
 ### X-API — Zig 0.16 API-regression fixtures
