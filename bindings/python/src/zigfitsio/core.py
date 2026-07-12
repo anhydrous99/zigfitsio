@@ -1119,7 +1119,8 @@ class _TableHDU(_HDU):
                     stride = int(out.strides[0])
                     span = (nrows - 1) * stride + max(width, 1)
                     ll.check(ll.lib.zf_read_col_str_strided_v1(
-                        t, col, 1, nrows, width, stride, ll.ZF_STR_TRIM, _ptr(out), span,
+                        t, col, 1, nrows, width, stride, ll.ZF_STR_TRIM,
+                        c.cast(_ptr(out), ll.CHARP), span,
                     ))
 
             return field_dtype, read_str
@@ -1183,7 +1184,8 @@ class _TableHDU(_HDU):
                 if nrows:
                     stride = int(out.strides[0])
                     ll.check(ll.lib.zf_read_col_strided_v1(
-                        t, dt.zf_code(elem_dtype), col, 1, nrows, None, _ptr(out),
+                        t, dt.zf_code(elem_dtype), col, 1, nrows, None,
+                        c.cast(_ptr(out), ll.CHARP),
                         (nrows - 1) * stride + elem_dtype.itemsize, stride,
                     ))
 
@@ -1198,7 +1200,8 @@ class _TableHDU(_HDU):
                 if nrows:
                     stride = int(out.strides[0])
                     ll.check(ll.lib.zf_read_col_strided_v1(
-                        t, dt.zf_code(elem_dtype), col, 1, nrows, None, _ptr(out),
+                        t, dt.zf_code(elem_dtype), col, 1, nrows, None,
+                        c.cast(_ptr(out), ll.CHARP),
                         (nrows - 1) * stride + repeat * cdtype.itemsize, stride,
                     ))
 
@@ -1220,7 +1223,8 @@ class _TableHDU(_HDU):
             if nrows:
                 stride = int(out.strides[0])
                 ll.check(ll.lib.zf_read_col_strided_v1(
-                    t, dt.zf_code(elem_dtype), col, 1, nrows, None, _ptr(out),
+                    t, dt.zf_code(elem_dtype), col, 1, nrows, None,
+                    c.cast(_ptr(out), ll.CHARP),
                     (nrows - 1) * stride + repeat * elem_dtype.itemsize, stride,
                 ))
 
