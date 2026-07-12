@@ -106,9 +106,9 @@ pub const HttpDevice = struct {
                 if (validated.total) |total| try self.ensureSizeCompatible(total);
                 const r = resp.reader(&self.transfer_buf);
                 const response_len: usize = @intCast(validated.span);
-                const n = r.readSliceShort(buf[0..response_len]) catch return error.ReadFailed;
+                r.readSliceAll(buf[0..response_len]) catch return error.ReadFailed;
                 if (validated.total) |total| _ = try self.recordSize(total);
-                return n;
+                return response_len;
             },
             // The server ignored `Range` and sent the whole file: cache it and serve locally.
             .ok => {
@@ -354,8 +354,8 @@ fn contentRange(resp: *std.http.Client.Response) ?ContentRange {
 
 const ValidatedRange = struct { span: u64, total: ?u64 };
 
-/// Validate that a satisfied Content-Range answers the exact requested range, shortened only
-/// when the selected representation ends before the requested end.
+/// Validate that a satisfied Content-Range begins at the requested offset and does not extend
+/// beyond the requested end. Servers may intentionally cap a response to a smaller subrange.
 fn validateSatisfiedRange(parsed: ContentRange, offset: u64, len: usize) ?ValidatedRange {
     const range = switch (parsed) {
         .satisfied => |r| r,
@@ -363,8 +363,7 @@ fn validateSatisfiedRange(parsed: ContentRange, offset: u64, len: usize) ?Valida
     };
     if (range.first != offset or len == 0) return null;
     const requested_last = offset + @as(u64, len) - 1;
-    const expected_last = if (range.total) |total| @min(requested_last, total - 1) else requested_last;
-    if (range.last != expected_last) return null;
+    if (range.last > requested_last) return null;
     return .{ .span = range.last - range.first + 1, .total = range.total };
 }
 
@@ -417,7 +416,11 @@ test "validateSatisfiedRange accepts exact and EOF-shortened responses" {
         validateSatisfiedRange(shortened, 90, 20).?,
     );
     try testing.expectEqual(@as(?ValidatedRange, null), validateSatisfiedRange(exact, 11, 10));
-    try testing.expectEqual(@as(?ValidatedRange, null), validateSatisfiedRange(exact, 10, 20));
+    try testing.expectEqualDeep(
+        ValidatedRange{ .span = 10, .total = 100 },
+        validateSatisfiedRange(exact, 10, 20).?,
+    );
+    try testing.expectEqual(@as(?ValidatedRange, null), validateSatisfiedRange(exact, 10, 5));
 }
 
 test "recordSize memoizes zero and rejects conflicting observations" {
@@ -454,6 +457,9 @@ const LoopbackScript = enum {
     zero_range_size,
     read_seeds_size,
     no_range_fallback,
+    truncated_chunked,
+    truncated_fixed,
+    range_limited,
 };
 
 const LoopbackContext = struct {
@@ -552,6 +558,47 @@ fn serveLoopbackFallible(ctx: *LoopbackContext) !void {
                 .extra_headers = &.{.{ .name = "content-range", .value = "bytes 1-2/5" }},
             });
         },
+        .truncated_chunked, .truncated_fixed => {
+            var req = try server.receiveHead();
+            try checkLoopbackRequest(&req, .GET, "bytes=0-3");
+            ctx.get_count += 1;
+            if (ctx.script == .truncated_chunked) {
+                try req.respond("ab", .{
+                    .status = .partial_content,
+                    .keep_alive = false,
+                    .transfer_encoding = .chunked,
+                    .extra_headers = &.{.{ .name = "content-range", .value = "bytes 0-3/100" }},
+                });
+            } else {
+                try req.server.out.writeAll(
+                    "HTTP/1.1 206 Partial Content\r\n" ++
+                        "content-length: 4\r\n" ++
+                        "content-range: bytes 0-3/100\r\n" ++
+                        "connection: close\r\n\r\n" ++
+                        "ab",
+                );
+                try req.server.out.flush();
+            }
+        },
+        .range_limited => {
+            var first = try server.receiveHead();
+            try checkLoopbackRequest(&first, .GET, "bytes=0-3");
+            ctx.get_count += 1;
+            try first.respond("ab", .{
+                .status = .partial_content,
+                .keep_alive = true,
+                .extra_headers = &.{.{ .name = "content-range", .value = "bytes 0-1/5" }},
+            });
+
+            var second = try server.receiveHead();
+            try checkLoopbackRequest(&second, .GET, "bytes=2-3");
+            ctx.get_count += 1;
+            try second.respond("cd", .{
+                .status = .partial_content,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "content-range", .value = "bytes 2-3/5" }},
+            });
+        },
     }
 }
 
@@ -605,6 +652,18 @@ fn runLoopbackScenario(script: LoopbackScript) !void {
             try testing.expectEqualStrings("cd", &buf);
             try testing.expectEqual(@as(u64, 5), try dev.getSize());
         },
+        .truncated_chunked, .truncated_fixed => {
+            var buf: [4]u8 = undefined;
+            try testing.expectError(error.ReadFailed, dev.pread(&buf, 0));
+            const http: *HttpDevice = @ptrCast(@alignCast(dev.ptr));
+            try testing.expectEqual(@as(?u64, null), http.known_size);
+        },
+        .range_limited => {
+            var buf: [4]u8 = undefined;
+            try dev.readAll(&buf, 0);
+            try testing.expectEqualStrings("abcd", &buf);
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+        },
     }
 
     thread.join();
@@ -626,6 +685,14 @@ fn runLoopbackScenario(script: LoopbackScript) !void {
             try testing.expectEqual(@as(usize, 0), ctx.head_count);
             try testing.expectEqual(@as(usize, 1), ctx.get_count);
         },
+        .truncated_chunked, .truncated_fixed => {
+            try testing.expectEqual(@as(usize, 0), ctx.head_count);
+            try testing.expectEqual(@as(usize, 1), ctx.get_count);
+        },
+        .range_limited => {
+            try testing.expectEqual(@as(usize, 0), ctx.head_count);
+            try testing.expectEqual(@as(usize, 2), ctx.get_count);
+        },
     }
 }
 
@@ -639,4 +706,13 @@ test "HTTP size is discovered once per device lifetime" {
 test "range reads seed size and no-range fallback reuses its response" {
     try runLoopbackScenario(.read_seeds_size);
     try runLoopbackScenario(.no_range_fallback);
+}
+
+test "truncated partial responses fail without caching their advertised size" {
+    try runLoopbackScenario(.truncated_chunked);
+    try runLoopbackScenario(.truncated_fixed);
+}
+
+test "server-limited partial responses remain valid short reads" {
+    try runLoopbackScenario(.range_limited);
 }
