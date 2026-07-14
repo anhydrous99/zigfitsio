@@ -883,6 +883,10 @@ pub fn copyRows(self, dst: *BinTable, src_first: u64, n: u64) !void;
 // column ops (FR-BTB-6): insertColumn / appendColumn / deleteColumn / copyColumn
 ```
 
+`copyColumn` is a raw fixed-width-cell operation. It rejects either source or destination when
+the column is a `P`/`Q` descriptor: copying descriptor bytes would alias heap payload ownership.
+A future VLA copy operation must carry the active `HeapManager` and deep-copy the payload.
+
 Column lookup is case-insensitive with the `*`/`?`/`#` wildcards and the **explicit
 multi-match contract** of `FR-UTL-4` (zero → `error.NoSuchColumn`; one → that column;
 many → the ordered `Matches` list) — never the CFITSIO status-iteration idiom.
