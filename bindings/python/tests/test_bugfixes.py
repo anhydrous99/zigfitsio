@@ -1528,6 +1528,56 @@ def test_out_of_range_znaxis_raises():
         _ = hl[1].shape
 
 
+# ── BUGHUNT-2026-07-06 #49: malformed gzip tiles must raise, never abort ───────────────────
+_MALFORMED_GZIP = bytes.fromhex("1f8b08000000000000ff0302000000000000000000")
+
+
+def _malformed_gzip_zimage_bytes(codec, fallback=False):
+    def build(handle):
+        ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
+        names = [b"COMPRESSED_DATA"]
+        if fallback:
+            names.append(b"GZIP_COMPRESSED_DATA")
+        ncols = len(names)
+        ttype = (c.c_char_p * ncols)(*names)
+        tform = (c.c_char_p * ncols)(*([b"1PB"] * ncols))
+        ll.check(ll.lib.zf_create_tbl_heap(
+            handle, ll.BINARY_TBL, 1, ncols, ttype, tform, None, None, len(_MALFORMED_GZIP)
+        ))
+        table = c.c_void_p()
+        ll.check(ll.lib.zf_table_open(handle, c.byref(table)))
+        try:
+            payload = np.frombuffer(_MALFORMED_GZIP, dtype=np.uint8)
+            ll.check(ll.lib.zf_write_col_vla(
+                table, ll.ZF_UINT8, 1 if fallback else 0, 1,
+                payload.ctypes.data_as(c.c_void_p), payload.size,
+            ))
+        finally:
+            ll.lib.zf_table_close(table)
+        key = b"ZIMAGE"
+        ll.check(ll.lib.zf_write_key_log(handle, key, len(key), 1, None, 0))
+        key, value = b"ZCMPTYPE", codec.encode()
+        ll.check(ll.lib.zf_write_key_str(handle, key, len(key), value, len(value), None, 0))
+        for key, value in ((b"ZBITPIX", 16), (b"ZNAXIS", 1), (b"ZNAXIS1", 1), (b"ZTILE1", 1)):
+            ll.check(ll.lib.zf_write_key_lng(handle, key, len(key), value, None, 0))
+    return _bytes_from(build)
+
+
+@pytest.mark.parametrize(("codec", "fallback"), [
+    ("GZIP_1", False),
+    ("GZIP_2", False),
+    ("GZIP_1", True),
+])
+def test_malformed_gzip_tile_raises_instead_of_aborting(codec, fallback):
+    hl = zf.from_bytes(_malformed_gzip_zimage_bytes(codec, fallback))
+    try:
+        with pytest.raises(ll.FitsCompressError) as exc:
+            _ = hl[1].data
+        assert exc.value.status == 414
+    finally:
+        hl.close()
+
+
 # ── 2026-07 findings 13-15: None header values, data=None clears, table data validation ──────
 def test_none_header_value_round_trips_as_undefined_card(tmp_fits):
     # Finding 13: header['KEY'] = None must write a FITS *undefined* card (blank value field),

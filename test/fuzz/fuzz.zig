@@ -298,6 +298,11 @@ test "seeds: hostile codec streams are typed errors, never a panic" {
     try std.testing.expectError(error.CorruptTile, fits.plio.decompress(alloc, &.{0x00}, 4));
     // GZIP: not a gzip stream; and a valid stream must respect the output ceiling.
     try std.testing.expectError(error.CorruptTile, fits.gzip.gzipDecode(alloc, "not gzip at all", 1 << 16));
+    const malformed_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" ++
+        "\x03\x02\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00";
+    try std.testing.expectError(error.CorruptTile, fits.gzip.gzipDecode(alloc, malformed_gzip, 1 << 16));
+    try std.testing.expectError(error.CorruptTile, fits.gzip.gzip2Decode(alloc, malformed_gzip, 4, 1 << 16));
     {
         const big = try alloc.alloc(u8, 4096);
         defer alloc.free(big);

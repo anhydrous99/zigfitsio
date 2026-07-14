@@ -34,6 +34,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
   fail without caching metadata, while server-capped subranges remain valid short reads.
 
 ### Fixed
+- **Core / Python / TypeScript**: malformed `GZIP_1`/`GZIP_2` tile streams with invalid
+  DEFLATE back-references now reliably surface as `error.CorruptTile`, C status 414, and
+  `FitsCompressError` instead of aborting native callers or trapping Wasm. Zig 0.16.0 supplies
+  the hardened flate decoder; deterministic core, fuzz-seed, native, and Wasm regressions pin
+  both codecs and the `GZIP_COMPRESSED_DATA` fallback. (BUGHUNT-2026-07-06 item 49)
 - **Core**: `BinTable.copyColumn` now rejects `P`/`Q` variable-length-array columns before any
   device mutation. Raw descriptor copying previously gave two cells ownership of one heap extent,
   so rewriting the source silently changed the destination and invalidated heap-manager accounting.

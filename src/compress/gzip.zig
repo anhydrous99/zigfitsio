@@ -121,3 +121,11 @@ test "decode enforces the output ceiling" {
 test "corrupt gzip stream fails typed" {
     try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, "not a gzip stream", 1 << 20));
 }
+
+test "malformed gzip back-reference fails typed" {
+    const malformed = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" ++
+        "\x03\x02\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00";
+    try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, malformed, 1 << 20));
+    try testing.expectError(error.CorruptTile, gzip2Decode(testing.allocator, malformed, 2, 1 << 20));
+}
