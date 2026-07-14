@@ -1975,6 +1975,60 @@ describe("zf_img_param hostile Z* geometry (finding 47)", () => {
   });
 });
 
+describe("malformed gzip tiles (BUGHUNT 49)", () => {
+  const malformedGzip = Uint8Array.from([
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+    0x03, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]);
+
+  function malformedZimageBytes(codec: string, fallback: boolean): Uint8Array {
+    return bytesFrom((handle) => {
+      const names = fallback ? ["COMPRESSED_DATA", "GZIP_COMPRESSED_DATA"] : ["COMPRESSED_DATA"];
+      ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+      ll.check(ll.lib.zf_create_tbl_heap(
+        handle, ll.BINARY_TBL, 1n, names.length, names, names.map(() => "1PB"), null, null,
+        BigInt(malformedGzip.length),
+      ));
+      const table = ll.outU64();
+      ll.check(ll.lib.zf_table_open(handle, table));
+      try {
+        ll.check(ll.lib.zf_write_col_vla(
+          table[0], ll.ZF_UINT8, fallback ? 1 : 0, 1n, malformedGzip, BigInt(malformedGzip.length),
+        ));
+      } finally {
+        ll.lib.zf_table_close(table[0]);
+      }
+      const zimage = enc("ZIMAGE");
+      ll.check(ll.lib.zf_write_key_log(handle, zimage, zimage.length, 1, null, 0));
+      const zcmptype = enc("ZCMPTYPE");
+      ll.check(ll.lib.zf_write_key_str(handle, zcmptype, zcmptype.length, enc(codec), codec.length, null, 0));
+      for (const [name, value] of [["ZBITPIX", 16n], ["ZNAXIS", 1n], ["ZNAXIS1", 1n], ["ZTILE1", 1n]] as const) {
+        const key = enc(name);
+        ll.check(ll.lib.zf_write_key_lng(handle, key, key.length, value, null, 0));
+      }
+    });
+  }
+
+  test("GZIP_1, GZIP_2, and the gzip fallback throw status 414 instead of trapping", () => {
+    for (const [codec, fallback] of [["GZIP_1", false], ["GZIP_2", false], ["GZIP_1", true]] as const) {
+      const hl = zf.fromBytes(malformedZimageBytes(codec, fallback));
+      try {
+        let caught: unknown;
+        try {
+          void (hl.get(1) as zf.CompImageHDU).data;
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(zf.FitsCompressError);
+        expect((caught as zf.FitsError).status).toBe(414);
+      } finally {
+        hl.close();
+      }
+    }
+  });
+});
+
 describe("undefined header values (finding 13)", () => {
   test("null value writes an undefined card and round-trips", () => {
     const h = new zf.Header();
