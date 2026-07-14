@@ -2117,8 +2117,8 @@ fn celestialOf(h: *Handle, alt: c_int) fits.Error!fits.Celestial {
     return fits.Celestial.fromWcs(&w);
 }
 
-/// Convert a 1-based pixel coordinate `(px, py)` to celestial `(lon, lat)` degrees using the
-/// current HDU's WCS (`alt` selects an alternate WCS letter; 0/space = primary).
+/// Convert 1-based `(longitude-axis pixel, latitude-axis pixel)` to celestial `(lon, lat)`
+/// degrees using the current HDU's WCS (`alt` selects an alternate WCS letter; 0/space = primary).
 pub export fn zf_wcs_pix2world(h_opt: ?*Handle, alt: c_int, px: f64, py: f64, out_lon: *f64, out_lat: *f64) c_int {
     const h = h_opt orelse return abi.failNull();
     const cel = celestialOf(h, alt) catch |e| return abi.fail(&h.diag, e);
@@ -2128,7 +2128,8 @@ pub export fn zf_wcs_pix2world(h_opt: ?*Handle, alt: c_int, px: f64, py: f64, ou
     return 0;
 }
 
-/// Convert celestial `(lon, lat)` degrees to a 1-based pixel coordinate `(px, py)`.
+/// Convert celestial `(lon, lat)` degrees to 1-based
+/// `(longitude-axis pixel, latitude-axis pixel)`.
 pub export fn zf_wcs_world2pix(h_opt: ?*Handle, alt: c_int, lon: f64, lat: f64, out_px: *f64, out_py: *f64) c_int {
     const h = h_opt orelse return abi.failNull();
     const cel = celestialOf(h, alt) catch |e| return abi.fail(&h.diag, e);

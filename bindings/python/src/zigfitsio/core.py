@@ -730,7 +730,11 @@ class ImageHDU(_HDU):
 
     # ── WCS celestial transforms (1-based pixel coords, FITS CRPIX convention) ────────────
     def pix2world(self, x: float, y: float, alt: str = " "):
-        """Convert one-based FITS pixel coordinates to celestial longitude and latitude."""
+        """Convert one-based longitude- and latitude-axis pixels to celestial coordinates.
+
+        ``x`` is the longitude-axis pixel and ``y`` the latitude-axis pixel; those axes need
+        not be FITS Axes 1 and 2.
+        """
 
         h = self._select()
         lon = c.c_double()
@@ -739,7 +743,11 @@ class ImageHDU(_HDU):
         return lon.value, lat.value
 
     def world2pix(self, lon: float, lat: float, alt: str = " "):
-        """Convert celestial longitude and latitude to one-based FITS pixel coordinates."""
+        """Convert celestial coordinates to one-based longitude- and latitude-axis pixels.
+
+        The returned pair is ordered longitude-axis pixel then latitude-axis pixel; those axes
+        need not be FITS Axes 1 and 2.
+        """
 
         h = self._select()
         px = c.c_double()

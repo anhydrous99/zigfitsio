@@ -345,6 +345,8 @@ int  zf_findings_get(ZfFindings* f, long i, int* severity, int* hdu,
 void zf_findings_free(ZfFindings* f);
 
 /* ── World Coordinate System ─────────────────────────────────────────────────────────────── */
+/* Pixel-coordinate pairs are 1-based and ordered (longitude-axis pixel, latitude-axis pixel);
+ * the celestial axes need not be FITS Axes 1 and 2. */
 int  zf_wcs_pix2world(ZfFits* h, int alt, double px, double py, double* out_lon, double* out_lat);
 int  zf_wcs_world2pix(ZfFits* h, int alt, double lon, double lat, double* out_px, double* out_py);
 
