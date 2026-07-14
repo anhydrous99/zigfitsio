@@ -2,6 +2,8 @@
 
 import ctypes as c
 import os
+import shutil
+import subprocess
 
 import numpy as np
 import pytest
@@ -303,6 +305,34 @@ def test_wcs_matches_astropy(tmp_fits):
     with zf.open(p) as hdul:
         lon, lat = hdul[0].pix2world(40.0, 30.0)  # 1-based
     np.testing.assert_allclose([lon, lat], ap, atol=1e-6)
+
+
+def test_non_adjacent_celestial_axes_match_astropy(tmp_fits):
+    WCS = pytest.importorskip("astropy.wcs").WCS
+    hdr = afits.Header()
+    for k, v in [
+        ("CTYPE1", "RA---TAN"), ("CTYPE2", "FREQ"), ("CTYPE3", "DEC--TAN"),
+        ("CUNIT1", "deg"), ("CUNIT2", "Hz"), ("CUNIT3", "deg"),
+        ("CRPIX1", 8.0), ("CRPIX2", 5.0), ("CRPIX3", 6.0),
+        ("CRVAL1", 150.0), ("CRVAL2", 1.42e9), ("CRVAL3", 2.0),
+        ("CDELT1", -0.001), ("CDELT2", 1e6), ("CDELT3", 0.001),
+    ]:
+        hdr[k] = v
+    p = tmp_fits("non_adjacent_celestial.fits")
+    afits.PrimaryHDU(np.zeros((12, 10, 16), dtype="f4"), header=hdr).writeto(p)
+
+    w = WCS(afits.getheader(p))
+    pixel = np.array([11.25, hdr["CRPIX2"], 3.75])
+    world = w.all_pix2world([pixel], 1)[0]
+    astropy_pixel = w.all_world2pix([[world[0], hdr["CRVAL2"], world[2]]], 1)[0]
+    with zf.open(p) as hdul:
+        zig_world = hdul[0].pix2world(pixel[0], pixel[2])
+        zig_pixel = hdul[0].world2pix(world[0], world[2])
+
+    np.testing.assert_allclose(zig_world, world[[0, 2]], rtol=0, atol=1e-6)
+    np.testing.assert_allclose(zig_pixel, astropy_pixel[[0, 2]], rtol=0, atol=1e-6)
+    if verifier := shutil.which("fitsverify"):
+        subprocess.run([verifier, "-q", p], check=True, capture_output=True, text=True)
 
 
 def test_undefined_card_matches_astropy(tmp_fits):

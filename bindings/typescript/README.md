@@ -99,6 +99,9 @@ hdul.image(0).header.transaction((header) => {
 
 ### WCS
 
+Pixel pairs are one-based and ordered (longitude-axis pixel, latitude-axis pixel); the
+celestial axes need not be FITS Axes 1 and 2.
+
 ```ts
 using hdul = zf.open("wcs.fits");
 const [lon, lat] = hdul.image(0).pix2world(40.0, 30.0); // 1-based FITS pixel convention

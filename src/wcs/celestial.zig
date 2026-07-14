@@ -60,12 +60,14 @@ pub const Projection = enum {
     }
 };
 
-/// A celestial transform derived from a 2-axis `Wcs`: the reference pixel/value, the linear
-/// transform, the projection, and the rotation parameters. Built by `fromWcs`.
+/// A celestial transform derived from the longitude/latitude axis pair of a `Wcs`: the
+/// reference pixel/value, linear transform, projection, and rotation parameters. Built by
+/// `fromWcs`.
 pub const Celestial = struct {
     proj: Projection,
-    /// Index of the longitude axis (0) and latitude axis (1) in the WCS.
+    /// Zero-based index of the longitude axis in the source WCS.
     lon_axis: usize = 0,
+    /// Zero-based index of the latitude axis in the source WCS.
     lat_axis: usize = 1,
     crpix: [2]f64,
     crval: [2]f64, // reference value [lon0, lat0] degrees (informational)
@@ -80,18 +82,44 @@ pub const Celestial = struct {
     /// Inverse of `m`.
     minv: [2][2]f64,
 
-    /// Build a celestial transform from a parsed `Wcs`. Requires ≥2 axes whose `CTYPEi` carry
-    /// a supported projection. `error.UnsupportedProjection` / `error.BadWcs` otherwise.
+    /// Build a celestial transform from a parsed `Wcs`. Requires exactly one complementary
+    /// longitude/latitude pair whose `CTYPEi` values carry the same projection code.
+    /// A PC/CD term from an omitted pixel axis into either celestial row is not representable
+    /// by this two-pixel API and returns `error.BadWcs`.
+    /// `error.UnsupportedProjection` / `error.BadWcs` otherwise.
     pub fn fromWcs(w: *const Wcs) WcsError!Celestial {
-        if (w.axes < 2) return error.BadWcs;
-        // Identify lon/lat axes by CTYPE prefix; default to (0,1).
-        var lon: usize = 0;
-        var lat: usize = 1;
-        if (isLat(w.ctype[0]) and isLon(w.ctype[1])) {
-            lon = 1;
-            lat = 0;
+        const n: usize = w.axes;
+        if (n < 2 or w.ctype.len < n) return error.BadWcs;
+
+        var lon_axis: ?usize = null;
+        var lat_axis: ?usize = null;
+        var lon_family: ?CelestialFamily = null;
+        var lat_family: ?CelestialFamily = null;
+        for (w.ctype[0..n], 0..) |ctype, i| {
+            if (longitudeFamily(ctype)) |family| {
+                if (lon_axis != null) return error.BadWcs;
+                lon_axis = i;
+                lon_family = family;
+            }
+            if (latitudeFamily(ctype)) |family| {
+                if (lat_axis != null) return error.BadWcs;
+                lat_axis = i;
+                lat_family = family;
+            }
         }
+        const lon = lon_axis orelse return error.BadWcs;
+        const lat = lat_axis orelse return error.BadWcs;
+        if (lon_family.? != lat_family.?) return error.BadWcs;
+
+        const lon_code = w.ctype[lon][w.ctype[lon].len - 3 ..];
+        const lat_code = w.ctype[lat][w.ctype[lat].len - 3 ..];
+        if (!std.ascii.eqlIgnoreCase(lon_code, lat_code)) return error.BadWcs;
         const proj = Projection.fromCtype(w.ctype[lon]) orelse return error.UnsupportedProjection;
+
+        switch (w.transform) {
+            .pc, .cd => |matrix| if (couplesOmittedPixelAxis(matrix, lon, lat, n)) return error.BadWcs,
+            .none => {},
+        }
 
         // Build the 2×2 linear transform M absorbing CDELT (PC) or using CD directly.
         var m: [2][2]f64 = undefined;
@@ -146,8 +174,8 @@ pub const Celestial = struct {
         };
     }
 
-    /// Convert a pixel coordinate `[lon_pix, lat_pix]` (1-based, per FITS CRPIX) to celestial
-    /// `[lon_deg, lat_deg]`.
+    /// Convert a 1-based pixel coordinate `[longitude-axis pixel, latitude-axis pixel]` to
+    /// celestial `[lon_deg, lat_deg]`. The pair need not be FITS Axes 1 and 2.
     pub fn pixelToWorld(self: *const Celestial, pix: [2]f64) WcsError![2]f64 {
         // 1. pixel → intermediate world coordinates (degrees).
         const q0 = pix[0] - self.crpix[0];
@@ -160,7 +188,8 @@ pub const Celestial = struct {
         return self.nativeToCelestial(nt.phi, nt.theta);
     }
 
-    /// Convert celestial `[lon_deg, lat_deg]` to a pixel coordinate `[lon_pix, lat_pix]`.
+    /// Convert celestial `[lon_deg, lat_deg]` to a 1-based pixel coordinate ordered
+    /// `[longitude-axis pixel, latitude-axis pixel]`. The pair need not be FITS Axes 1 and 2.
     pub fn worldToPixel(self: *const Celestial, world: [2]f64) WcsError![2]f64 {
         const nt = self.celestialToNative(world[0], world[1]);
         const xy = try self.project(nt.phi, nt.theta);
@@ -328,11 +357,32 @@ fn wrapPi(a: f64) f64 {
     return x - std.math.pi;
 }
 
-fn isLon(ct: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(ct, "RA") or std.ascii.startsWithIgnoreCase(ct, "GLON") or std.ascii.startsWithIgnoreCase(ct, "ELON");
+const CelestialFamily = enum { equatorial, galactic, ecliptic };
+
+fn longitudeFamily(ctype: []const u8) ?CelestialFamily {
+    if (ctype.len < 5) return null;
+    const prefix = ctype[0..5];
+    if (std.ascii.eqlIgnoreCase(prefix, "RA---")) return .equatorial;
+    if (std.ascii.eqlIgnoreCase(prefix, "GLON-")) return .galactic;
+    if (std.ascii.eqlIgnoreCase(prefix, "ELON-")) return .ecliptic;
+    return null;
 }
-fn isLat(ct: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(ct, "DEC") or std.ascii.startsWithIgnoreCase(ct, "GLAT") or std.ascii.startsWithIgnoreCase(ct, "ELAT");
+
+fn latitudeFamily(ctype: []const u8) ?CelestialFamily {
+    if (ctype.len < 5) return null;
+    const prefix = ctype[0..5];
+    if (std.ascii.eqlIgnoreCase(prefix, "DEC--")) return .equatorial;
+    if (std.ascii.eqlIgnoreCase(prefix, "GLAT-")) return .galactic;
+    if (std.ascii.eqlIgnoreCase(prefix, "ELAT-")) return .ecliptic;
+    return null;
+}
+
+fn couplesOmittedPixelAxis(matrix: [][]f64, lon: usize, lat: usize, axes: usize) bool {
+    for (0..axes) |pixel_axis| {
+        if (pixel_axis != lon and pixel_axis != lat and
+            (matrix[lon][pixel_axis] != 0 or matrix[lat][pixel_axis] != 0)) return true;
+    }
+    return false;
 }
 fn clamp(v: f64, lo: f64, hi: f64) f64 {
     return @max(lo, @min(hi, v));
@@ -401,6 +451,124 @@ test "TAN: reference pixel maps to CRVAL; pixel→world→pixel round-trips" {
         const back = try c.worldToPixel(world);
         try testing.expect(@abs(back[0] - pt[0]) < 1e-6);
         try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
+    }
+}
+
+test "Celestial.fromWcs discovers separated celestial axes" {
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    3",
+        "CTYPE1  = 'RA---TAN'",
+        "CTYPE2  = 'FREQ'",
+        "CTYPE3  = 'DEC--TAN'",
+        "CRPIX1  =                 32.0",
+        "CRPIX2  =                  5.0",
+        "CRPIX3  =                 24.0",
+        "CRVAL1  =                150.0",
+        "CRVAL2  =         1420000000.0",
+        "CRVAL3  =                  2.0",
+        "CDELT1  =               -0.001",
+        "CDELT2  =              1000000",
+        "CDELT3  =                0.001",
+    });
+    defer cleanup(testing.allocator, p);
+
+    var c = try Celestial.fromWcs(&p.w);
+    try testing.expectEqual(@as(usize, 0), c.lon_axis);
+    try testing.expectEqual(@as(usize, 2), c.lat_axis);
+    const ref = try c.pixelToWorld(.{ 32.0, 24.0 });
+    try testing.expect(@abs(ref[0] - 150.0) < 1e-9);
+    try testing.expect(@abs(ref[1] - 2.0) < 1e-9);
+
+    const pixel: [2]f64 = .{ 41.25, 17.5 };
+    const world = try c.pixelToWorld(pixel);
+    const back = try c.worldToPixel(world);
+    try testing.expect(@abs(back[0] - pixel[0]) < 1e-6);
+    try testing.expect(@abs(back[1] - pixel[1]) < 1e-6);
+}
+
+test "Celestial.fromWcs accepts celestial PC block and reverse-only coupling" {
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    3",
+        "CTYPE1  = 'RA---TAN'",
+        "CTYPE2  = 'FREQ'",
+        "CTYPE3  = 'DEC--tan'",
+        "CRPIX1  =                  1.0",
+        "CRPIX2  =                  1.0",
+        "CRPIX3  =                  1.0",
+        "CRVAL1  =                  0.0",
+        "CRVAL2  =                  0.0",
+        "CRVAL3  =                  0.0",
+        "CDELT1  =                  2.0",
+        "CDELT2  =                  1.0",
+        "CDELT3  =                  3.0",
+        "PC1_1   =                  0.0",
+        "PC1_3   =                 -1.0",
+        "PC3_1   =                  1.0",
+        "PC3_3   =                  0.0",
+        "PC2_1   =                 0.25",
+        "PC2_3   =                 -0.5",
+    });
+    defer cleanup(testing.allocator, p);
+
+    const c = try Celestial.fromWcs(&p.w);
+    try testing.expectEqual(@as(f64, 0), c.m[0][0]);
+    try testing.expectEqual(@as(f64, -2), c.m[0][1]);
+    try testing.expectEqual(@as(f64, 3), c.m[1][0]);
+    try testing.expectEqual(@as(f64, 0), c.m[1][1]);
+}
+
+test "Celestial.fromWcs rejects missing and duplicate celestial axes" {
+    {
+        var ctypes = [_][]u8{ @constCast("FREQ"), @constCast("DEC--TAN") };
+        var w: Wcs = .{ .axes = ctypes.len, .ctype = &ctypes };
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&w));
+    }
+    {
+        var ctypes = [_][]u8{ @constCast("RA---TAN"), @constCast("FREQ") };
+        var w: Wcs = .{ .axes = ctypes.len, .ctype = &ctypes };
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&w));
+    }
+    {
+        var ctypes = [_][]u8{ @constCast("RA---TAN"), @constCast("GLON-TAN"), @constCast("DEC--TAN") };
+        var w: Wcs = .{ .axes = ctypes.len, .ctype = &ctypes };
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&w));
+    }
+    {
+        var ctypes = [_][]u8{ @constCast("RA---TAN"), @constCast("DEC--TAN"), @constCast("GLAT-TAN") };
+        var w: Wcs = .{ .axes = ctypes.len, .ctype = &ctypes };
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&w));
+    }
+}
+
+test "Celestial.fromWcs rejects mixed families and projection codes" {
+    {
+        var ctypes = [_][]u8{ @constCast("RA---TAN"), @constCast("GLAT-TAN") };
+        var w: Wcs = .{ .axes = ctypes.len, .ctype = &ctypes };
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&w));
+    }
+    {
+        var ctypes = [_][]u8{ @constCast("RA---TAN"), @constCast("DEC--SIN") };
+        var w: Wcs = .{ .axes = ctypes.len, .ctype = &ctypes };
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&w));
+    }
+}
+
+test "Celestial.fromWcs rejects celestial rows coupled to omitted pixel axes" {
+    inline for (.{
+        "PC1_2   =                 0.25",
+        "PC3_2   =                 0.25",
+        "CD1_2   =                 0.25",
+        "CD3_2   =                 0.25",
+    }) |coupling| {
+        var p = try wcsFromCards(testing.allocator, &.{
+            "WCSAXES =                    3",
+            "CTYPE1  = 'RA---TAN'",
+            "CTYPE2  = 'FREQ'",
+            "CTYPE3  = 'DEC--TAN'",
+            coupling,
+        });
+        defer cleanup(testing.allocator, p);
+        try testing.expectError(error.BadWcs, Celestial.fromWcs(&p.w));
     }
 }
 
@@ -614,7 +782,7 @@ test "legacy CROTA2 rotation is folded into M when no PC/CD" {
     try testing.expect(@abs(back[1] - pt[1]) < 1e-6);
 }
 
-test "unsupported projection is a typed error" {
+test "Celestial.fromWcs keeps matching unsupported projection as a typed error" {
     var p = try wcsFromCards(testing.allocator, &.{
         "WCSAXES =                    2",
         "CTYPE1  = 'RA---AIT'",

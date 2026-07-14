@@ -794,6 +794,11 @@ export class ImageHDU extends BaseHDU {
   }
 
   // ── WCS celestial transforms (1-based pixel coords, FITS CRPIX convention) ──
+  /**
+   * Convert one-based longitude- and latitude-axis pixels to celestial coordinates.
+   * `x` is the longitude-axis pixel and `y` the latitude-axis pixel; those axes need not be
+   * FITS Axes 1 and 2.
+   */
   pix2world(x: number, y: number, alt = " "): [number, number] {
     const h = this._select();
     const lon = ll.outF64();
@@ -803,6 +808,11 @@ export class ImageHDU extends BaseHDU {
     return [lon[0], lat[0]];
   }
 
+  /**
+   * Convert celestial coordinates to one-based longitude- and latitude-axis pixels.
+   * The returned pair is ordered longitude-axis pixel then latitude-axis pixel; those axes
+   * need not be FITS Axes 1 and 2.
+   */
   world2pix(lon: number, lat: number, alt = " "): [number, number] {
     const h = this._select();
     const px = ll.outF64();

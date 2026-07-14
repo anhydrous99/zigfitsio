@@ -85,6 +85,9 @@ use best-effort rollback and are not a crash-safe/on-disk journaling transaction
 
 ### WCS (celestial)
 
+Pixel pairs are one-based and ordered (longitude-axis pixel, latitude-axis pixel); the
+celestial axes need not be FITS Axes 1 and 2.
+
 ```python
 with zf.open("wcs.fits") as hdul:
     lon, lat = hdul[0].pix2world(40.0, 30.0)   # 1-based pixel (FITS CRPIX convention)
