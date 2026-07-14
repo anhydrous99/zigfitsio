@@ -33,6 +33,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
   because their logical size exceeds the bounded whole-body cache limit. Truncated partial bodies
   fail without caching metadata, while server-capped subranges remain valid short reads.
 
+### Fixed
+- **Core**: `BinTable.copyColumn` now rejects `P`/`Q` variable-length-array columns before any
+  device mutation. Raw descriptor copying previously gave two cells ownership of one heap extent,
+  so rewriting the source silently changed the destination and invalidated heap-manager accounting.
+  Fixed-width column copies and self-copies are unchanged. (BUGHUNT-2026-07-06 item 59)
+
 ## [0.1.5] - 2026-07-11
 
 ### Added

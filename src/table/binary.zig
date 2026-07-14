@@ -580,15 +580,17 @@ pub const BinTable = struct {
         try self.reparse();
     }
 
-    /// Copy the stored bytes of column `src` over column `dest` (both 0-based) for every row, as
-    /// a raw per-cell byte copy (no scaling). The two columns must have equal field byte widths
-    /// (`error.BadTform` otherwise). `error.NoSuchColumn` if either index is out of range.
+    /// Copy the stored bytes of fixed-width column `src` over column `dest` (both 0-based) for
+    /// every row, as a raw per-cell byte copy (no scaling). The two columns must have equal field
+    /// byte widths; P/Q descriptors require a heap-aware deep copy (`error.BadTform` otherwise).
+    /// `error.NoSuchColumn` if either index is out of range.
     pub fn copyColumn(self: *BinTable, src: u16, dest: u16) OpenError!void {
         try self.requireWritable();
         if (src >= self.columns.len or dest >= self.columns.len) return error.NoSuchColumn;
         if (src == dest) return;
         const cs = &self.columns[src];
         const cd = &self.columns[dest];
+        if (cs.tform.type.isVla() or cd.tform.type.isVla()) return error.BadTform;
         const ws = try cs.tform.fieldBytes();
         const wd = try cd.tform.fieldBytes();
         if (ws != wd) return error.BadTform;
@@ -2328,6 +2330,8 @@ test "copyColumn duplicates one column's bytes over another of equal width" {
         .{ .tform = "1J", .ttype = "SRC" },
         .{ .tform = "1J", .ttype = "DST" },
         .{ .tform = "1I", .ttype = "NARROW" },
+        .{ .tform = "1PJ", .ttype = "VLA" },
+        .{ .tform = "2J", .ttype = "WIDE" },
     };
     const hdu = try buildBinTable(&f, alloc, &specs, 3, null);
     var t = try BinTable.of(&f, hdu);
@@ -2342,6 +2346,8 @@ test "copyColumn duplicates one column's bytes over another of equal width" {
 
     // Mismatched widths are rejected; out-of-range is typed.
     try testing.expectError(error.BadTform, t.copyColumn(0, 2));
+    try testing.expectError(error.BadTform, t.copyColumn(3, 4));
+    try testing.expectError(error.BadTform, t.copyColumn(4, 3));
     try testing.expectError(error.NoSuchColumn, t.copyColumn(0, 9));
 }
 

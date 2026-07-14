@@ -1401,6 +1401,42 @@ fn makeTwoVlaHdu(f: *Fits, alloc: Allocator, nrows: u64, pcount: u64) !*Hdu {
     return f.appendHdu(h);
 }
 
+test "copyColumn rejects VLA descriptors without changing heap ownership" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeTwoVlaHdu(&fx.f, alloc, 1, 64);
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &.{ 111, 222, 333 });
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 1 }, 0, i32, &.{ 444, 555 });
+    const before = try alloc.dupe(u8, fx.mem.bytes());
+    defer alloc.free(before);
+    const top_before = mgr.top;
+    const free_before = mgr.free_list.items.len;
+
+    try t.copyColumn(0, 0); // self-copy remains a no-op, including for VLA columns
+    try testing.expectError(error.BadTform, t.copyColumn(0, 1));
+    try testing.expectEqualSlices(u8, before, fx.mem.bytes());
+    try testing.expectEqual(top_before, mgr.top);
+    try testing.expectEqual(free_before, mgr.free_list.items.len);
+
+    const src = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(src);
+    const dest = try readVlaCell(alloc, &t, .{ .index = 1 }, 0, i32);
+    defer alloc.free(dest);
+    try testing.expectEqualSlices(i32, &.{ 111, 222, 333 }, src);
+    try testing.expectEqualSlices(i32, &.{ 444, 555 }, dest);
+
+    var rebuilt = try HeapManager.initForTable(&t);
+    defer rebuilt.deinit(alloc);
+    try testing.expectEqual(top_before, rebuilt.top);
+}
+
 // A handle + memory device packaged so tests can build a one-column VLA table quickly.
 const Fixture = struct {
     mem: *MemoryDevice,
