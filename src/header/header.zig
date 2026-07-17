@@ -392,7 +392,9 @@ pub const Header = struct {
             // Prefer filling a reserved blank card in place (FR-HDR-12) over inserting, so the
             // following HDUs need not shift.
             if (self.firstBlankBeforeEnd()) |bi| {
-                try self.cards.replaceRange(alloc, bi, 1, cards);
+                var blanks: usize = 1;
+                while (blanks < cards.len and bi + blanks < self.cards.items.len and self.cards.items[bi + blanks].kind == .blank) : (blanks += 1) {}
+                try self.cards.replaceRange(alloc, bi, blanks, cards);
             } else {
                 try self.cards.replaceRange(alloc, self.endIndex() orelse self.cards.items.len, 0, cards);
             }
@@ -663,6 +665,8 @@ test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)"
     const before = h.count();
     try h.update(testing.allocator, "BITPIX", .{ .int = 8 }, null);
     try testing.expectEqual(before, h.count()); // filled a blank, no net growth
+    try h.update(testing.allocator, "LONGSTR", .{ .string = "x" ** 150 }, null);
+    try testing.expectEqual(before, h.count()); // a multi-card value consumes multiple blanks
 }
 
 test "reserveSpace bulk-inserts a large contiguous blank run" {

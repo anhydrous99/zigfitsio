@@ -85,7 +85,7 @@ pub fn parseValue(alloc: Allocator, card: *const Card) (HeaderError || errors.Va
 /// needs the long-string convention, use `split`.
 pub fn build(name: []const u8, v: value.KeywordValue, comment: ?[]const u8) HeaderError!Card {
     try value.requireFinite(v);
-    const tokens = normalizedName(name);
+    const tokens = try normalizedName(name);
     const cmt = nonEmptyComment(comment);
     var raw: [80]u8 = [_]u8{' '} ** 80;
     var w = std.Io.Writer.fixed(&raw);
@@ -115,7 +115,7 @@ pub fn build(name: []const u8, v: value.KeywordValue, comment: ?[]const u8) Head
 /// returned card slice is allocator-owned; free the slice, not individual cards.
 pub fn split(alloc: Allocator, name: []const u8, v: value.KeywordValue, comment: ?[]const u8) (HeaderError || Allocator.Error)![]Card {
     try value.requireFinite(v);
-    const tokens = normalizedName(name);
+    const tokens = try normalizedName(name);
     const cmt = nonEmptyComment(comment);
 
     var list: std.ArrayList(Card) = .empty;
@@ -189,11 +189,12 @@ pub fn split(alloc: Allocator, name: []const u8, v: value.KeywordValue, comment:
 const CONTINUE_PREFIX = "CONTINUE  ";
 
 // Trim the public spelling and accept one optional `HIERARCH ` prefix without doubling it.
-fn normalizedName(name: []const u8) []const u8 {
-    var tokens = std.mem.trim(u8, name, " ");
-    if (tokens.len >= 9 and std.ascii.eqlIgnoreCase(tokens[0..9], "HIERARCH ")) {
-        tokens = std.mem.trimStart(u8, tokens[9..], " ");
-    }
+fn normalizedName(name: []const u8) HeaderError![]const u8 {
+    const trimmed = std.mem.trimStart(u8, name, " ");
+    const prefixed = trimmed.len >= 9 and std.ascii.eqlIgnoreCase(trimmed[0..9], "HIERARCH ");
+    if (!prefixed and trimmed.len != name.len) return error.BadKeywordName;
+    const tokens = if (prefixed) std.mem.trim(u8, trimmed[9..], " ") else std.mem.trimEnd(u8, name, " ");
+    if (tokens.len == 0 or std.mem.indexOfScalar(u8, tokens, '=') != null) return error.BadKeywordName;
     return tokens;
 }
 

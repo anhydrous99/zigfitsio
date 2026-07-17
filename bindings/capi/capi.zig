@@ -1079,7 +1079,11 @@ pub export fn zf_write_key_log(h_opt: ?*Handle, name_ptr: [*]const u8, name_len:
 /// Create or update a string keyword (single card; ≤ 68 chars).
 pub export fn zf_write_key_str(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
     const h = h_opt orelse return abi.failNull();
-    return writeKey(h, name_ptr[0..name_len], .{ .string = value_ptr[0..value_len] }, commentOf(comment_ptr, comment_len));
+    const name = name_ptr[0..name_len];
+    const v: fits.KeywordValue = .{ .string = value_ptr[0..value_len] };
+    const comment = commentOf(comment_ptr, comment_len);
+    _ = (if (fits.hierarch.requiresConvention(name)) fits.hierarch.build(name, v, comment) else fits.Card.buildValue(name, v, comment)) catch |e| return abi.fail(&h.diag, e);
+    return writeKey(h, name, v, comment);
 }
 
 /// Create or update a long string keyword using the CONTINUE convention.

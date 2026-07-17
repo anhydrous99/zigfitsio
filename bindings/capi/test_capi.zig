@@ -829,6 +829,8 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     // zf_free.
     const name = "LONGSTR";
     const longval = "x" ** 100;
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_str(hh, name, name.len, longval, longval.len, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_exists(hh, name, name.len));
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, longval, longval.len, null, 0));
     var out_ptr: ?[*]u8 = null;
     var out_len: usize = 0;
@@ -838,7 +840,7 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     capi.zf_free(out_ptr, out_len);
 }
 
-test "leading keyword names are rejected with status 207 on the write path (BUGHUNT 62)" {
+test "invalid keyword names are rejected with status 207 on the write path (BUGHUNT 62)" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
     defer capi.zf_close(h);
@@ -851,10 +853,14 @@ test "leading keyword names are rejected with status 207 on the write path (BUGH
     try testing.expectEqual(@as(c_int, 207), capi.zf_last_status());
     const longval = "x" ** 100;
     try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_longstr(hh, bad, bad.len, longval, longval.len, null, 0));
+    const bad_hierarch = " ESO A";
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_lng(hh, bad_hierarch, bad_hierarch.len, 5, null, 0));
 
     const good = "GOODKEY";
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, good, good.len, 7, null, 0));
     try testing.expectEqual(@as(c_int, 207), capi.zf_rename_key(hh, good, good.len, bad, bad.len));
+    const bad_delimiter = "ESO = BAD";
+    try testing.expectEqual(@as(c_int, 207), capi.zf_rename_key(hh, good, good.len, bad_delimiter, bad_delimiter.len));
     var v: c_longlong = 0;
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(hh, good, good.len, &v));
     try testing.expectEqual(@as(c_longlong, 7), v); // untouched by the failed rename
@@ -1925,6 +1931,27 @@ test "table column mutation: insert_col and delete_col" {
     try testing.expectEqual(@as(c_int, 2), ncols);
     try testing.expectEqual(@as(c_int, 0), capi.zf_table_colnum(th, "B", 1, &col));
     try testing.expectEqual(@as(c_int, 1), col);
+}
+
+test "insert_col rejects column 1000 before mutation" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const ttype: [999]?[*:0]const u8 = @splat(null);
+    const tform: [999]?[*:0]const u8 = @splat("1B");
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(hh, 0, 0, tform.len, &ttype, &tform, null, "BIG"));
+    var t: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+    defer capi.zf_table_close(t);
+
+    try testing.expectEqual(@as(c_int, 213), capi.zf_insert_col(t.?, 999, "1B", null));
+    var ncols: c_int = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_ncols(t.?, &ncols));
+    try testing.expectEqual(@as(c_int, 999), ncols);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_exists(hh, "TFORM1000", 9));
 }
 
 test "zf_table_col_unit: ASCII tables surface TUNITn; binary tables do not (documented gap)" {

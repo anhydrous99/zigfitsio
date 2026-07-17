@@ -524,6 +524,7 @@ pub const BinTable = struct {
     pub fn insertColumn(self: *BinTable, alloc: Allocator, at: u16, tform: []const u8, ttype: ?[]const u8) OpenError!void {
         try self.requireWritable();
         if (at > self.columns.len) return error.NoSuchColumn;
+        if (self.columns.len >= 999) return error.BadDimensions;
         const parsed = try BinTform.parse(tform);
         const field_bytes = try parsed.fieldBytes();
         const old_naxis1 = self.naxis1;
