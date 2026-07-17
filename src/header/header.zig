@@ -121,10 +121,13 @@ pub const Header = struct {
     fn findFirst(self: *const Header, name: []const u8) ?usize {
         for (self.cards.items, 0..) |*c, i| {
             if (c.kind == .end) continue;
-            if (c.name.eqlText(name)) return i;
             // The 8-byte name of every HIERARCH card is the literal "HIERARCH"; match the real
             // hierarchical keyword (either spelling) via the convention parser (FR-HDR-9).
-            if (c.name.eqlText("HIERARCH") and hierarch.matchName(c, name)) return i;
+            if (hierarch.isHierarch(c)) {
+                if (hierarch.matchName(c, name)) return i;
+                continue;
+            }
+            if (c.name.eqlText(name)) return i;
         }
         return null;
     }
@@ -340,31 +343,60 @@ pub const Header = struct {
         return null;
     }
 
+    // Number of physical cards in the logical value beginning at `i`. A trailing `&` only
+    // continues when a quoted CONTINUE fragment actually follows; a lone trailing `&` is data.
+    fn valueRunCount(self: *const Header, i: usize) usize {
+        const card = &self.cards.items[i];
+        const first_field = if (hierarch.isHierarch(card))
+            hierarch.valueField(card) orelse return 1
+        else if (card.kind == .value)
+            card.valueField()
+        else
+            return 1;
+
+        var run_count: usize = 1;
+        var continues = continuation.endsWithSentinel(first_field);
+        while (continues and i + run_count < self.cards.items.len) {
+            const next = &self.cards.items[i + run_count];
+            if (next.kind != .continuation) break;
+            const field = next.raw[8..];
+            const trimmed = std.mem.trimStart(u8, field, " ");
+            if (trimmed.len == 0 or trimmed[0] != '\'') break;
+            run_count += 1;
+            continues = continuation.endsWithSentinel(field);
+        }
+        return run_count;
+    }
+
+    fn buildValueRun(alloc: Allocator, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8, as_hierarch: bool) (HeaderError || Allocator.Error)![]Card {
+        if (as_hierarch) return hierarch.split(alloc, name, v, comment_text);
+        if (v == .string) return continuation.split(alloc, name, v.string, comment_text);
+        const cards = try alloc.alloc(Card, 1);
+        errdefer alloc.free(cards);
+        cards[0] = try Card.buildValue(name, v, comment_text);
+        return cards;
+    }
+
     /// Update keyword `name`'s value (and comment): replace it in place if present, else insert
     /// a new value card just before `END` — create-if-absent (FR-HDR-11). When `comment_text`
     /// is null and the keyword exists, its current comment is preserved.
     pub fn update(self: *Header, alloc: Allocator, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
         if (self.findFirst(name)) |i| {
-            const keep = comment_text orelse value.parseComment(self.cards.items[i].valueField());
-            // Replacing a continued long-string base with a single card must also drop its
-            // CONTINUE run (same rule as `delete`): the new value does not continue, so a
-            // leftover run would be orphaned garbage commentary.
-            const old = &self.cards.items[i];
-            var continues = old.kind == .value and continuation.endsWithSentinel(old.valueField()) and
-                i + 1 < self.cards.items.len and self.cards.items[i + 1].kind == .continuation;
-            self.cards.items[i] = try Card.buildValue(name, v, keep);
-            while (continues and i + 1 < self.cards.items.len and self.cards.items[i + 1].kind == .continuation) {
-                const c = self.cards.orderedRemove(i + 1);
-                continues = continuation.endsWithSentinel(c.valueField());
-            }
+            const keep = comment_text orelse self.comment(name);
+            const cards = try buildValueRun(alloc, name, v, keep, hierarch.isHierarch(&self.cards.items[i]));
+            defer alloc.free(cards);
+            try self.cards.replaceRange(alloc, i, self.valueRunCount(i), cards);
         } else {
-            const card = try Card.buildValue(name, v, comment_text);
+            const cards = try buildValueRun(alloc, name, v, comment_text, hierarch.requiresConvention(name));
+            defer alloc.free(cards);
             // Prefer filling a reserved blank card in place (FR-HDR-12) over inserting, so the
             // following HDUs need not shift.
             if (self.firstBlankBeforeEnd()) |bi| {
-                self.cards.items[bi] = card;
+                var blanks: usize = 1;
+                while (blanks < cards.len and bi + blanks < self.cards.items.len and self.cards.items[bi + blanks].kind == .blank) : (blanks += 1) {}
+                try self.cards.replaceRange(alloc, bi, blanks, cards);
             } else {
-                try self.cards.insert(alloc, self.endIndex() orelse self.cards.items.len, card);
+                try self.cards.replaceRange(alloc, self.endIndex() orelse self.cards.items.len, 0, cards);
             }
         }
     }
@@ -381,8 +413,12 @@ pub const Header = struct {
     /// modify-in-place). `error.KeywordNotFound` if absent.
     pub fn modify(self: *Header, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8) (HeaderError || ValueError)!void {
         const i = self.findFirst(name) orelse return error.KeywordNotFound;
-        const keep = comment_text orelse value.parseComment(self.cards.items[i].valueField());
-        self.cards.items[i] = try Card.buildValue(name, v, keep);
+        const keep = comment_text orelse self.comment(name);
+        const card = if (hierarch.isHierarch(&self.cards.items[i]))
+            try hierarch.build(name, v, keep)
+        else
+            try Card.buildValue(name, v, keep);
+        self.cards.replaceRangeAssumeCapacity(i, self.valueRunCount(i), &.{card});
     }
 
     /// Insert a pre-built card at position `index` (0-based).
@@ -397,33 +433,36 @@ pub const Header = struct {
     /// `zf_write_key_longstr`'s replace-if-present relies on this to not leak the old run.
     pub fn delete(self: *Header, name: []const u8) ValueError!void {
         const i = self.findFirst(name) orelse return error.KeywordNotFound;
-        const card = &self.cards.items[i];
-        // A HIERARCH card keeps its value after the `=`, not at fixed columns 11–80 (same
-        // routing as valueBytesOf); commentary/blank cards have no value and never continue.
-        const field: ?[]const u8 = if (hierarch.isHierarch(card))
-            hierarch.valueField(card)
-        else if (card.kind == .value)
-            card.valueField()
-        else
-            null;
-        var continues = if (field) |vf| continuation.endsWithSentinel(vf) else false;
-        _ = self.cards.orderedRemove(i);
-        // The run extends while each removed fragment carries the sentinel AND another CONTINUE
-        // follows — the same rule `assemble` uses (a trailing `&` on the last card is literal).
-        while (continues and i < self.cards.items.len and self.cards.items[i].kind == .continuation) {
-            const c = self.cards.orderedRemove(i);
-            continues = continuation.endsWithSentinel(c.valueField());
-        }
+        self.cards.replaceRangeAssumeCapacity(i, self.valueRunCount(i), &.{});
     }
 
     /// Rename keyword `old` to `new`, preserving its value/comment and position. The new name
-    /// is normalized and validated (`error.BadKeywordName` on a bad alphabet).
-    pub fn rename(self: *Header, old: []const u8, new: []const u8) (ValueError || HeaderError)!void {
+    /// is normalized and validated (`error.BadKeywordName` on a bad alphabet). An allocator is
+    /// required because transitions to or from HIERARCH may rechunk a continued string.
+    pub fn rename(self: *Header, alloc: Allocator, old: []const u8, new: []const u8) (ValueError || HeaderError || errors.LimitError || Allocator.Error)!void {
         const i = self.findFirst(old) orelse return error.KeywordNotFound;
-        const new_name = try Name.parseStrict(new);
-        var raw = self.cards.items[i].raw;
-        @memcpy(raw[0..8], &new_name.bytes);
-        self.cards.items[i] = try Card.parse(&raw);
+        const old_hierarch = hierarch.isHierarch(&self.cards.items[i]);
+        const new_hierarch = hierarch.requiresConvention(new);
+
+        // Fixed-to-fixed renames preserve every value/comment byte and continuation fragment.
+        if (!old_hierarch and !new_hierarch) {
+            const new_name = try Name.parseStrict(new);
+            var raw = self.cards.items[i].raw;
+            @memcpy(raw[0..8], &new_name.bytes);
+            self.cards.items[i] = try Card.parse(&raw);
+            return;
+        }
+
+        const old_count = self.valueRunCount(i);
+        const keep = self.comment(old);
+        var old_value: value.KeywordValue = if (old_count > 1)
+            .{ .string = try self.getLongString(alloc, old) }
+        else
+            try self.getValueUnion(alloc, old);
+        defer old_value.deinit(alloc);
+        const cards = try buildValueRun(alloc, new, old_value, keep, new_hierarch);
+        defer alloc.free(cards);
+        try self.cards.replaceRange(alloc, i, old_count, cards);
     }
 
     /// Reserve `n` blank cards just before `END` so later `update` calls can fill them in
@@ -573,7 +612,7 @@ test "edit ops: update/modify/insert/delete/rename preserve order and index" {
     try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "NAXIS"));
 
     // rename and delete.
-    try h.rename("EXTEND", "GROUPS");
+    try h.rename(testing.allocator, "EXTEND", "GROUPS");
     try testing.expect(!h.has("EXTEND"));
     try testing.expectEqual(true, try h.getValue(bool, "GROUPS"));
     try h.delete("GROUPS");
@@ -626,6 +665,8 @@ test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)"
     const before = h.count();
     try h.update(testing.allocator, "BITPIX", .{ .int = 8 }, null);
     try testing.expectEqual(before, h.count()); // filled a blank, no net growth
+    try h.update(testing.allocator, "LONGSTR", .{ .string = "x" ** 150 }, null);
+    try testing.expectEqual(before, h.count()); // a multi-card value consumes multiple blanks
 }
 
 test "reserveSpace bulk-inserts a large contiguous blank run" {
@@ -789,17 +830,15 @@ test "delete keeps a literal trailing '&' value and an unrelated CONTINUE run in
     try testing.expectEqualStrings("cloudy skies overnight", got);
 }
 
-test "write-path keyword names reject embedded/leading blanks (BUGHUNT 62)" {
+test "fixed-card builders and leading blanks remain strict (BUGHUNT 62)" {
     var h = Header.initEmpty();
     defer h.deinit(testing.allocator);
     try testing.expectError(error.BadKeywordName, h.appendValue(testing.allocator, "AB CD", .{ .int = 1 }, null));
     try testing.expectError(error.BadKeywordName, h.appendValue(testing.allocator, " XKEY", .{ .int = 1 }, null));
-    try testing.expectError(error.BadKeywordName, h.update(testing.allocator, "AB CD", .{ .int = 1 }, null));
     try testing.expectError(error.BadKeywordName, h.appendLongString(testing.allocator, "AB CD", "z" ** 150, null));
 
     try h.appendValue(testing.allocator, "GOODKEY", .{ .int = 7 }, null);
-    try testing.expectError(error.BadKeywordName, h.rename("GOODKEY", "AB CD"));
-    try testing.expectError(error.BadKeywordName, h.rename("GOODKEY", " XKEY"));
+    try testing.expectError(error.BadKeywordName, h.rename(testing.allocator, "GOODKEY", " XKEY"));
     try testing.expectEqual(@as(i64, 7), try h.getValue(i64, "GOODKEY")); // untouched by the failed renames
 }
 
@@ -849,6 +888,74 @@ test "HIERARCH lookup through the Header by both spellings (FR-HDR-9)" {
     const un = try h.getValueUnion(testing.allocator, "ESO INS TEMP");
     defer un.deinit(testing.allocator);
     try testing.expectEqual(@as(f64, 12.5), un.float);
+}
+
+test "direct HIERARCH update and modify preserve the convention (BUGHUNT 33)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendRaw(testing.allocator, &raw80("HIERARCH ESO A = 1 / com"));
+    try h.ensureEnd(testing.allocator);
+
+    // The physical convention token is not itself a logical keyword.
+    try testing.expect(!h.has("HIERARCH"));
+    try h.update(testing.allocator, "ESO A", .{ .int = 2 }, null);
+    try testing.expect(std.mem.startsWith(u8, h.at(0).bytes(), "HIERARCH ESO A = 2"));
+    try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "HIERARCH ESO A"));
+    try testing.expectEqualStrings("com", h.comment("ESO A").?);
+
+    const before = h.at(0).raw;
+    try testing.expectError(error.CardOverflow, h.modify("ESO A", .{ .string = "x" ** 80 }, null));
+    try testing.expectEqualSlices(u8, &before, h.at(0).bytes());
+
+    try h.update(testing.allocator, "ESO A", .{ .string = "quoted ' value " ** 8 }, null);
+    try testing.expect(h.valueRunCount(0) > 1);
+    try h.modify("ESO A", .{ .string = "short" }, null);
+    try testing.expectEqual(@as(usize, 1), h.valueRunCount(0));
+    const short = try h.getLongString(testing.allocator, "ESO A");
+    defer testing.allocator.free(short);
+    try testing.expectEqualStrings("short", short);
+    try testing.expectEqualStrings("com", h.comment("ESO A").?);
+}
+
+test "direct rename rebuilds HIERARCH transitions and continued strings (BUGHUNT 33)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    const original = ("a quoted ' HIERARCH value " ** 7) ++ "END";
+    try h.update(testing.allocator, "ESO OLD LONG KEY", .{ .string = original }, "provenance");
+    try h.ensureEnd(testing.allocator);
+
+    try h.rename(testing.allocator, "ESO OLD LONG KEY", "MIDKEY");
+    const fixed = try h.getLongString(testing.allocator, "MIDKEY");
+    defer testing.allocator.free(fixed);
+    try testing.expectEqualStrings(original, fixed);
+    try testing.expectEqualStrings("provenance", h.comment("MIDKEY").?);
+    try testing.expectEqual(h.count() - 1, h.valueRunCount(0));
+
+    try h.rename(testing.allocator, "MIDKEY", "HIERARCH ESO NEW LONG KEY");
+    try testing.expect(std.mem.startsWith(u8, h.at(0).bytes(), "HIERARCH ESO NEW LONG KEY = "));
+    const hierarchical = try h.getLongString(testing.allocator, "ESO NEW LONG KEY");
+    defer testing.allocator.free(hierarchical);
+    try testing.expectEqualStrings(original, hierarchical);
+    try testing.expectEqualStrings("provenance", h.comment("ESO NEW LONG KEY").?);
+    try testing.expectEqual(h.count() - 1, h.valueRunCount(0));
+
+    try h.rename(testing.allocator, "ESO NEW LONG KEY", "ESO FINAL LONG KEY");
+    const final = try h.getLongString(testing.allocator, "ESO FINAL LONG KEY");
+    defer testing.allocator.free(final);
+    try testing.expectEqualStrings(original, final);
+    try testing.expectEqual(Card.Kind.end, h.at(h.count() - 1).kind);
+}
+
+test "failed HIERARCH rename is atomic (BUGHUNT 33)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendRaw(testing.allocator, &raw80("HIERARCH ESO BAD = NOT_A_VALUE / untouched"));
+    try h.ensureEnd(testing.allocator);
+    const before = h.at(0).raw;
+
+    try testing.expectError(error.BadValueSyntax, h.rename(testing.allocator, "ESO BAD", "GOODKEY"));
+    try testing.expectEqualSlices(u8, &before, h.at(0).bytes());
+    try testing.expectEqual(Card.Kind.end, h.at(1).kind);
 }
 
 test "complex and undefined values are reachable via getValueUnion/getComplex (FR-HDR-3)" {

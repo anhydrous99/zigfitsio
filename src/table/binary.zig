@@ -524,6 +524,7 @@ pub const BinTable = struct {
     pub fn insertColumn(self: *BinTable, alloc: Allocator, at: u16, tform: []const u8, ttype: ?[]const u8) OpenError!void {
         try self.requireWritable();
         if (at > self.columns.len) return error.NoSuchColumn;
+        if (self.columns.len >= 999) return error.BadDimensions;
         const parsed = try BinTform.parse(tform);
         const field_bytes = try parsed.fieldBytes();
         const old_naxis1 = self.naxis1;
@@ -696,7 +697,7 @@ pub const BinTable = struct {
         for (COL_KW) |prefix| {
             const old_kw = kwNameRt(&b1, prefix, old_n);
             const new_kw = kwNameRt(&b2, prefix, new_n);
-            self.hdu.header.rename(old_kw, new_kw) catch |e| switch (e) {
+            self.hdu.header.rename(self.fits.alloc, old_kw, new_kw) catch |e| switch (e) {
                 error.KeywordNotFound => {},
                 else => return e,
             };

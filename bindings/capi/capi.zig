@@ -1079,42 +1079,17 @@ pub export fn zf_write_key_log(h_opt: ?*Handle, name_ptr: [*]const u8, name_len:
 /// Create or update a string keyword (single card; ≤ 68 chars).
 pub export fn zf_write_key_str(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
     const h = h_opt orelse return abi.failNull();
-    return writeKey(h, name_ptr[0..name_len], .{ .string = value_ptr[0..value_len] }, commentOf(comment_ptr, comment_len));
+    const name = name_ptr[0..name_len];
+    const v: fits.KeywordValue = .{ .string = value_ptr[0..value_len] };
+    const comment = commentOf(comment_ptr, comment_len);
+    _ = (if (fits.hierarch.requiresConvention(name)) fits.hierarch.build(name, v, comment) else fits.Card.buildValue(name, v, comment)) catch |e| return abi.fail(&h.diag, e);
+    return writeKey(h, name, v, comment);
 }
 
-/// Append a long string keyword using the CONTINUE convention (inserts before END).
+/// Create or update a long string keyword using the CONTINUE convention.
 pub export fn zf_write_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, value_ptr: [*]const u8, value_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
     const h = h_opt orelse return abi.failNull();
-    const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
-    const name = name_ptr[0..name_len];
-    // Build and reserve the complete replacement before deleting the old logical run. In
-    // particular, an unrepresentable final comment must not delete the existing keyword and
-    // leave a same-revision snapshot cache describing cards that are no longer live.
-    const cards = fits.continuation.split(gpa, name, value_ptr[0..value_len], commentOf(comment_ptr, comment_len)) catch |e| return abi.fail(&h.diag, e);
-    defer gpa.free(cards);
-    const reserve = std.math.add(usize, hdu.header.cards.items.len, cards.len) catch return abi.fail(&h.diag, error.LimitExceeded);
-    hdu.header.cards.ensureTotalCapacityPrecise(gpa, reserve) catch |e| return abi.fail(&h.diag, e);
-
-    const count_before_delete = hdu.header.count();
-    var mutated = false;
-    hdu.header.delete(name) catch |e| switch (e) {
-        error.KeywordNotFound => {}, // create when absent
-        else => return abi.fail(&h.diag, e),
-    };
-    mutated = hdu.header.count() != count_before_delete;
-    var idx = endIndex(&hdu.header);
-    for (cards) |c| {
-        hdu.header.insert(gpa, idx, c) catch |e| {
-            if (mutated) {
-                hdu.bumpHeaderRevision();
-                h.clearHeaderSnapshot();
-            }
-            return abi.fail(&h.diag, e);
-        };
-        mutated = true;
-        idx += 1;
-    }
-    return rewriteChangedHeader(h, hdu);
+    return writeKey(h, name_ptr[0..name_len], .{ .string = value_ptr[0..value_len] }, commentOf(comment_ptr, comment_len));
 }
 
 /// Create or update a keyword with an undefined (blank) value field (FITS 4.0 §4.1.2.3).
@@ -1135,7 +1110,7 @@ pub export fn zf_delete_key(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: us
 pub export fn zf_rename_key(h_opt: ?*Handle, old_ptr: [*]const u8, old_len: usize, new_ptr: [*]const u8, new_len: usize) c_int {
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
-    hdu.header.rename(old_ptr[0..old_len], new_ptr[0..new_len]) catch |e| return abi.fail(&h.diag, e);
+    hdu.header.rename(gpa, old_ptr[0..old_len], new_ptr[0..new_len]) catch |e| return abi.fail(&h.diag, e);
     return rewriteChangedHeader(h, hdu);
 }
 

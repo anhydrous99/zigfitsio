@@ -34,6 +34,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
   fail without caching metadata, while server-capped subranges remain valid short reads.
 
 ### Fixed
+- **Core / C ABI**: direct header updates, modifications, and renames now preserve HIERARCH
+  serialization, comments, and complete CONTINUE runs instead of emitting malformed fixed-format
+  cards or orphaned fragments. `Header.rename` now takes an allocator so transitions between
+  fixed and hierarchical names can rechunk long strings atomically. (BUGHUNT-2026-07-06 items 24
+  and 33)
 - **Core / Python / TypeScript**: malformed `GZIP_1`/`GZIP_2` tile streams with invalid
   DEFLATE back-references now reliably surface as `error.CorruptTile`, C status 414, and
   `FitsCompressError` instead of aborting native callers or trapping Wasm. Zig 0.16.0 supplies

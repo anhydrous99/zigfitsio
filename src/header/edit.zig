@@ -293,12 +293,6 @@ fn isCommentaryName(name: []const u8) bool {
     return n.len == 0 or std.ascii.eqlIgnoreCase(n, "COMMENT") or std.ascii.eqlIgnoreCase(n, "HISTORY");
 }
 
-fn isHierarchName(name: []const u8) bool {
-    const n = std.mem.trim(u8, name, " ");
-    return (n.len >= 9 and std.ascii.eqlIgnoreCase(n[0..9], "HIERARCH ")) or
-        n.len > 8 or std.mem.indexOfScalar(u8, n, ' ') != null;
-}
-
 const Run = struct {
     first: usize,
     count: usize,
@@ -477,7 +471,7 @@ fn generatedCardUpperBound(name: []const u8, edit_value: Value, comment: ?[]cons
         std.math.add(usize, comment_len, 3) catch return error.LimitExceeded
     else
         0;
-    if (!isHierarchName(name)) {
+    if (!hierarch.requiresConvention(name)) {
         const padded = std.math.add(usize, escaped, if (str.len < keyword_value.MIN_STRING_CHARS) keyword_value.MIN_STRING_CHARS - str.len else 0) catch
             return error.LimitExceeded;
         if (comment_cost <= 68 and padded <= 68 - comment_cost) return 1;
@@ -523,7 +517,7 @@ fn preflightValueRun(
 
 fn buildValueRun(alloc: Allocator, name: []const u8, edit_value: Value, comment: ?[]const u8) ApplyError![]Card {
     const v = edit_value.asKeywordValue();
-    if (isHierarchName(name)) return hierarch.split(alloc, name, v, comment);
+    if (hierarch.requiresConvention(name)) return hierarch.split(alloc, name, v, comment);
     if (v == .string) return continuation.split(alloc, name, v.string, comment);
     const one = try alloc.alloc(Card, 1);
     errdefer alloc.free(one);
@@ -575,7 +569,7 @@ fn applyRename(alloc: Allocator, header: *Header, kind: HduKind, op: Rename, lim
 
     // Fixed-name to fixed-name retains the exact value/comment bytes and continuation fragments,
     // so it needs neither allocation nor a logical value parse.
-    if (!run.hierarch and !isHierarchName(op.new)) {
+    if (!run.hierarch and !hierarch.requiresConvention(op.new)) {
         const new_name = try Name.parseStrict(op.new);
         var raw = header.cards.items[run.first].raw;
         @memcpy(raw[0..8], &new_name.bytes);
