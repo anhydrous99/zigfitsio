@@ -17,9 +17,18 @@ const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Whether `card` is a `HIERARCH` card (its name field is exactly `HIERARCH`).
+/// Whether `card` uses the HIERARCH convention. A fixed-format value card whose literal keyword
+/// is `HIERARCH` is not a convention card.
 pub fn isHierarch(card: *const Card) bool {
-    return card.name.eqlText("HIERARCH");
+    return card.name.eqlText("HIERARCH") and card.kind != .value;
+}
+
+/// Whether a public keyword spelling requires the HIERARCH convention rather than the fixed
+/// eight-byte keyword field.
+pub fn requiresConvention(name: []const u8) bool {
+    const n = std.mem.trim(u8, name, " ");
+    return (n.len >= 9 and std.ascii.eqlIgnoreCase(n[0..9], "HIERARCH ")) or
+        n.len > 8 or std.mem.indexOfScalar(u8, n, ' ') != null;
 }
 
 /// The hierarchical keyword name of a `HIERARCH` card — the text between `HIERARCH` and the
@@ -554,4 +563,7 @@ test "non-HIERARCH card yields null" {
     var buf: [70]u8 = undefined;
     try testing.expect(keyword(&c, &buf) == null);
     try testing.expect((try parseValue(testing.allocator, &c)) == null);
+
+    const fixed = card80("HIERARCH=                    1");
+    try testing.expect(!isHierarch(&fixed));
 }

@@ -696,7 +696,7 @@ pub const BinTable = struct {
         for (COL_KW) |prefix| {
             const old_kw = kwNameRt(&b1, prefix, old_n);
             const new_kw = kwNameRt(&b2, prefix, new_n);
-            self.hdu.header.rename(old_kw, new_kw) catch |e| switch (e) {
+            self.hdu.header.rename(self.fits.alloc, old_kw, new_kw) catch |e| switch (e) {
                 error.KeywordNotFound => {},
                 else => return e,
             };

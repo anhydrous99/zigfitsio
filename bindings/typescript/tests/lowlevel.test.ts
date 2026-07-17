@@ -100,6 +100,28 @@ describe("lowlevel basics", () => {
       ll.lib.zf_close(h);
     }
   });
+
+  test("direct HIERARCH updates and renames cross Wasm (BUGHUNT 33)", () => {
+    const h = createMemory();
+    try {
+      emptyPrimary(h);
+      const old = enc("ESO DET GAIN");
+      ll.check(ll.lib.zf_write_key_lng(h, old, old.length, 2n, null, 0));
+      ll.check(ll.lib.zf_write_key_lng(h, old, old.length, 3n, null, 0));
+
+      const fixed = enc("GAIN");
+      ll.check(ll.lib.zf_rename_key(h, old, old.length, fixed, fixed.length));
+      const renamed = enc("ESO NEW GAIN");
+      ll.check(ll.lib.zf_rename_key(h, fixed, fixed.length, renamed, renamed.length));
+
+      const out = ll.outI64();
+      ll.check(ll.lib.zf_read_key_lng(h, renamed, renamed.length, out));
+      expect(out[0]).toBe(3n);
+      expect(new TextDecoder().decode(fileBytes(h))).toContain("HIERARCH ESO NEW GAIN = 3");
+    } finally {
+      ll.lib.zf_close(h);
+    }
+  });
 });
 
 describe("packed VLA ABI", () => {
