@@ -8,10 +8,12 @@ pub const Digest = [16]u8;
 pub const Hasher = struct {
     inner: std.crypto.hash.Blake3,
 
+    /// Initialize an empty fingerprint state.
     pub fn init() Hasher {
         return .{ .inner = .init(.{}) };
     }
 
+    /// Add bytes to the fingerprint state.
     pub fn update(self: *Hasher, bytes: []const u8) void {
         self.inner.update(bytes);
     }

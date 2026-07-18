@@ -10,8 +10,8 @@ Completed. Python now uses the same core fingerprint for contiguous and strided 
 cells retain their existing little-endian byte-length framing; small updates are copied into a
 bounded 8 MiB batch before crossing the C ABI, and non-contiguous cells stream in logical C order.
 
-Across 31 alternating samples, an 8 MiB contiguous array was 1.36x faster and an 8 MiB transposed
-array was 1.13x faster than the previous BLAKE2b path. A 6.83 MiB mixed-cell VLA fixture was 1.07x
+Across 31 alternating samples, an 8 MiB contiguous array was 1.34x faster and an 8 MiB transposed
+array was 1.10x faster than the previous BLAKE2b path. A 6.83 MiB mixed-cell VLA fixture was 1.06x
 faster. Run the proof with:
 
 ```sh

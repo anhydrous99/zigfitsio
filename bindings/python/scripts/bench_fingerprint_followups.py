@@ -13,11 +13,24 @@ from __future__ import annotations
 from hashlib import blake2b
 import math
 import os
+from pathlib import Path
 import platform
 from statistics import median
+import sys
 from time import perf_counter_ns
 
 import numpy as np
+
+if sys.platform == "darwin":
+    _subdir, _libname = "lib", "libzigfitsio_capi.dylib"
+elif sys.platform == "win32":
+    _subdir, _libname = "bin", "zigfitsio_capi.dll"
+else:
+    _subdir, _libname = "lib", "libzigfitsio_capi.so"
+_built_library = Path(__file__).resolve().parents[3] / "zig-out" / _subdir / _libname
+if not _built_library.exists():
+    raise SystemExit("run `zig build capi -Doptimize=ReleaseFast` before this benchmark")
+os.environ["ZIGFITSIO_LIBRARY"] = str(_built_library)
 
 from zigfitsio.core import _col_fp, _ndarray_fp
 
