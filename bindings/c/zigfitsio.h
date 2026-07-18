@@ -31,6 +31,7 @@ extern "C" {
 typedef struct ZfFits ZfFits;
 typedef struct ZfTable ZfTable;
 typedef struct ZfFindings ZfFindings;
+typedef struct ZfFingerprint128StateV1 ZfFingerprint128StateV1;
 
 /* ── Element datatype codes (ZfType) ─────────────────────────────────────────────────────── */
 #define ZF_UINT8      1
@@ -198,6 +199,20 @@ void   zf_last_keyword(uint8_t* buf, size_t buf_len, size_t* out_len);
 int64_t zf_last_byte_offset(void);
 int64_t zf_last_hdu_index(void);
 void   zf_free(uint8_t* ptr, size_t len);
+
+/* ── Ephemeral data fingerprints ─────────────────────────────────────────────────────── */
+#define ZF_FINGERPRINT128_SIZE_V1 16
+
+/* Canonical first 16 bytes of BLAKE3. A NULL data pointer is valid only when len == 0. */
+int  zf_fingerprint128_v1(const uint8_t* data, size_t len,
+                          uint8_t* out);
+int  zf_fingerprint128_begin_v1(ZfFingerprint128StateV1** out_state);
+int  zf_fingerprint128_update_v1(ZfFingerprint128StateV1* state,
+                                 const uint8_t* data, size_t len);
+/* Finalization does not consume the state. States are single-threaded. */
+int  zf_fingerprint128_final_v1(const ZfFingerprint128StateV1* state,
+                                uint8_t* out);
+void zf_fingerprint128_free_v1(ZfFingerprint128StateV1* state);
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────────────────────── */
 int  zf_open_file(const uint8_t* path, size_t path_len, int mode, const ZfOpenOpts* opts, ZfFits** out);

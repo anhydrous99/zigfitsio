@@ -8,6 +8,7 @@
 import { afterAll, describe, expect, test } from "./_harness/index.js";
 import * as zf from "../src/index.js";
 import * as ll from "../src/lowlevel/index.js";
+import { colFp } from "../src/table.js";
 import { enc } from "../src/util.js";
 import { fill, tmpFits } from "./_fixtures.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
@@ -250,6 +251,29 @@ describe("unsigned conventions", () => {
 });
 
 describe("VLA columns", () => {
+  test("core fingerprints preserve string values and VLA cell framing", () => {
+    const strings: zf.StringColumn = { kind: "string", dtype: "u1", repeat: 8, values: ["alpha", "beta"] };
+    const stringFp = colFp(strings);
+    expect(colFp({ ...strings, values: [...strings.values] })).toBe(stringFp);
+    expect(colFp({ ...strings, values: ["alpha", "gamma"] })).not.toBe(stringFp);
+    expect(colFp({ ...strings, values: ["a", "b\u0000c"] })).not.toBe(
+      colFp({ ...strings, values: ["a\u0000b", "c"] }),
+    );
+
+    const backing = Int32Array.from([1, 2]);
+    const split: zf.VlaColumn = {
+      kind: "vla",
+      dtype: "i4",
+      repeat: 1,
+      values: [backing.subarray(0, 1), backing.subarray(1, 2)],
+    };
+    const splitFp = colFp(split);
+    expect(colFp({ ...split, values: [Int32Array.of(1), Int32Array.of(2)] })).toBe(splitFp);
+    expect(colFp({ ...split, values: [Int32Array.of(2), Int32Array.of(1)] })).not.toBe(splitFp);
+    expect(colFp({ ...split, values: [Int32Array.of(1, 2), new Int32Array(0)] })).not.toBe(splitFp);
+    expect(colFp({ ...split, values: [] })).not.toBe(colFp({ ...split, values: [new Int32Array(0)] }));
+  });
+
   test("packed P/Q write/read keeps empty cells, BigInts, shared views, and mutations", () => {
     const p = [Int32Array.from([1, 2, 3]), Int32Array.from([4]), new Int32Array(0)];
     const q = [BigInt64Array.from([9007199254740993n]), BigInt64Array.from([-7n, 11n]), new BigInt64Array(0)];
@@ -762,6 +786,45 @@ describe("readonly-open edits and the pristine fast path", () => {
     hl.close();
     // Verbatim copy: byte-identical to the source.
     expect(Buffer.compare(readFileSync(out), readFileSync(src))).toBe(0);
+  });
+
+  test("pristine update-mode saves fingerprint each materialized payload once", () => {
+    const source = new zf.HDUList([
+      new zf.PrimaryHDU({ data: Int16Array.from([1, 2, 3, 4]) }),
+      zf.BinTableHDU.fromColumns([
+        new zf.Column("A", "1J", { array: Int32Array.from([1, 2, 3]) }),
+        new zf.Column("B", "1J", { array: Int32Array.from([4, 5, 6]) }),
+      ]),
+    ]).toBytes();
+
+    for (const save of [
+      (hl: zf.HDUList) => expect(hl.toBytes()).toEqual(source),
+      (hl: zf.HDUList) => {
+        const out = tmp.path();
+        hl.writeTo(out, { overwrite: true });
+        expect(Buffer.compare(readFileSync(out), Buffer.from(source))).toBe(0);
+      },
+    ]) {
+      const hl = zf.fromBytes(source, "update");
+      void hl.get(0).data;
+      void hl.get(1).data;
+      const fingerprint = ll.native.fn.zf_fingerprint128_v1;
+      let calls = 0;
+      let bytes = 0;
+      ll.native.fn.zf_fingerprint128_v1 = (...args) => {
+        calls += 1;
+        bytes += Number(args[1]);
+        return fingerprint(...args);
+      };
+      try {
+        save(hl);
+        expect(calls).toBe(3); // one image plus two table columns
+        expect(bytes).toBe(32); // 8 image bytes plus two 12-byte columns
+      } finally {
+        ll.native.fn.zf_fingerprint128_v1 = fingerprint;
+        hl.close();
+      }
+    }
   });
 
   test("failed writeTo leaves no partial file", () => {

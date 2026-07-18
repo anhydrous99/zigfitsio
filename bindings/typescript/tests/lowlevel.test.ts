@@ -41,6 +41,25 @@ describe("lowlevel basics", () => {
     expect(typeof ll.native.withMemoryBytes).toBe("function");
   });
 
+  test("fingerprint hashes the exact bytes of a subarray one-shot and streamed", () => {
+    const source = Uint8Array.from([0xff, 0x61, 0x62, 0x63, 0xee]);
+    const out = new Uint8Array(16);
+    ll.check(ll.lib.zf_fingerprint128_v1(source.subarray(1, 4), 3, out));
+    expect(Buffer.from(out).toString("hex")).toBe("6437b3ac38465133ffb63b75273a8db5");
+
+    const state = ll.outU64();
+    ll.check(ll.lib.zf_fingerprint128_begin_v1(state));
+    try {
+      ll.check(ll.lib.zf_fingerprint128_update_v1(state[0], source.subarray(1, 2), 1));
+      ll.check(ll.lib.zf_fingerprint128_update_v1(state[0], source.subarray(2, 4), 2));
+      const streamed = new Uint8Array(16);
+      ll.check(ll.lib.zf_fingerprint128_final_v1(state[0], streamed));
+      expect(streamed).toEqual(out);
+    } finally {
+      ll.lib.zf_fingerprint128_free_v1(state[0]);
+    }
+  });
+
   test("in-memory f32 image roundtrip through raw zf_* calls", () => {
     const h = createMemory();
     try {
@@ -459,7 +478,13 @@ describe("allocate-and-return", () => {
 describe("wasm buf-direction map", () => {
   const byName = new Map(PROTOS.map((p) => [p.name, p]));
   test("prototype count and packed VLA directions match the ABI", () => {
-    expect(PROTOS).toHaveLength(94);
+    expect(PROTOS).toHaveLength(99);
+    expect(BUF_DIRS.zf_fingerprint128_v1).toEqual({ 0: "in", 2: "out" });
+    // A wasm32 state pointer occupies only the low half of the BigUint64Array out slot; keep
+    // default inout staging so its zeroed upper bytes survive copy-back.
+    expect(BUF_DIRS.zf_fingerprint128_begin_v1).toBeUndefined();
+    expect(BUF_DIRS.zf_fingerprint128_update_v1).toEqual({ 1: "in" });
+    expect(BUF_DIRS.zf_fingerprint128_final_v1).toEqual({ 1: "out" });
     expect(BUF_DIRS.zf_header_snapshot_query_v1).toEqual({ 3: "out" });
     // Failure-atomic fill buffers intentionally retain the safe default "inout" staging.
     expect(BUF_DIRS.zf_header_snapshot_fill_v1).toBeUndefined();

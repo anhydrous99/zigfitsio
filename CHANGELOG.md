@@ -7,6 +7,8 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Core / C ABI**: BLAKE3-128 data fingerprints now have shared one-shot and streaming
+  primitives for binding dirty-state checks, with a versioned C ABI and canonical digest bytes.
 - **Core / C ABI**: versioned logical-header snapshots expose parsed cards in one bounded
   read, and atomic batch edits validate a staged header before committing once. Revision
   checks prevent stale writers, while HDU-aware structural policy protects table and
@@ -17,6 +19,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
   crossings for large headers and batch edits. (#59)
 
 ### Changed
+- **Python / TypeScript**: Python array fingerprints and all TypeScript image/table fingerprints
+  now use the shared core implementation instead of separate BLAKE2b and per-byte BigInt FNV
+  loops. TypeScript lifecycle operations also reuse just-computed digests instead of hashing the
+  same materialized data twice. Read-fusion and large-buffer follow-ups remain documented in
+  [`docs/fingerprint-followups.md`](docs/fingerprint-followups.md).
 - **Core / Compression**: tiled-image reads now fetch compact descriptor and per-tile metadata
   rows in bounded windows, carry the selected descriptor through heap validation and decoding,
   and share heap geometry/device-size checks across the operation. Tiled-table cells likewise

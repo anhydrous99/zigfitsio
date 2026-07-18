@@ -50,6 +50,9 @@ type BufDir = "in" | "out" | "inout";
 // positional heuristic) so they cannot silently mis-optimize if the ABI grows; they are pinned by
 // the tripwire test in `tests/lowlevel.test.ts` and mirror `bindings/c/zigfitsio.h`.
 export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "out">>>> = {
+  zf_fingerprint128_v1: { 0: "in", 2: "out" },
+  zf_fingerprint128_update_v1: { 1: "in" },
+  zf_fingerprint128_final_v1: { 1: "out" },
   zf_header_snapshot_query_v1: { 3: "out" },
   // snapshot_fill is deliberately left at the default "inout" direction. Its ABI is
   // failure-atomic: BUFFER_TOO_SMALL leaves every caller buffer untouched, so staging the

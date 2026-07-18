@@ -103,6 +103,9 @@ pub const FindingsHandle = struct {
     list: fits.validate.Findings,
 };
 
+/// The object behind a `ZfFingerprint128StateV1*`.
+pub const Fingerprint128StateV1 = fits.fingerprint.Hasher;
+
 /// Per-column metadata returned by `zf_table_col_info` (names/units come via separate buffer
 /// getters to keep this POD). `typecode` is the natural element `ZfType`; `repeat` is the
 /// element count per cell (bytes for character `A`, bits for `X`), `width` the field byte width

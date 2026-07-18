@@ -11,6 +11,24 @@ def test_version():
     assert ll.version().count(".") == 2
 
 
+def test_fingerprint_one_shot_matches_streaming():
+    one_shot = (c.c_ubyte * 16)()
+    ll.check(ll.lib.zf_fingerprint128_v1(b"abc", 3, one_shot))
+
+    state = c.c_void_p()
+    ll.check(ll.lib.zf_fingerprint128_begin_v1(c.byref(state)))
+    try:
+        ll.check(ll.lib.zf_fingerprint128_update_v1(state, b"a", 1))
+        ll.check(ll.lib.zf_fingerprint128_update_v1(state, b"bc", 2))
+        streamed = (c.c_ubyte * 16)()
+        ll.check(ll.lib.zf_fingerprint128_final_v1(state, streamed))
+    finally:
+        ll.lib.zf_fingerprint128_free_v1(state)
+
+    assert bytes(one_shot).hex() == "6437b3ac38465133ffb63b75273a8db5"
+    assert bytes(streamed) == bytes(one_shot)
+
+
 def test_create_memory_image_roundtrip():
     h = c.c_void_p()
     ll.check(ll.lib.zf_create_memory(None, c.byref(h)))

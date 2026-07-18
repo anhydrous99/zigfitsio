@@ -7,6 +7,7 @@
  */
 import { afterAll, describe, expect, test } from "./_harness/index.js";
 import * as zf from "../src/index.js";
+import * as ll from "../src/lowlevel/index.js";
 import { fill, tmpFits } from "./_fixtures.js";
 
 const tmp = tmpFits();
@@ -471,9 +472,20 @@ describe("ImageHDU.section (strided cutouts)", () => {
     try {
       const img = hdul.image(0);
       (img.data as zf.FitsArray).data[8] = 777; // in-place edit, not yet flushed
-      // section() flushes first, so it sees 777 (not the stale on-disk 8).
-      const cut = img.section({ window: [[1, 2], [2, 3]] }); // the single pixel (1,2) = flat 8
-      expect(asNums(cut.data)).toEqual([777]);
+      const fingerprint = ll.native.fn.zf_fingerprint128_v1;
+      let fingerprintCalls = 0;
+      ll.native.fn.zf_fingerprint128_v1 = (...args) => {
+        fingerprintCalls += 1;
+        return fingerprint(...args);
+      };
+      try {
+        // section() flushes first, so it sees 777 (not the stale on-disk 8).
+        const cut = img.section({ window: [[1, 2], [2, 3]] }); // the single pixel (1,2) = flat 8
+        expect(asNums(cut.data)).toEqual([777]);
+        expect(fingerprintCalls).toBe(1); // compare and write-back share the computed digest
+      } finally {
+        ll.native.fn.zf_fingerprint128_v1 = fingerprint;
+      }
     } finally {
       hdul.close();
     }

@@ -113,6 +113,8 @@ pub const RandomGroups = @import("groups.zig").RandomGroups;
 // ── Data integrity (§16) ───────────────────────────────────────────────────────────────
 /// DATASUM/CHECKSUM computation and verification (FR-SUM-*).
 pub const checksum = @import("checksum.zig");
+/// Binding-facing, ephemeral BLAKE3-128 data fingerprints.
+pub const fingerprint = @import("fingerprint.zig");
 
 // ── Tiled compression (§17) ────────────────────────────────────────────────────────────
 const tiled_mod = @import("compress/tiled.zig");
@@ -222,6 +224,7 @@ test {
     _ = @import("table/ascii.zig");
     _ = @import("table/heap.zig");
     _ = @import("checksum.zig");
+    _ = @import("fingerprint.zig");
     _ = @import("groups.zig");
     _ = @import("iterator.zig");
     _ = @import("validate.zig");
