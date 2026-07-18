@@ -69,14 +69,13 @@ fn castFloatInt(comptime Dst: type, src: anytype) ConvError!Dst {
 fn castIntFloat(comptime Dst: type, src: anytype, mode: Mode) ConvError!Dst {
     const f: Dst = @floatFromInt(src);
     if (mode == .scalar) {
-        // `f` is integral-valued; round-trip through i128 (which holds any value our floats can
-        // carry) to detect mantissa precision loss without risking an out-of-range cast. Guard
-        // against a non-finite intermediate first: an integer too large for a narrow `Dst` (e.g.
-        // a value > 65504 into `f16`) saturates to ±inf, and `@intFromFloat(inf)` traps — a
-        // saturated result is by definition not exactly representable, so report precision loss.
         if (!std.math.isFinite(f)) return error.PrecisionLoss;
-        const back: i128 = @intFromFloat(f);
-        if (back != @as(i128, src)) return error.PrecisionLoss;
+        // Excess integer bits are exactly representable only when they are trailing zeroes.
+        const magnitude = @abs(src);
+        const significant_bits = @bitSizeOf(@TypeOf(src)) - @clz(magnitude);
+        const precision = std.math.floatFractionalBits(Dst) + 1;
+        if (significant_bits > precision and @ctz(magnitude) < significant_bits - precision)
+            return error.PrecisionLoss;
     }
     return f;
 }
@@ -125,6 +124,9 @@ test "int→float exact vs inexact (scalar errors, bulk silent)" {
     _ = try cast(f64, big, .bulk); // silent in bulk
     const exact: i64 = (@as(i64, 1) << 52) + 1; // representable
     try testing.expectEqual(@as(f64, @floatFromInt(exact)), try cast(f64, exact, .scalar));
+    try testing.expectEqual(@as(f16, 2050), try cast(f16, @as(i64, 2050), .scalar));
+    try testing.expectError(error.PrecisionLoss, cast(f16, @as(i64, 2049), .scalar));
+    try testing.expectError(error.PrecisionLoss, cast(f16, @as(i64, -2049), .scalar));
 }
 
 test "int→narrow-float overflow reports PrecisionLoss, never traps on @intFromFloat(inf)" {

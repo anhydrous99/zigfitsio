@@ -6,6 +6,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.6] - 2026-07-18
+
 ### Added
 - **Core / C ABI**: BLAKE3-128 data fingerprints now have shared one-shot and streaming
   primitives for binding dirty-state checks, with a versioned C ABI and canonical digest bytes.
@@ -41,6 +45,8 @@ All notable changes to `zigfitsio` are documented here. The format follows
   fail without caching metadata, while server-capped subranges remain valid short reads.
 
 ### Fixed
+- **Core**: scalar integer→float exactness checks now inspect the source integer bits instead
+  of round-tripping through `i128`, avoiding an intermittent Windows x86_64 conversion failure.
 - **C ABI / TypeScript**: `zf_walloc` now returns null for zero-length and overflowing scratch
   allocation requests instead of aborting native safety builds, wrapping in optimized builds, or
   trapping Wasm. Valid allocations remain 16-byte aligned. (BUGHUNT-2026-07-06 item 50)
