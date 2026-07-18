@@ -8,7 +8,7 @@ import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import { FitsArray, asFitsArray } from "./fitsarray.js";
 import { Header, type CardRec, type HeaderMutation, type HeaderValue } from "./header.js";
-import { enc, fnv1a64, viewBytes } from "./util.js";
+import { enc } from "./util.js";
 import type { HDUList } from "./hdulist.js";
 
 /**
@@ -18,6 +18,14 @@ import type { HDUList } from "./hdulist.js";
  * Exported for table.ts/hdulist.ts only — not part of the public API surface.
  */
 export const DATA_UNSET: unique symbol = Symbol("zigfitsio.data.unset");
+
+/** @internal Core-owned 128-bit change fingerprint for a typed buffer. */
+export function dataFingerprint(data: ArrayBufferView): bigint {
+  const out = new Uint8Array(16);
+  ll.check(ll.lib.zf_fingerprint128_v1(data, data.byteLength, out));
+  const view = new DataView(out.buffer);
+  return view.getBigUint64(0, true) | (view.getBigUint64(8, true) << 64n);
+}
 
 // Structural keywords the library derives from the data; user header edits must not overwrite them.
 const STRUCTURAL = new Set([
@@ -416,12 +424,15 @@ export abstract class BaseHDU {
    * read — catching an in-place mutation that never goes through a setter.
    * Consulted by the writeTo/toBytes pristine gate.
    */
-  _dataChanged(): boolean {
+  _dataChanged(out?: bigint[]): boolean {
+    void out;
     return false;
   }
 
   /** @internal Update-mode in-place write-back (image/table HDUs override). */
-  _flushData(): void {}
+  _flushData(precomputed?: readonly bigint[]): void {
+    void precomputed;
+  }
 
   /** @internal Serialize this HDU into `handle` (subclasses implement). */
   abstract _writeTo(handle: bigint, primary: boolean): void;
@@ -618,10 +629,12 @@ export class ImageHDU extends BaseHDU {
     this._markDirty(); // a replaced array is not in the open handle's bytes
   }
 
-  override _dataChanged(): boolean {
+  override _dataChanged(out?: bigint[]): boolean {
     const d = this._data;
     if (d === DATA_UNSET || d === null) return false;
-    return fnv1a64(viewBytes(d.data)) !== this._dataFingerprint;
+    const fp = dataFingerprint(d.data);
+    out?.push(fp);
+    return fp !== this._dataFingerprint;
   }
 
   get shape(): readonly number[] | null {
@@ -691,7 +704,7 @@ export class ImageHDU extends BaseHDU {
     // Baseline in ALL modes so both update-mode write-back and the pristine
     // gate can detect a later edit — including an in-place mutation that
     // never goes through the data setter and so never sets `_dirty`.
-    this._dataFingerprint = fnv1a64(viewBytes(buf));
+    this._dataFingerprint = dataFingerprint(buf);
     return arr;
   }
 
@@ -737,7 +750,8 @@ export class ImageHDU extends BaseHDU {
           "cannot read a section of a cleared image (data = null is pending); restore .data or use writeTo() to a new file",
         );
       }
-      if (this._dataChanged()) this._flushData();
+      const fingerprints: bigint[] = [];
+      if (this._dataChanged(fingerprints)) this._flushData(fingerprints);
     }
     const { bitpix, axes } = this._imgParam(); // axes: FITS order (fastest first)
     const ndim = axes.length;
@@ -868,7 +882,7 @@ export class ImageHDU extends BaseHDU {
    * the HDU's own BSCALE/BZERO so scaled/unsigned images round-trip through
    * the library's inverse scaling.
    */
-  override _flushData(): void {
+  override _flushData(precomputed?: readonly bigint[]): void {
     const data = this._data;
     if (data === DATA_UNSET) return;
     if (data === null) {
@@ -879,7 +893,7 @@ export class ImageHDU extends BaseHDU {
         "clearing image data cannot be written back to the open file in update mode; restore .data or save with writeTo() to a new file",
       );
     }
-    const fp = fnv1a64(viewBytes(data.data));
+    const fp = precomputed?.[0] ?? dataFingerprint(data.data);
     if (fp === this._dataFingerprint) return;
     const h = this._select();
     const { axes } = this._imgParam();

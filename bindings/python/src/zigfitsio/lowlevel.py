@@ -378,6 +378,12 @@ _PROTOS = [
     ("zf_last_byte_offset", I64, []),
     ("zf_last_hdu_index", I64, []),
     ("zf_free", None, [VOID, SZ]),
+    # fingerprints
+    ("zf_fingerprint128_v1", INT, [VOID, SZ, VOID]),
+    ("zf_fingerprint128_begin_v1", INT, [PVOID]),
+    ("zf_fingerprint128_update_v1", INT, [VOID, VOID, SZ]),
+    ("zf_fingerprint128_final_v1", INT, [VOID, VOID]),
+    ("zf_fingerprint128_free_v1", None, [VOID]),
     # lifecycle
     ("zf_open_file", INT, [CHARP, SZ, INT, VOID, PVOID]),
     ("zf_create_file", INT, [CHARP, SZ, VOID, PVOID]),

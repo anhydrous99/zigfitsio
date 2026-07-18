@@ -31,7 +31,7 @@ class GenerateWikiTests(unittest.TestCase):
 
     def test_c_header_has_ordered_neutral_abi(self) -> None:
         prototypes = _header_zf_prototypes()
-        self.assertEqual(len(prototypes), 94)
+        self.assertEqual(len(prototypes), 99)
         self.assertEqual(
             prototypes[0],
             {"name": "zf_version", "returns": "cstring_ret", "args": []},
@@ -70,6 +70,17 @@ class GenerateWikiTests(unittest.TestCase):
         )
         self.assertEqual(typescript["zf_header_snapshot_query_v1"]["args"][-1], "buf")
         self.assertEqual(typescript["zf_header_apply_v1"]["args"][2:4], ["buf", "buf"])
+        self.assertEqual(
+            python["zf_fingerprint128_begin_v1"]["args"], ["void_ptr_ptr"]
+        )
+        self.assertEqual(
+            python["zf_fingerprint128_v1"]["args"],
+            ["void_ptr", "usize", "void_ptr"],
+        )
+        self.assertEqual(
+            typescript["zf_fingerprint128_update_v1"]["args"],
+            ["handle", "buf", "usize"],
+        )
 
         wrong = [dict(item) for item in _header_python_abi()]
         wrong[17] = {**wrong[17], "args": ["void_ptr", "i64_ptr"]}

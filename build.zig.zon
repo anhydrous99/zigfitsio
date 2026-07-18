@@ -15,5 +15,6 @@
         "LICENSE",
         "README.md",
         "CHANGELOG.md",
+        "docs/fingerprint-followups.md",
     },
 }

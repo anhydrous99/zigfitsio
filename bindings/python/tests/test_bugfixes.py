@@ -888,22 +888,38 @@ def test_inplace_mutation_of_readonly_open_is_saved(tmp_fits):
 
 
 def test_change_fingerprints_are_bounded_and_layout_independent(monkeypatch):
-    logical = np.arange(48, dtype=">i4").reshape(6, 8)[:, ::2]
-    expected = core._ndarray_fp(np.array(logical, order="C"))
+    base = np.arange(48, dtype=">i4").reshape(6, 8)
+    packed = np.zeros(8, dtype=np.dtype([("pad", "u1"), ("value", ">i4")]))
+    packed["value"] = np.arange(8)
+    layouts = [base[:, ::2], base[::-1, ::-1], base.T, packed["value"]]
+    expected = [core._ndarray_fp(np.array(arr, order="C")) for arr in layouts]
 
     def no_full_copy(*_args, **_kwargs):
         raise AssertionError("fingerprinting must not materialize a full contiguous copy")
 
     monkeypatch.setattr(core.np, "ascontiguousarray", no_full_copy)
-    assert core._ndarray_fp(logical) == expected
-    logical[0, 0] += 1
-    assert core._ndarray_fp(logical) != expected
+    assert [core._ndarray_fp(arr) for arr in layouts] == expected
+    layouts[0][0, 0] += 1
+    assert core._ndarray_fp(layouts[0]) != expected[0]
 
     split = np.empty(2, dtype=object)
     joined = np.empty(2, dtype=object)
     split[:] = [np.array([1], dtype="i4"), np.array([2], dtype="i4")]
     joined[:] = [np.array([1, 2], dtype="i4"), np.array([], dtype="i4")]
     assert core._col_fp(split) != core._col_fp(joined)
+
+    strided = np.empty(2, dtype=object)
+    copied = np.empty(2, dtype=object)
+    strided[:] = [np.arange(8, dtype="i4")[::-2], np.arange(9, dtype="i4")[1::3]]
+    copied[:] = [np.array(cell, order="C") for cell in strided]
+    assert core._col_fp(strided) == core._col_fp(copied)
+
+    # Force several buffered nditer chunks so each chunk must be copied before reuse.
+    large_strided = np.empty(1, dtype=object)
+    large_copied = np.empty(1, dtype=object)
+    large_strided[0] = np.arange(200_000, dtype="i4")[::2]
+    large_copied[0] = np.array(large_strided[0], order="C")
+    assert core._col_fp(large_strided) == core._col_fp(large_copied)
 
 
 def test_table_read_fills_packed_unaligned_fields_directly():

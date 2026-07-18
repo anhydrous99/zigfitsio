@@ -58,6 +58,7 @@ include = [
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "docs/fingerprint-followups.md",
 ]
 
 [tool.pytest.ini_options]

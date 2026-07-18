@@ -8,10 +8,17 @@
 import { FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
-import { BaseHDU, DATA_UNSET, writeConventionOffset, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
+import {
+  BaseHDU,
+  DATA_UNSET,
+  dataFingerprint,
+  writeConventionOffset,
+  isTableStructuralKeyword,
+  type HDUOptions,
+} from "./hdu.js";
 import type { HeaderMutation } from "./header.js";
 import type { ElementOf } from "./fitsarray.js";
-import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
+import { decOut, enc, viewBytes } from "./util.js";
 
 // ════════════════════════════════════════════════════════════════════════
 // Data model
@@ -561,28 +568,90 @@ function unsignedColTzeroOf(col: Column): number | null {
 
 // ── fingerprints ──
 
-const FNV_PRIME = 0x100000001b3n;
-const U64_MASK = 0xffffffffffffffffn;
+function fingerprintParts(parts: Iterable<ArrayBufferView>): bigint {
+  const state = ll.outU64();
+  ll.check(ll.lib.zf_fingerprint128_begin_v1(state));
+  try {
+    for (const part of parts) {
+      const bytes = viewBytes(part);
+      for (let at = 0; at < bytes.byteLength; at += WASM_STAGE_BUDGET) {
+        const chunk = bytes.subarray(at, Math.min(at + WASM_STAGE_BUDGET, bytes.byteLength));
+        ll.check(ll.lib.zf_fingerprint128_update_v1(state[0], chunk, chunk.byteLength));
+      }
+    }
+    const out = new Uint8Array(16);
+    ll.check(ll.lib.zf_fingerprint128_final_v1(state[0], out));
+    const view = new DataView(out.buffer);
+    return view.getBigUint64(0, true) | (view.getBigUint64(8, true) << 64n);
+  } finally {
+    ll.lib.zf_fingerprint128_free_v1(state[0]);
+  }
+}
 
-const mix = (h: bigint, v: bigint): bigint => (((h ^ (v & U64_MASK)) * FNV_PRIME) & U64_MASK);
+function stringFingerprint(values: readonly string[]): bigint {
+  const headerBytes = (BigInt(values.length) + 1n) * 8n;
+  requireWasmBufferSize(headerBytes, 1, "string fingerprint framing");
+  const header = allocTransferArray(
+    "u1",
+    safeSlotCount(headerBytes, 1, "string fingerprint framing"),
+    "string fingerprint framing",
+  ) as Uint8Array;
+  const lengths = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  lengths.setBigUint64(0, BigInt(values.length), true);
+  for (let i = 0; i < values.length; i++) lengths.setBigUint64((i + 1) * 8, BigInt(values[i].length), true);
+  return fingerprintParts([header, enc(values.join("\u0000"))]);
+}
+
+function* vlaFingerprintBatches(cells: readonly dt.TypedArray[]): IterableIterator<ArrayBufferView> {
+  const length = new Uint8Array(8);
+  const view = new DataView(length.buffer);
+  let batch: Uint8Array | null = null;
+  let used = 0;
+  for (const cell of cells) {
+    view.setBigUint64(0, BigInt(cell.length), true);
+    for (const part of [length, viewBytes(cell)]) {
+      for (let at = 0; at < part.byteLength; ) {
+        batch ??= new Uint8Array(WASM_STAGE_BUDGET);
+        const take = Math.min(batch.byteLength - used, part.byteLength - at);
+        batch.set(part.subarray(at, at + take), used);
+        used += take;
+        at += take;
+        if (used === batch.byteLength) {
+          yield batch;
+          batch = null;
+          used = 0;
+        }
+      }
+    }
+  }
+  if (batch !== null && used > 0) yield batch.subarray(0, used);
+}
 
 /** A change-detection fingerprint for one materialized table column. */
 export function colFp(cd: ColumnData): bigint {
   if (cd.kind === "string") {
-    // NUL separator (written as an escape — a literal NUL byte here made the
-    // file read as binary and was one accidental "cleanup" away from
-    // fingerprint collisions).
-    return fnv1a64(enc((cd.values as string[]).join("\u0000")));
+    return stringFingerprint(cd.values as string[]);
   }
   if (cd.kind === "vla") {
-    let h = 0xcbf29ce484222325n;
-    for (const cell of cd.values as dt.TypedArray[]) {
-      h = mix(h, BigInt(cell.length));
-      h = mix(h, fnv1a64(viewBytes(cell)));
+    const cells = cd.values as dt.TypedArray[];
+    let framedBytes = 0n;
+    for (const cell of cells) framedBytes += 8n + BigInt(cell.byteLength);
+    if (framedBytes <= BigInt(WASM_STAGE_BUDGET)) {
+      const size = safeSlotCount(framedBytes, 1, "VLA fingerprint");
+      const framed = allocTransferArray("u1", size, "VLA fingerprint") as Uint8Array;
+      const lengths = new DataView(framed.buffer, framed.byteOffset, framed.byteLength);
+      let at = 0;
+      for (const cell of cells) {
+        lengths.setBigUint64(at, BigInt(cell.length), true);
+        at += BigUint64Array.BYTES_PER_ELEMENT;
+        framed.set(viewBytes(cell), at);
+        at += cell.byteLength;
+      }
+      return dataFingerprint(framed);
     }
-    return h;
+    return fingerprintParts(vlaFingerprintBatches(cells));
   }
-  return fnv1a64(viewBytes(cd.values as dt.TypedArray));
+  return dataFingerprint(cd.values as dt.TypedArray);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -680,11 +749,13 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     this._markDirty();
   }
 
-  override _dataChanged(): boolean {
+  override _dataChanged(out?: bigint[]): boolean {
     const d = this._data;
     if (d === DATA_UNSET || d === null || this._colFingerprints === null) return false;
     for (const name of d.names) {
-      if (colFp(d.column(name)) !== this._colFingerprints.get(name)) return true;
+      const fp = colFp(d.column(name));
+      out?.push(fp);
+      if (fp !== this._colFingerprints.get(name)) return true;
     }
     return false;
   }
@@ -694,7 +765,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    * (update mode). Only changed columns are rewritten; changing the row count
    * or editing a VLA/scaled column in place is not supported.
    */
-  override _flushData(): void {
+  override _flushData(precomputed?: readonly bigint[]): void {
     if (this._data === DATA_UNSET) return;
     if (this._data === null) {
       let empty = false;
@@ -730,7 +801,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       for (let j = 0; j < fileNames.length; j++) fileIndex.set(fileNames[j], j);
       for (let i = 0; i < rec.names.length; i++) {
         const name = rec.names[i];
-        const newFp = colFp(rec.column(name));
+        const newFp = precomputed?.[i] ?? colFp(rec.column(name));
         if (newFp === this._colFingerprints!.get(name)) continue; // column unchanged
         if (nrows !== rec.nrows) {
           throw new NotSupportedError(

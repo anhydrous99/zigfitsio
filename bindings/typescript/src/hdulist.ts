@@ -6,14 +6,17 @@
 import { existsSync, renameSync, rmSync, writeFile } from "./fsbridge.js";
 import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
-import { BaseHDU, CompImageHDU, DATA_UNSET, ImageHDU, PrimaryHDU } from "./hdu.js";
+import { BaseHDU, CompImageHDU, DATA_UNSET, ImageHDU, PrimaryHDU, dataFingerprint } from "./hdu.js";
 import { AsciiTableHDU, BinTableHDU, TableHDU, colFp } from "./table.js";
 import type { ColumnShape } from "./table.js";
-import { enc, fnv1a64, viewBytes } from "./util.js";
+import { enc } from "./util.js";
 import { NotSupportedError } from "./errors.js";
 
 /** Any concrete HDU — `.data` narrows to `FitsArray | TableData | null`. */
 export type AnyHDU = PrimaryHDU | ImageHDU | CompImageHDU | BinTableHDU | AsciiTableHDU;
+
+/** Digests already computed earlier in the same synchronous save/flush operation. */
+type DataFingerprints = Map<BaseHDU, bigint[]>;
 
 export class HDUList implements Iterable<AnyHDU> {
   readonly hdus: AnyHDU[] = [];
@@ -159,26 +162,30 @@ export class HDUList implements Iterable<AnyHDU> {
 
   // ── lifecycle ──
   flush(): void {
+    this._flush();
+  }
+
+  private _flush(precomputed: DataFingerprints = new Map()): void {
     if (this._handle === null) return;
     if (this._mode !== ll.READONLY) {
       // 1) Reconcile the file's HDU layout with the in-memory list — appends,
       //    inserts, deletions, and reorders — so an open+edit+close persists
       //    structure, not just writeTo().
-      this._reconcile();
+      this._reconcile(precomputed);
       // 2) Write back in-place edits to attached image/table data.
       for (const hdu of this.hdus) {
         if (hdu._hdulist !== this) continue;
         if (hdu instanceof CompImageHDU) {
           // In-place recompression isn't supported; fail loud rather than silently
           // drop. An explicit clear (data = null) is a recompression too.
-          if (hdu._dataChanged() || hdu._data === null) {
+          if ((!precomputed.has(hdu) && hdu._dataChanged()) || hdu._data === null) {
             throw new NotSupportedError(
               410,
               "in-place update of a compressed image is not supported; use writeTo() to a new file",
             );
           }
         } else if (hdu instanceof ImageHDU || hdu instanceof TableHDU) {
-          hdu._flushData();
+          hdu._flushData(precomputed.get(hdu));
         }
       }
     }
@@ -217,7 +224,7 @@ export class HDUList implements Iterable<AnyHDU> {
    * still valid for lazy reads), the displaced originals are deleted after,
    * and bookkeeping is rebound last.
    */
-  private _reconcile(): void {
+  private _reconcile(precomputed: DataFingerprints): void {
     const handle = this._handle as bigint;
     // Longest leading run of HDUs still in their scanned slots; everything after is rebuilt.
     let prefix = 0;
@@ -250,11 +257,15 @@ export class HDUList implements Iterable<AnyHDU> {
       );
     }
     for (const hdu of this.hdus) {
-      if (hdu instanceof CompImageHDU && hdu._hdulist === this && hdu._dataChanged()) {
-        throw new NotSupportedError(
-          410,
-          "in-place update of a compressed image is not supported; use writeTo() to a new file",
-        );
+      if (hdu instanceof CompImageHDU && hdu._hdulist === this) {
+        const fingerprints: bigint[] = [];
+        if (hdu._dataChanged(fingerprints)) {
+          throw new NotSupportedError(
+            410,
+            "in-place update of a compressed image is not supported; use writeTo() to a new file",
+          );
+        }
+        if (fingerprints.length > 0) precomputed.set(hdu, fingerprints);
       }
     }
     const diskCount = this._hduCount(); // authoritative on-disk count (drives cleanup + deletes)
@@ -318,10 +329,14 @@ export class HDUList implements Iterable<AnyHDU> {
         // so a pending in-place edit must still be detected and written back
         // at the new index.
         if (hdu instanceof ImageHDU && hdu._data !== DATA_UNSET && hdu._data !== null) {
-          hdu._dataFingerprint = fnv1a64(viewBytes(hdu._data.data));
+          const fingerprints = [dataFingerprint(hdu._data.data)];
+          hdu._dataFingerprint = fingerprints[0];
+          precomputed.set(hdu, fingerprints);
         } else if (hdu instanceof TableHDU && hdu._data !== DATA_UNSET && hdu._data !== null) {
           const rec = hdu._data;
-          hdu._colFingerprints = new Map(rec.names.map((n) => [n, colFp(rec.column(n))]));
+          const fingerprints = rec.names.map((n) => colFp(rec.column(n)));
+          hdu._colFingerprints = new Map(rec.names.map((n, j) => [n, fingerprints[j]]));
+          precomputed.set(hdu, fingerprints);
         }
       }
       if (hdu._header !== null && hdu._header._persist === null) {
@@ -345,11 +360,20 @@ export class HDUList implements Iterable<AnyHDU> {
    * appended/removed — so it can be copied verbatim.
    */
   _isPristineAttached(): boolean {
+    return this._isPristineAttachedWith();
+  }
+
+  private _isPristineAttachedWith(precomputed?: DataFingerprints): boolean {
     if (this._handle === null || !this._owns || this._dirty || this.hdus.length !== this._scannedCount) {
       return false;
     }
-    if (this.hdus.some((hdu) => hdu._dataChanged())) return false; // in-place edits don't set _dirty
-    return this.hdus.every((h, i) => this._attachedAt(h, i));
+    if (!this.hdus.every((h, i) => this._attachedAt(h, i))) return false;
+    for (const hdu of this.hdus) {
+      const fingerprints: bigint[] = [];
+      if (hdu._dataChanged(fingerprints)) return false; // in-place edits don't set _dirty
+      if (fingerprints.length > 0) precomputed?.set(hdu, fingerprints);
+    }
+    return true;
   }
 
   /** @internal */
@@ -418,8 +442,9 @@ export class HDUList implements Iterable<AnyHDU> {
     // overwrite does not destroy the existing file until the new one is complete.
     const tmp = path + ".zigfitsio.tmp";
     try {
-      if (!checksum && this._isPristineAttached()) {
-        this.flush();
+      const precomputed: DataFingerprints = new Map();
+      if (!checksum && this._isPristineAttachedWith(precomputed)) {
+        this._flush(precomputed);
         this._writeHandleBytes(this._handle as bigint, tmp);
       } else {
         this._emitTo(tmp, checksum);
@@ -437,7 +462,11 @@ export class HDUList implements Iterable<AnyHDU> {
 
   /** Serialize the HDU list to an in-memory FITS byte buffer. */
   toBytes(): Uint8Array {
-    if (this._isPristineAttached()) return this._sourceBytes();
+    const precomputed: DataFingerprints = new Map();
+    if (this._isPristineAttachedWith(precomputed)) {
+      this._flush(precomputed);
+      return this._sourceBytesAfterFlush();
+    }
     return this._emitBytes(false);
   }
 

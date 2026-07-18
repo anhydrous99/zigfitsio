@@ -19,6 +19,7 @@ const Handle = abi.Handle;
 const ZfType = abi.ZfType;
 const ZfScaling = abi.ZfScaling;
 const ZfOpenOpts = abi.ZfOpenOpts;
+const Fingerprint128StateV1 = abi.Fingerprint128StateV1;
 const gpa = abi.gpa;
 
 /// Opaque owner used by the WebAssembly binding to fill the final `MemoryDevice` allocation
@@ -66,6 +67,52 @@ pub export fn zf_last_hdu_index() i64 {
 /// Release a buffer returned by an allocate-and-return getter (e.g. `zf_read_key_longstr`).
 pub export fn zf_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |p| gpa.free(p[0..len]);
+}
+
+// ── Ephemeral data fingerprints ────────────────────────────────────────────────────────
+
+/// Compute the canonical first 16 bytes of BLAKE3 over one byte slice.
+pub export fn zf_fingerprint128_v1(data_opt: ?[*]const u8, len: usize, out_opt: ?[*]u8) c_int {
+    const out = out_opt orelse return abi.failNull();
+    if (len != 0 and data_opt == null) return abi.failNull();
+    const data: []const u8 = if (data_opt) |p| p[0..len] else &.{};
+    const digest = fits.fingerprint.hash(data);
+    @memcpy(out[0..digest.len], &digest);
+    return 0;
+}
+
+/// Allocate a new incremental fingerprint state.
+pub export fn zf_fingerprint128_begin_v1(out_opt: ?*?*Fingerprint128StateV1) c_int {
+    const out = out_opt orelse return abi.failNull();
+    out.* = null;
+    const state = gpa.create(Fingerprint128StateV1) catch return abi.fail(null, error.OutOfMemory);
+    state.* = .init();
+    out.* = state;
+    return 0;
+}
+
+/// Add one byte slice to an incremental fingerprint.
+pub export fn zf_fingerprint128_update_v1(state_opt: ?*Fingerprint128StateV1, data_opt: ?[*]const u8, len: usize) c_int {
+    const state = state_opt orelse return abi.failNull();
+    if (len != 0 and data_opt == null) return abi.failNull();
+    const data: []const u8 = if (data_opt) |p| p[0..len] else &.{};
+    state.update(data);
+    return 0;
+}
+
+/// Finalize without consuming the incremental state.
+pub export fn zf_fingerprint128_final_v1(state_opt: ?*const Fingerprint128StateV1, out_opt: ?[*]u8) c_int {
+    const state = state_opt orelse return abi.failNull();
+    const out = out_opt orelse return abi.failNull();
+    const digest = state.final();
+    @memcpy(out[0..digest.len], &digest);
+    return 0;
+}
+
+/// Release an incremental fingerprint state. Safe to call with null.
+pub export fn zf_fingerprint128_free_v1(state_opt: ?*Fingerprint128StateV1) void {
+    const state = state_opt orelse return;
+    gpa.destroy(state);
 }
 
 // ── Foreign scratch allocator ────────────────────────────────────────────────────────────────

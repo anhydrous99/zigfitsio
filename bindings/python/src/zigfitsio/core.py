@@ -10,7 +10,6 @@ Data is exchanged as native-endian NumPy arrays; image arrays use C-order with r
 from __future__ import annotations
 
 import ctypes as c
-from hashlib import blake2b
 import math
 import os
 from typing import Any, Sequence
@@ -161,42 +160,95 @@ def _vla_elem_dtype(fmt: str):
     return dt.bin_elem_dtype(ord(letter)) if letter else (np.dtype("f8"), False)
 
 
-def _hash_array_into(digest, arr) -> None:
-    """Feed an ndarray's logical C-order bytes to ``digest`` with bounded scratch space."""
+def _array_chunks(arr):
+    """Yield bounded, contiguous chunks in logical C order."""
     arr = np.asarray(arr)
     if not arr.nbytes:
         return
     if arr.flags.c_contiguous:
-        digest.update(memoryview(arr).cast("B"))
+        yield arr
         return
     elems = max(1, (64 * 1024) // max(arr.dtype.itemsize, 1))
-    chunks = np.nditer(
+    yield from np.nditer(
         arr,
         flags=["external_loop", "buffered", "zerosize_ok"],
         op_flags=[["readonly", "contig"]],
         order="C",
         buffersize=elems,
     )
-    for chunk in chunks:
-        digest.update(memoryview(chunk).cast("B"))
+
+
+def _hash_array_into(state, arr) -> None:
+    """Feed an ndarray's logical C-order bytes to a core fingerprint state."""
+    for chunk in _array_chunks(arr):
+        ll.check(ll.lib.zf_fingerprint128_update_v1(state, _VOID(chunk.ctypes.data), chunk.nbytes))
+
+
+def _finish_fp(state) -> bytes:
+    out = (c.c_ubyte * 16)()
+    ll.check(ll.lib.zf_fingerprint128_final_v1(state, out))
+    return bytes(out)
 
 
 def _ndarray_fp(arr):
     """Bounded content fingerprint normalized to logical C-order, independent of layout."""
-    digest = blake2b(digest_size=16)
-    _hash_array_into(digest, arr)
-    return digest.digest()
+    arr = np.asarray(arr)
+    if not arr.nbytes or arr.flags.c_contiguous:
+        out = (c.c_ubyte * 16)()
+        data = _VOID(arr.ctypes.data) if arr.nbytes else None
+        ll.check(ll.lib.zf_fingerprint128_v1(data, arr.nbytes, out))
+        return bytes(out)
+    state = _VOID()
+    ll.check(ll.lib.zf_fingerprint128_begin_v1(c.byref(state)))
+    try:
+        _hash_array_into(state, arr)
+        return _finish_fp(state)
+    finally:
+        ll.lib.zf_fingerprint128_free_v1(state)
 
 
 def _col_fp(col):
     """A change-detection fingerprint for one materialized table column (object=VLA safe)."""
     if col.dtype == object:
-        digest = blake2b(digest_size=16)
-        for cell in col:
-            arr = np.asarray(cell)
-            digest.update(int(arr.nbytes).to_bytes(8, "little"))
-            _hash_array_into(digest, arr)
-        return digest.digest()
+        state = _VOID()
+        ll.check(ll.lib.zf_fingerprint128_begin_v1(c.byref(state)))
+        try:
+            batch = bytearray()
+            batch_limit = 8 * 1024 * 1024
+
+            def flush_batch() -> None:
+                nonlocal batch
+                if not batch:
+                    return
+                data = (c.c_ubyte * len(batch)).from_buffer(batch)
+                ll.check(ll.lib.zf_fingerprint128_update_v1(state, data, len(batch)))
+                batch = bytearray()
+
+            def feed(raw) -> None:
+                raw = memoryview(raw).cast("B")
+                remaining = batch_limit - len(batch)
+                if len(raw) <= remaining:
+                    batch.extend(raw)
+                    if len(batch) == batch_limit:
+                        flush_batch()
+                    return
+                pos = 0
+                while pos < len(raw):
+                    take = min(batch_limit - len(batch), len(raw) - pos)
+                    batch.extend(raw[pos:pos + take])
+                    pos += take
+                    if len(batch) == batch_limit:
+                        flush_batch()
+
+            for cell in col:
+                arr = np.asarray(cell)
+                feed(int(arr.nbytes).to_bytes(8, "little"))
+                for chunk in _array_chunks(arr):
+                    feed(chunk)
+            flush_batch()
+            return _finish_fp(state)
+        finally:
+            ll.lib.zf_fingerprint128_free_v1(state)
     return _ndarray_fp(col)
 
 

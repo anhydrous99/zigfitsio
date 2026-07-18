@@ -35,6 +35,55 @@ test "ABI constants stay in sync with bindings/c/zigfitsio.h" {
     try testing.expectEqual(@as(usize, 88), @sizeOf(abi.ZfHeaderOpV1));
 }
 
+test "BLAKE3-128 C ABI supports one-shot and non-consuming streaming" {
+    const expected_empty = [_]u8{
+        0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6,
+        0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9, 0x49,
+    };
+    const expected_abc = [_]u8{
+        0x64, 0x37, 0xb3, 0xac, 0x38, 0x46, 0x51, 0x33,
+        0xff, 0xb6, 0x3b, 0x75, 0x27, 0x3a, 0x8d, 0xb5,
+    };
+
+    var empty: [16]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_v1(null, 0, &empty));
+    try testing.expectEqualSlices(u8, &expected_empty, &empty);
+
+    var one_shot: [16]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_v1("abc".ptr, 3, &one_shot));
+    try testing.expectEqualSlices(u8, &expected_abc, &one_shot);
+
+    var state: ?*abi.Fingerprint128StateV1 = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_begin_v1(&state));
+    defer capi.zf_fingerprint128_free_v1(state);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_update_v1(state, "a".ptr, 1));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_update_v1(state, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_update_v1(state, "bc".ptr, 2));
+
+    var streamed: [16]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_final_v1(state, &streamed));
+    try testing.expectEqualSlices(u8, &one_shot, &streamed);
+    var again: [16]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_final_v1(state, &again));
+    try testing.expectEqualSlices(u8, &streamed, &again);
+}
+
+test "BLAKE3-128 C ABI rejects null required pointers" {
+    var digest: [16]u8 = undefined;
+    var state: ?*abi.Fingerprint128StateV1 = null;
+
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_v1(null, 1, &digest));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_v1("x".ptr, 1, null));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_begin_v1(null));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_fingerprint128_begin_v1(&state));
+    defer capi.zf_fingerprint128_free_v1(state);
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_update_v1(null, null, 0));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_update_v1(state, null, 1));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_final_v1(null, &digest));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_fingerprint128_final_v1(state, null));
+    capi.zf_fingerprint128_free_v1(null);
+}
+
 test "create in-memory image, write and read back f32" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
@@ -196,7 +245,15 @@ test "binary table create, write columns, read back" {
     // padding/guard byte untouched.
     var strided_num = [_]u8{0xa5} ** 24;
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_strided_v1(
-        th, I32, 0, 1, 3, null, strided_num[1..].ptr, 18, 7,
+        th,
+        I32,
+        0,
+        1,
+        3,
+        null,
+        strided_num[1..].ptr,
+        18,
+        7,
     ));
     for (idx, 0..) |want, row| {
         var got_value: i32 = undefined;
@@ -209,7 +266,15 @@ test "binary table create, write columns, read back" {
 
     var strided_text = [_]u8{0xa5} ** 34;
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_str_strided_v1(
-        th, 2, 1, 3, 8, 11, 1, strided_text[1..].ptr, 30,
+        th,
+        2,
+        1,
+        3,
+        8,
+        11,
+        1,
+        strided_text[1..].ptr,
+        30,
     ));
     try testing.expectEqualSlices(u8, "alpha\x00\x00\x00", strided_text[1..9]);
     try testing.expectEqualSlices(u8, "beta\x00\x00\x00\x00", strided_text[12..20]);

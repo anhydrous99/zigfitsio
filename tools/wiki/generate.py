@@ -264,13 +264,23 @@ def _header_python_abi() -> list[dict[str, Any]]:
             return "cstring_ret"
         if function == "zf_free" and index == 0:
             return "void_ptr"
+        if function.startswith("zf_fingerprint128_") and base == "uint8_t" and depth == 1:
+            return "void_ptr"
         if base == "char":
             return "char_ptr" if depth == 1 else "char_ptr_ptr" if depth == 2 else ""
         if base == "uint8_t":
             return "char_ptr" if depth == 1 else "void_ptr_ptr" if depth == 2 else ""
         if depth == 1 and base in structure_pointers:
             return structure_pointers[base]
-        if base in {"void", "ZfFits", "ZfTable", "ZfFindings", "ZfOpenOpts", "ZfScaling"}:
+        if base in {
+            "void",
+            "ZfFits",
+            "ZfTable",
+            "ZfFindings",
+            "ZfFingerprint128StateV1",
+            "ZfOpenOpts",
+            "ZfScaling",
+        }:
             return "void_ptr" if depth == 1 else "void_ptr_ptr" if depth == 2 else ""
         if depth == 1 and base in pointer_scalars:
             return pointer_scalars[base]
@@ -296,7 +306,7 @@ def _header_typescript_abi() -> list[dict[str, Any]]:
     """Map C declarations to the semantic neutral-FFI categories used by TypeScript."""
 
     result: list[dict[str, Any]] = []
-    handles = {"ZfFits", "ZfTable", "ZfFindings"}
+    handles = {"ZfFits", "ZfTable", "ZfFindings", "ZfFingerprint128StateV1"}
     for prototype in _raw_header_zf_prototypes():
         name = prototype["name"]
 
