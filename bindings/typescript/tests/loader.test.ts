@@ -43,6 +43,21 @@ describe("wasm backend", () => {
     expect(v).toMatch(/^\d+\.\d+\.\d+/);
   });
 
+  test("scratch allocator rejects zero and overflowing wasm32 lengths (BUGHUNT 50)", () => {
+    const ex = instantiate() as WebAssembly.Exports & {
+      zf_walloc(len: number): number;
+      zf_wfree(ptr: number): void;
+    };
+    expect(ex.zf_walloc(0)).toBe(0);
+    expect(ex.zf_walloc(0xffff_ffff)).toBe(0);
+    expect(ex.zf_walloc(0xffff_ffef)).toBe(0);
+
+    const ptr = ex.zf_walloc(1) >>> 0;
+    expect(ptr).not.toBe(0);
+    expect(ptr % 16).toBe(0);
+    ex.zf_wfree(ptr);
+  });
+
   test("isReady() is true on Node/Bun (synchronous init at import)", () => {
     expect(ll.isReady()).toBe(true);
   });

@@ -126,7 +126,8 @@ pub export fn zf_fingerprint128_free_v1(state_opt: ?*Fingerprint128StateV1) void
 /// `f64`/`i64` buffer). The block carries a length header so `zf_wfree` needs only the pointer.
 /// Returns null on out-of-memory (or `len == 0`).
 pub export fn zf_walloc(len: usize) ?[*]u8 {
-    const total = std.mem.alignForward(usize, len + 16, 16);
+    if (len == 0) return null;
+    const total = (std.math.add(usize, len, 31) catch return null) & ~@as(usize, 15);
     const slice = gpa.alignedAlloc(u8, .@"16", total) catch return null;
     std.mem.writeInt(u64, slice.ptr[0..8], total, .little);
     return slice.ptr + 16;

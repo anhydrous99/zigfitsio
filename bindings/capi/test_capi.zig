@@ -12,6 +12,18 @@ const F32 = 9;
 const F64 = 10;
 const I16 = 3;
 
+test "foreign scratch allocator rejects zero and overflowing lengths (BUGHUNT 50)" {
+    try testing.expect(capi.zf_walloc(0) == null);
+    try testing.expect(capi.zf_walloc(std.math.maxInt(usize)) == null);
+    try testing.expect(capi.zf_walloc(std.math.maxInt(usize) - 16) == null);
+
+    const ptr = capi.zf_walloc(1).?;
+    defer capi.zf_wfree(ptr);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(ptr) % 16);
+    ptr[0] = 0xa5;
+    try testing.expectEqual(@as(u8, 0xa5), ptr[0]);
+}
+
 test "ABI constants stay in sync with bindings/c/zigfitsio.h" {
     // ZfType codes (#define ZF_* in the header).
     try testing.expectEqual(@as(c_int, 1), @intFromEnum(abi.ZfType.uint8));

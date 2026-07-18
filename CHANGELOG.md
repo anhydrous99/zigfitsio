@@ -41,6 +41,9 @@ All notable changes to `zigfitsio` are documented here. The format follows
   fail without caching metadata, while server-capped subranges remain valid short reads.
 
 ### Fixed
+- **C ABI / TypeScript**: `zf_walloc` now returns null for zero-length and overflowing scratch
+  allocation requests instead of aborting native safety builds, wrapping in optimized builds, or
+  trapping Wasm. Valid allocations remain 16-byte aligned. (BUGHUNT-2026-07-06 item 50)
 - **Core / C ABI**: direct header updates, modifications, and renames now preserve HIERARCH
   serialization, comments, and complete CONTINUE runs instead of emitting malformed fixed-format
   cards or orphaned fragments. `Header.rename` now takes an allocator so transitions between
