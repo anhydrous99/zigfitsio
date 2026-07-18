@@ -27,7 +27,7 @@ REPOSITORY = "owner/repo"
 class GenerateWikiTests(unittest.TestCase):
     def test_all_project_versions_agree(self) -> None:
         versions = _read_versions()
-        self.assertEqual(set(versions.values()), {"0.1.5"})
+        self.assertEqual(set(versions.values()), {"0.1.6"})
 
     def test_c_header_has_ordered_neutral_abi(self) -> None:
         prototypes = _header_zf_prototypes()
