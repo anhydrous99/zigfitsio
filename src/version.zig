@@ -5,11 +5,6 @@ const errors = @import("errors.zig");
 /// The library version (mirrors `build.zig.zon` and `root.version`).
 pub const version_string = "0.1.6";
 
-/// Return the library version string (FR-UTL-3).
-pub fn version() []const u8 {
-    return version_string;
-}
-
 /// Return a stable, human-readable message for every `Error` value (FR-UTL-3). The
 /// exhaustive switch guarantees a non-empty message per error.
 pub fn errorText(err: errors.Error) []const u8 {
@@ -84,7 +79,7 @@ pub fn errorText(err: errors.Error) []const u8 {
 const testing = std.testing;
 
 test "version is non-empty and matches the literal" {
-    try testing.expectEqualStrings("0.1.6", version());
+    try testing.expectEqualStrings("0.1.6", version_string);
 }
 
 test "errorText is non-empty for every error value" {

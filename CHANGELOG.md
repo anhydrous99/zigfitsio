@@ -6,7 +6,9 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- **Build**: `zig build` now installs only the static Zig library; the C-ABI shared library
+  remains available through `zig build capi`, and the validation CLI through `zig build fitsverify`.
 
 ## [0.1.6] - 2026-07-18
 
@@ -26,8 +28,7 @@ _Nothing yet._
 - **Python / TypeScript**: Python array fingerprints and all TypeScript image/table fingerprints
   now use the shared core implementation instead of separate BLAKE2b and per-byte BigInt FNV
   loops. TypeScript lifecycle operations also reuse just-computed digests instead of hashing the
-  same materialized data twice. Read-fusion and large-buffer follow-ups remain documented in
-  [`docs/fingerprint-followups.md`](docs/fingerprint-followups.md).
+  same materialized data twice.
 - **Core / Compression**: tiled-image reads now fetch compact descriptor and per-tile metadata
   rows in bounded windows, carry the selected descriptor through heap validation and decoding,
   and share heap geometry/device-size checks across the operation. Tiled-table cells likewise

@@ -18,8 +18,8 @@
 //! a write→read round-trip is exact.
 const std = @import("std");
 const errors = @import("errors.zig");
-const convert = @import("convert.zig");
 const endian = @import("endian.zig");
+const image = @import("image.zig");
 const limits = @import("limits.zig");
 const Fits = @import("fits.zig").Fits;
 const Hdu = @import("hdu.zig").Hdu;
@@ -274,13 +274,13 @@ pub const RandomGroups = struct {
                 var k: usize = 0;
                 while (k < n) : (k += 1) {
                     const idx: usize = @intCast(done + @as(u64, k));
-                    buf[idx] = try applyScaleRead(Stored, T, scratch[k], self.pscal[idx], self.pzero[idx]);
+                    buf[idx] = try image.applyScaleRead(Stored, T, scratch[k], .{ .bscale = self.pscal[idx], .bzero = self.pzero[idx] });
                 }
             } else {
                 var k: usize = 0;
                 while (k < n) : (k += 1) {
                     const idx: usize = @intCast(done + @as(u64, k));
-                    scratch[k] = try applyScaleWrite(Stored, T, buf[idx], self.pscal[idx], self.pzero[idx]);
+                    scratch[k] = try image.applyScaleWrite(Stored, T, buf[idx], .{ .bscale = self.pscal[idx], .bzero = self.pzero[idx] });
                 }
                 endian.swapToBig(Stored, scratch[0..n]);
                 try self.fits.dev.writeAll(std.mem.sliceAsBytes(scratch[0..n]), off);
@@ -302,10 +302,10 @@ pub const RandomGroups = struct {
                 try self.fits.dev.readAll(std.mem.sliceAsBytes(scratch[0..n]), off);
                 endian.swapToNative(Stored, scratch[0..n]);
                 var k: usize = 0;
-                while (k < n) : (k += 1) buf[@intCast(done + @as(u64, k))] = try applyScaleRead(Stored, T, scratch[k], scale, zero);
+                while (k < n) : (k += 1) buf[@intCast(done + @as(u64, k))] = try image.applyScaleRead(Stored, T, scratch[k], .{ .bscale = scale, .bzero = zero });
             } else {
                 var k: usize = 0;
-                while (k < n) : (k += 1) scratch[k] = try applyScaleWrite(Stored, T, buf[@intCast(done + @as(u64, k))], scale, zero);
+                while (k < n) : (k += 1) scratch[k] = try image.applyScaleWrite(Stored, T, buf[@intCast(done + @as(u64, k))], .{ .bscale = scale, .bzero = zero });
                 endian.swapToBig(Stored, scratch[0..n]);
                 try self.fits.dev.writeAll(std.mem.sliceAsBytes(scratch[0..n]), off);
             }
@@ -313,46 +313,6 @@ pub const RandomGroups = struct {
         }
     }
 };
-
-// ── scaling math (mirrors image.zig: physical = zero + scale × stored) ──────────────────────
-
-fn isIntegral(f: f64) bool {
-    return std.math.isFinite(f) and @floor(f) == f;
-}
-
-// Magnitude bound for the integer fast-path offset (PZEROn/BZERO). Every legitimate convention
-// (≤ 2^63) is far below this; staying under 2^100 keeps `@intFromFloat` (to i128) and the i128
-// add/sub in range, so an out-of-range header value (e.g. 1e39) falls through to the float path
-// — which returns error.Overflow — instead of panicking on an out-of-bounds `@intFromFloat`.
-const FAST_ZERO_LIMIT: f64 = 0x1p100;
-
-fn applyScaleRead(comptime Stored: type, comptime T: type, s: Stored, scale: f64, zero: f64) errors.ConvError!T {
-    // Integer offset (scale == 1, integral zero) stays in integer space so the unsigned/signed
-    // conventions carry no f64 precision loss near 2^63.
-    if (scale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(zero) and @abs(zero) < FAST_ZERO_LIMIT) {
-        const z: i128 = @intFromFloat(zero);
-        return convert.cast(T, @as(i128, s) + z, .bulk);
-    }
-    const sf: f64 = switch (@typeInfo(Stored)) {
-        .int => @floatFromInt(s),
-        .float => @floatCast(s),
-        else => unreachable,
-    };
-    return convert.cast(T, zero + scale * sf, .bulk);
-}
-
-fn applyScaleWrite(comptime Stored: type, comptime T: type, v: T, scale: f64, zero: f64) errors.ConvError!Stored {
-    if (scale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(zero) and @abs(zero) < FAST_ZERO_LIMIT) {
-        const z: i128 = @intFromFloat(zero);
-        return convert.cast(Stored, @as(i128, v) - z, .bulk);
-    }
-    const vf: f64 = switch (@typeInfo(T)) {
-        .int => @floatFromInt(v),
-        .float => @floatCast(v),
-        else => unreachable,
-    };
-    return convert.cast(Stored, (vf - zero) / scale, .bulk);
-}
 
 // ── tests ──────────────────────────────────────────────────────────────────────────────
 const testing = std.testing;
@@ -570,9 +530,9 @@ test "read-only handle rejects writes" {
 test "integer scaling fast path: huge integral PZERO/BZERO is a typed error, not an @intFromFloat panic" {
     // Regression: a crafted PZEROn/BZERO like 1e39 is integral but far outside i128 range, so
     // the integer fast-path's bare `@intFromFloat(zero)` panicked. It must be a typed Overflow.
-    try testing.expectError(error.Overflow, applyScaleRead(i32, i32, @as(i32, 1), 1.0, 1.0e39));
-    try testing.expectError(error.Overflow, applyScaleWrite(i32, i32, @as(i32, 1), 1.0, 1.0e39));
-    try testing.expectError(error.Overflow, applyScaleRead(i32, i32, @as(i32, 1), 1.0, -1.0e39));
+    try testing.expectError(error.Overflow, image.applyScaleRead(i32, i32, @as(i32, 1), .{ .bzero = 1.0e39 }));
+    try testing.expectError(error.Overflow, image.applyScaleWrite(i32, i32, @as(i32, 1), .{ .bzero = 1.0e39 }));
+    try testing.expectError(error.Overflow, image.applyScaleRead(i32, i32, @as(i32, 1), .{ .bzero = -1.0e39 }));
     // The 64-bit unsigned convention (zero = 2^63) still resolves exactly via the fast path.
-    try testing.expectEqual(@as(i128, 9223372036854775808), try applyScaleRead(i64, i128, @as(i64, 0), 1.0, 9223372036854775808.0));
+    try testing.expectEqual(@as(i128, 9223372036854775808), try image.applyScaleRead(i64, i128, @as(i64, 0), .{ .bzero = 9223372036854775808.0 }));
 }

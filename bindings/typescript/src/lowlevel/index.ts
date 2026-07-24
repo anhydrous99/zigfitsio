@@ -14,7 +14,8 @@
  * synchronous. `lib`/`native` are lazy proxies that throw a clear error if touched
  * before init completes.
  */
-import { openWasmLibrary, type NativeFn, type NativeLibrary, type NativeResult, type WasmExports } from "../ffi/index.js";
+import type { NativeFn, NativeLibrary, NativeResult } from "../ffi/types.js";
+import { openWasmLibrary, type WasmExports } from "../ffi/wasm.js";
 import { wasmBytesSync, wasmSourceAsync } from "../loader.js";
 import { CODE_TO_CLASS, FitsError } from "../errors.js";
 import { decOut } from "../util.js";

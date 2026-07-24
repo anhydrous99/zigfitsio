@@ -513,17 +513,17 @@ pub fn readVlaColumnInto(
 
 fn fillFromHeap(comptime T: type, dev: Device, abs: u64, elem: BinaryType, out: []T, column: *const Column) (errors.IoError || errors.ConvError)!void {
     switch (elem) {
-        .logical => try readLogicalRun(T, dev, abs, out),
-        .bit => try readBitRun(T, dev, abs, out),
+        .logical => try binary.readLogical(T, dev, abs, out, .bulk, .{}),
+        .bit => try binary.readBits(T, dev, abs, out, .bulk),
         .char => try readCharRun(T, dev, abs, out),
-        .byte => try readStoredRun(u8, T, dev, abs, out, column),
-        .int16 => try readStoredRun(i16, T, dev, abs, out, column),
-        .int32 => try readStoredRun(i32, T, dev, abs, out, column),
-        .int64 => try readStoredRun(i64, T, dev, abs, out, column),
-        .float32 => try readStoredRun(f32, T, dev, abs, out, column),
-        .float64 => try readStoredRun(f64, T, dev, abs, out, column),
-        .complex32 => try readStoredRun(f32, T, dev, abs, out, column),
-        .complex64 => try readStoredRun(f64, T, dev, abs, out, column),
+        .byte => try binary.readRun(u8, T, dev, abs, out, column, .bulk, .{}),
+        .int16 => try binary.readRun(i16, T, dev, abs, out, column, .bulk, .{}),
+        .int32 => try binary.readRun(i32, T, dev, abs, out, column, .bulk, .{}),
+        .int64 => try binary.readRun(i64, T, dev, abs, out, column, .bulk, .{}),
+        .float32 => try binary.readRun(f32, T, dev, abs, out, column, .bulk, .{}),
+        .float64 => try binary.readRun(f64, T, dev, abs, out, column, .bulk, .{}),
+        .complex32 => try binary.readRun(f32, T, dev, abs, out, column, .bulk, .{}),
+        .complex64 => try binary.readRun(f64, T, dev, abs, out, column, .bulk, .{}),
         .vla32, .vla64 => unreachable,
     }
 }
@@ -605,7 +605,7 @@ fn descriptorExtent(d: Descriptor, elem: BinaryType, geom: *const HeapGeometry) 
 }
 
 fn validateStoredValues(comptime Stored: type, comptime T: type, in: []const T, column: *const Column) errors.ConvError!void {
-    for (in) |value| _ = try convertToStored(Stored, T, value, column);
+    for (in) |value| _ = try binary.convertStored(Stored, T, value, column, .bulk, .{});
 }
 
 // Perform every deterministic conversion before a packed write starts mutating the heap. The
@@ -827,17 +827,17 @@ fn releaseDescriptorExtent(alloc: Allocator, mgr: *HeapManager, d: Descriptor, e
 
 fn drainToHeap(comptime T: type, dev: Device, abs: u64, elem: BinaryType, in: []const T, column: *const Column) (errors.IoError || errors.ConvError)!void {
     switch (elem) {
-        .logical => try writeLogicalRun(T, dev, abs, in),
-        .bit => try writeBitRun(T, dev, abs, in),
+        .logical => try binary.writeLogical(T, dev, abs, in, .{}),
+        .bit => try binary.writeBits(T, dev, abs, in),
         .char => try writeCharRun(T, dev, abs, in),
-        .byte => try writeStoredRun(u8, T, dev, abs, in, column),
-        .int16 => try writeStoredRun(i16, T, dev, abs, in, column),
-        .int32 => try writeStoredRun(i32, T, dev, abs, in, column),
-        .int64 => try writeStoredRun(i64, T, dev, abs, in, column),
-        .float32 => try writeStoredRun(f32, T, dev, abs, in, column),
-        .float64 => try writeStoredRun(f64, T, dev, abs, in, column),
-        .complex32 => try writeStoredRun(f32, T, dev, abs, in, column),
-        .complex64 => try writeStoredRun(f64, T, dev, abs, in, column),
+        .byte => try binary.writeRun(u8, T, dev, abs, in, column, .bulk, .{}),
+        .int16 => try binary.writeRun(i16, T, dev, abs, in, column, .bulk, .{}),
+        .int32 => try binary.writeRun(i32, T, dev, abs, in, column, .bulk, .{}),
+        .int64 => try binary.writeRun(i64, T, dev, abs, in, column, .bulk, .{}),
+        .float32 => try binary.writeRun(f32, T, dev, abs, in, column, .bulk, .{}),
+        .float64 => try binary.writeRun(f64, T, dev, abs, in, column, .bulk, .{}),
+        .complex32 => try binary.writeRun(f32, T, dev, abs, in, column, .bulk, .{}),
+        .complex64 => try binary.writeRun(f64, T, dev, abs, in, column, .bulk, .{}),
         .vla32, .vla64 => unreachable,
     }
 }
@@ -1126,161 +1126,6 @@ fn moveBytes(table: *BinTable, src: u64, dst: u64, len: u64) errors.IoError!void
             try table.fits.dev.writeAll(buf[0..m], dst + o);
             remaining -= m;
         }
-    }
-}
-
-// ── scaling / conversion (mirrors binary.zig's fixed-column policy, bulk, no null sentinel) ──
-
-// Stored→physical→T: applies TZERO/TSCAL scaling. The integer-space path (`zero_int`) preserves
-// the CFITSIO unsigned conventions near 2^63 without f64 precision loss.
-fn convertFromStored(comptime Stored: type, comptime T: type, s: Stored, column: *const Column) errors.ConvError!T {
-    const sinfo = @typeInfo(Stored);
-    if (T == bool) {
-        return s != 0;
-    } else if (column.scal == 1.0 and column.zero == 0.0) {
-        return convert.cast(T, s, .bulk);
-    } else if (sinfo == .int and @typeInfo(T) == .int and column.zero_int != null) {
-        const phys: i128 = @as(i128, s) + column.zero_int.?;
-        return convert.cast(T, phys, .bulk);
-    } else {
-        const sf: f64 = if (sinfo == .int) @floatFromInt(s) else @as(f64, s);
-        const phys: f64 = column.zero + column.scal * sf;
-        return convert.cast(T, phys, .bulk);
-    }
-}
-
-// T→physical→Stored: the inverse scaling for writes.
-fn convertToStored(comptime Stored: type, comptime T: type, v: T, column: *const Column) errors.ConvError!Stored {
-    if (T == bool) {
-        return if (v) @as(Stored, 1) else @as(Stored, 0);
-    } else if (column.scal == 1.0 and column.zero == 0.0) {
-        return convert.cast(Stored, v, .bulk);
-    } else if (@typeInfo(Stored) == .int and @typeInfo(T) == .int and column.zero_int != null) {
-        const phys: i128 = @as(i128, v) - column.zero_int.?;
-        return convert.cast(Stored, phys, .bulk);
-    } else {
-        const vf: f64 = switch (@typeInfo(T)) {
-            .int => @floatFromInt(v),
-            .float => @floatCast(v),
-            else => unreachable,
-        };
-        const stored_f: f64 = (vf - column.zero) / column.scal;
-        return convert.cast(Stored, stored_f, .bulk);
-    }
-}
-
-// ── per-type transfer cores (heap payload; chunked, byte-swapped, scaled) ────────────────────
-
-fn readStoredRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, out: []T, column: *const Column) (errors.IoError || errors.ConvError)!void {
-    const cap = @max(1, SCRATCH_BYTES / @sizeOf(Stored));
-    var scratch: [cap]Stored = undefined;
-    var done: usize = 0;
-    while (done < out.len) {
-        const m = @min(scratch.len, out.len - done);
-        const raw = std.mem.sliceAsBytes(scratch[0..m]);
-        try dev.readAll(raw, off + @as(u64, done) * @sizeOf(Stored));
-        endian.swapToNative(Stored, scratch[0..m]);
-        for (scratch[0..m], 0..) |s, i| out[done + i] = try convertFromStored(Stored, T, s, column);
-        done += m;
-    }
-}
-
-fn writeStoredRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, in: []const T, column: *const Column) (errors.IoError || errors.ConvError)!void {
-    const cap = @max(1, SCRATCH_BYTES / @sizeOf(Stored));
-    var scratch: [cap]Stored = undefined;
-    var done: usize = 0;
-    while (done < in.len) {
-        const m = @min(scratch.len, in.len - done);
-        for (0..m) |i| scratch[i] = try convertToStored(Stored, T, in[done + i], column);
-        endian.swapToBig(Stored, scratch[0..m]);
-        const raw = std.mem.sliceAsBytes(scratch[0..m]);
-        try dev.writeAll(raw, off + @as(u64, done) * @sizeOf(Stored));
-        done += m;
-    }
-}
-
-// L: 'T'/'F' bytes ↔ bool/numeric; a 0 byte reads as false/0 (the logical null, no sentinel).
-fn readLogicalRun(comptime T: type, dev: Device, off: u64, out: []T) (errors.IoError || errors.ConvError)!void {
-    var scratch: [SCRATCH_BYTES]u8 = undefined;
-    var done: usize = 0;
-    while (done < out.len) {
-        const m = @min(scratch.len, out.len - done);
-        try dev.readAll(scratch[0..m], off + done);
-        for (scratch[0..m], 0..) |b, i| {
-            if (T == bool) {
-                out[done + i] = (b == 'T' or b == 't');
-            } else {
-                const tv: u8 = if (b == 'T' or b == 't') 1 else 0;
-                out[done + i] = try convert.cast(T, tv, .bulk);
-            }
-        }
-        done += m;
-    }
-}
-
-fn writeLogicalRun(comptime T: type, dev: Device, off: u64, in: []const T) (errors.IoError || errors.ConvError)!void {
-    var scratch: [SCRATCH_BYTES]u8 = undefined;
-    var done: usize = 0;
-    while (done < in.len) {
-        const m = @min(scratch.len, in.len - done);
-        for (0..m) |i| {
-            const truth: bool = if (T == bool) in[done + i] else (in[done + i] != 0);
-            scratch[i] = if (truth) 'T' else 'F';
-        }
-        try dev.writeAll(scratch[0..m], off + done);
-        done += m;
-    }
-}
-
-// X: MSB-first packed bits ↔ one element per bit. `out.len` is the bit count.
-fn readBitRun(comptime T: type, dev: Device, off: u64, out: []T) (errors.IoError || errors.ConvError)!void {
-    const nbits = out.len;
-    const fbytes = (nbits + 7) / 8;
-    var scratch: [SCRATCH_BYTES]u8 = undefined;
-    var byte_done: usize = 0;
-    while (byte_done < fbytes) {
-        const m = @min(scratch.len, fbytes - byte_done);
-        try dev.readAll(scratch[0..m], off + byte_done);
-        for (scratch[0..m], 0..) |b, bi| {
-            const base_bit = (byte_done + bi) * 8;
-            var k: usize = 0;
-            while (k < 8) : (k += 1) {
-                const bit_index = base_bit + k;
-                if (bit_index >= nbits) break;
-                const shift: u3 = @intCast(7 - k);
-                const bitval: u8 = (b >> shift) & 1;
-                out[bit_index] = if (T == bool) (bitval == 1) else try convert.cast(T, bitval, .bulk);
-            }
-        }
-        byte_done += m;
-    }
-}
-
-fn writeBitRun(comptime T: type, dev: Device, off: u64, in: []const T) (errors.IoError || errors.ConvError)!void {
-    const nbits = in.len;
-    const fbytes = (nbits + 7) / 8;
-    var scratch: [SCRATCH_BYTES]u8 = undefined;
-    var byte_done: usize = 0;
-    while (byte_done < fbytes) {
-        const m = @min(scratch.len, fbytes - byte_done);
-        @memset(scratch[0..m], 0);
-        for (0..m) |bi| {
-            const base_bit = (byte_done + bi) * 8;
-            var byte: u8 = 0;
-            var k: usize = 0;
-            while (k < 8) : (k += 1) {
-                const bit_index = base_bit + k;
-                if (bit_index >= nbits) break;
-                const truth: bool = if (T == bool) in[bit_index] else (in[bit_index] != 0);
-                if (truth) {
-                    const shift: u3 = @intCast(7 - k);
-                    byte |= (@as(u8, 1) << shift);
-                }
-            }
-            scratch[bi] = byte;
-        }
-        try dev.writeAll(scratch[0..m], off + byte_done);
-        byte_done += m;
     }
 }
 

@@ -79,7 +79,6 @@ pub fn build(b: *std.Build) void {
     // correct), but a Debug `zig build capi` — the local dev + smoke-test flow — was broken.
     // LLVM emits the correct prologue (`xmm0`/`xmm1`), so pin it here at the ABI boundary.
     capi_lib.use_llvm = true;
-    b.installArtifact(capi_lib);
     // Install the shared library into `zig-out/lib` when `zig build capi` is invoked directly
     // (the compile step alone does not copy the artifact out of the cache).
     const capi_install = b.addInstallArtifact(capi_lib, .{});
@@ -220,7 +219,6 @@ pub fn build(b: *std.Build) void {
     });
     fv_mod.addImport("zigfitsio", mod);
     const fitsverify = b.addExecutable(.{ .name = "fitsverify", .root_module = fv_mod });
-    b.installArtifact(fitsverify);
     const run_fv = b.addRunArtifact(fitsverify);
     if (b.args) |args| run_fv.addArgs(args);
     const fv_step = b.step("fitsverify", "Run the fitsverify CLI demo");
