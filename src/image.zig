@@ -493,7 +493,8 @@ fn transformWrite(comptime Stored: type, comptime T: type, v: T, sc: Scaling, se
 // panicking on an out-of-bounds `@intFromFloat`.
 const FAST_BZERO_LIMIT: f64 = 0x1p100;
 
-fn applyScaleRead(comptime Stored: type, comptime T: type, s: Stored, sc: Scaling) errors.ConvError!T {
+/// Apply image-style affine scaling to one stored value.
+pub fn applyScaleRead(comptime Stored: type, comptime T: type, s: Stored, sc: Scaling) errors.ConvError!T {
     if (sc.mode == .raw) return convert.cast(T, s, .bulk);
     if (sc.bscale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(sc.bzero) and @abs(sc.bzero) < FAST_BZERO_LIMIT) {
         const bz: i128 = @intFromFloat(sc.bzero);
@@ -507,7 +508,8 @@ fn applyScaleRead(comptime Stored: type, comptime T: type, s: Stored, sc: Scalin
     return convert.cast(T, sc.bzero + sc.bscale * sf, .bulk);
 }
 
-fn applyScaleWrite(comptime Stored: type, comptime T: type, v: T, sc: Scaling) errors.ConvError!Stored {
+/// Apply inverse image-style affine scaling to one caller value.
+pub fn applyScaleWrite(comptime Stored: type, comptime T: type, v: T, sc: Scaling) errors.ConvError!Stored {
     if (sc.mode == .raw) return convert.cast(Stored, v, .bulk);
     if (sc.bscale == 1 and @typeInfo(Stored) == .int and @typeInfo(T) == .int and isIntegral(sc.bzero) and @abs(sc.bzero) < FAST_BZERO_LIMIT) {
         const bz: i128 = @intFromFloat(sc.bzero);

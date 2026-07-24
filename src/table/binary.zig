@@ -1093,8 +1093,8 @@ inline fn vToF64(comptime T: type, v: T) f64 {
     };
 }
 
-// Stored→physical→T, applying TNULL/NaN nulls then TSCAL/TZERO scaling.
-fn convertScalar(comptime Stored: type, comptime T: type, s: Stored, column: *const Column, mode: Mode, opts: ReadOpts(T)) errors.ConvError!T {
+/// Convert one stored numeric value using the binary-table scaling and null policy.
+pub fn convertScalar(comptime Stored: type, comptime T: type, s: Stored, column: *const Column, mode: Mode, opts: ReadOpts(T)) errors.ConvError!T {
     const sinfo = @typeInfo(Stored);
     if (sinfo == .int) {
         if (column.tnull) |tn| {
@@ -1121,8 +1121,8 @@ fn convertScalar(comptime Stored: type, comptime T: type, s: Stored, column: *co
     }
 }
 
-// T→physical→stored, applying the inverse scaling and null encoding.
-fn convertStored(comptime Stored: type, comptime T: type, v: T, column: *const Column, mode: Mode, opts: WriteOpts(T)) errors.ConvError!Stored {
+/// Convert one caller value to its stored representation using inverse scaling and null encoding.
+pub fn convertStored(comptime Stored: type, comptime T: type, v: T, column: *const Column, mode: Mode, opts: WriteOpts(T)) errors.ConvError!Stored {
     if (opts.null_sentinel) |ns| {
         if (valEql(T, v, ns)) {
             if (@typeInfo(Stored) == .int) {
@@ -1150,8 +1150,8 @@ fn convertStored(comptime Stored: type, comptime T: type, v: T, column: *const C
 
 const SCRATCH_BYTES: usize = 8192;
 
-// Numeric/complex read: `out.len` stored values, chunked, byte-swapped, scaled, converted.
-fn readRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, out: []align(1) T, column: *const Column, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
+/// Read a contiguous numeric/complex run, applying byte order, scaling, and conversion.
+pub fn readRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, out: []align(1) T, column: *const Column, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
     const cap = @max(1, SCRATCH_BYTES / @sizeOf(Stored));
     var scratch: [cap]Stored = undefined;
     var done: usize = 0;
@@ -1165,8 +1165,8 @@ fn readRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, out: 
     }
 }
 
-// Numeric/complex write: inverse of `readRun`.
-fn writeRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, in: []const T, column: *const Column, mode: Mode, opts: WriteOpts(T)) (errors.IoError || errors.ConvError)!void {
+/// Write a contiguous numeric/complex run, applying inverse scaling and FITS byte order.
+pub fn writeRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, in: []const T, column: *const Column, mode: Mode, opts: WriteOpts(T)) (errors.IoError || errors.ConvError)!void {
     const cap = @max(1, SCRATCH_BYTES / @sizeOf(Stored));
     var scratch: [cap]Stored = undefined;
     var done: usize = 0;
@@ -1180,8 +1180,8 @@ fn writeRun(comptime Stored: type, comptime T: type, dev: Device, off: u64, in: 
     }
 }
 
-// L: 'T'/'F' bytes ↔ bool/numeric; a 0 byte is the logical null.
-fn readLogical(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
+/// Read contiguous FITS `L` bytes into boolean or numeric caller values.
+pub fn readLogical(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode, opts: ReadOpts(T)) (errors.IoError || errors.ConvError)!void {
     var scratch: [SCRATCH_BYTES]u8 = undefined;
     var done: usize = 0;
     while (done < out.len) {
@@ -1203,7 +1203,8 @@ fn readLogical(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode:
     }
 }
 
-fn writeLogical(comptime T: type, dev: Device, off: u64, in: []const T, opts: WriteOpts(T)) (errors.IoError || errors.ConvError)!void {
+/// Write boolean or numeric caller values as contiguous FITS `L` bytes.
+pub fn writeLogical(comptime T: type, dev: Device, off: u64, in: []const T, opts: WriteOpts(T)) (errors.IoError || errors.ConvError)!void {
     var scratch: [SCRATCH_BYTES]u8 = undefined;
     var done: usize = 0;
     while (done < in.len) {
@@ -1223,8 +1224,8 @@ fn writeLogical(comptime T: type, dev: Device, off: u64, in: []const T, opts: Wr
     }
 }
 
-// X: MSB-first packed bits ↔ one element per bit. `out.len` is the bit (repeat) count.
-fn readBits(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode) (errors.IoError || errors.ConvError)!void {
+/// Read MSB-first packed FITS `X` bits into one caller value per bit.
+pub fn readBits(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mode) (errors.IoError || errors.ConvError)!void {
     const nbits = out.len;
     const fbytes = (nbits + 7) / 8;
     var scratch: [SCRATCH_BYTES]u8 = undefined;
@@ -1247,7 +1248,8 @@ fn readBits(comptime T: type, dev: Device, off: u64, out: []align(1) T, mode: Mo
     }
 }
 
-fn writeBits(comptime T: type, dev: Device, off: u64, in: []const T) (errors.IoError || errors.ConvError)!void {
+/// Write one boolean or numeric caller value per bit as MSB-first packed FITS `X` bytes.
+pub fn writeBits(comptime T: type, dev: Device, off: u64, in: []const T) (errors.IoError || errors.ConvError)!void {
     const nbits = in.len;
     const fbytes = (nbits + 7) / 8;
     var scratch: [SCRATCH_BYTES]u8 = undefined;

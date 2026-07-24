@@ -51,7 +51,7 @@
     "test:node": "vitest run",
     "typecheck:tests": "tsc -p tsconfig.test.json",
     "check-versions": "node scripts/check-versions.mjs",
-    "prepack": "node scripts/prepack.mjs"
+    "prepack": "npm run build && npm run check-versions"
   },
   "devDependencies": {
     "@types/node": "^26.1.0",

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "./_harness/index.js";
-import { openWasmLibrary } from "../src/ffi/index.js";
+import { openWasmLibrary } from "../src/ffi/wasm.js";
 import { findWasm, wasmBytesSync } from "../src/loader.js";
 import * as ll from "../src/lowlevel/index.js";
 
