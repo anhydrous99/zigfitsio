@@ -217,6 +217,11 @@ npm run build           # clean + tsc -> dist/ + build & copy zigfitsio.wasm
 
 The dev loader honors `ZIGFITSIO_WASM` and falls back to a `zig-out/bin` build.
 
+`tsc` uses TypeScript 7 through the `@typescript/native` npm alias. The `typescript`
+alias supplies the TypeScript 6 API required by TypeDoc, following
+[Microsoft's compatibility setup](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/#running-side-by-side-with-typescript-6.0).
+Remove the compatibility alias when TypeDoc supports the TypeScript 7 API.
+
 ## License
 
 MIT — see [LICENSE](https://github.com/anhydrous99/zigfitsio/blob/main/LICENSE).
