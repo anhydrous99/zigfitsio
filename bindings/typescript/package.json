@@ -60,6 +60,6 @@
     "typedoc-github-wiki-theme": "2.1.0",
     "typedoc-plugin-markdown": "4.13.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vitest": "^4.1.9"
+    "vitest": "^5.0.0"
   }
 }
