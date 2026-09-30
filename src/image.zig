@@ -110,16 +110,21 @@ pub const ImageView = struct {
     /// must be ≤ 999 (`error.BadNaxis`). After a successful call the view is fully usable: its
     /// `bitpix()`/`dims()`/`elementCount()` read the HDU's refreshed structural fields.
     pub fn reshape(self: *ImageView, new_bitpix: i64, new_axes: []const u64) ImageError!void {
+        if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
+        if (self.isCompressed()) return error.BadDimensions;
         if (!validBitpix(new_bitpix)) return error.BadBitpix;
         if (new_axes.len > 999) return error.BadNaxis;
 
         const alloc = self.fits.alloc;
-        const h = &self.hdu.header;
+        var staged: @import("header/header.zig").Header = .{ .inherit = self.hdu.header.inherit };
+        defer staged.deinit(alloc);
+        try staged.cards.appendSlice(alloc, self.hdu.header.cards.items);
+        const h = &staged;
         const old_naxis: usize = self.hdu.naxis;
 
         // Rewrite the structural keywords. `update` replaces in place when present and
         // creates-if-absent (before END) otherwise, so growing the dimensionality appends the
-        // new `NAXISn` cards — a header-card-count change that `rewriteHeaderInPlace` re-aligns.
+        // new `NAXISn` cards; the staged structural commit re-aligns their header unit.
         try h.update(alloc, "BITPIX", .{ .int = new_bitpix }, null);
         try h.update(alloc, "NAXIS", .{ .int = @intCast(new_axes.len) }, null);
         var name_buf: [16]u8 = undefined;
@@ -134,15 +139,7 @@ pub const ImageView = struct {
             h.delete(kw) catch {}; // absent is fine (already not there)
         }
 
-        // Land the new geometry. `refreshGeometry` recomputes bitpix/naxis/axes/data_bytes from
-        // the edited header (no byte move). It also overwrites `data_bytes` with the NEW size,
-        // but `rewriteHeaderInPlace` derives its grow/shrink delta from the *on-disk* (old) size
-        // it finds in `data_bytes`, so we restore that old value before calling it — otherwise the
-        // data resize (and its zero-fill) would be skipped.
-        const on_disk_bytes = self.hdu.data_bytes;
-        _ = try self.fits.refreshGeometry(self.hdu);
-        self.hdu.data_bytes = on_disk_bytes;
-        try self.fits.rewriteHeaderInPlace(self.hdu);
+        try self.fits.replaceStructuralHeaderInPlace(self.hdu, &staged);
     }
 
     /// `BITPIX` of the underlying array. For a compressed view this is the *uncompressed* image
@@ -232,6 +229,7 @@ pub const ImageView = struct {
 
     /// Write the entire array from `in` (exactly `elementCount()` elements).
     pub fn writeAll(self: *ImageView, comptime T: type, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
         if (self.isCompressed()) return error.BadDimensions; // writing raw pixels would corrupt the compressed table
         if (in.len != self.elementCount()) return error.BadDimensions;
         try self.writeLinear(T, 0, in, self.scalingOf(opts.scaling), opts.null_sentinel);
@@ -239,6 +237,7 @@ pub const ImageView = struct {
 
     /// Write `in.len` contiguous pixels starting at the N-D coordinate `first`.
     pub fn writePixels(self: *ImageView, comptime T: type, first: []const u64, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
         if (self.isCompressed()) return error.BadDimensions; // writing raw pixels would corrupt the compressed table
         const start = try self.linearIndex(first);
         const total = self.elementCount();
@@ -256,6 +255,7 @@ pub const ImageView = struct {
 
     /// Write a rectangular section (symmetric with `readSection`).
     pub fn writeSection(self: *ImageView, comptime T: type, lower: []const u64, upper: []const u64, stride: ?[]const u64, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
         if (self.isCompressed()) return error.BadDimensions; // writing raw pixels would corrupt the compressed table
         // `section` is shared with the read path (which fills its buffer), so it takes a mutable
         // slice; the write path only reads from `in`, hence the `@constCast` is sound here.
@@ -1026,4 +1026,105 @@ test "multi-chunk transfer stays correct across the chunk boundary" {
     defer testing.allocator.free(out);
     try img.readAll(i32, out, .{});
     try testing.expectEqualSlices(i32, src, out);
+}
+
+test "image writes and reshape preserve read-only handles and rejected geometry" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{ .limits = .{ .max_naxis_product = 16 } });
+    defer f.deinit();
+    var img = try ImageView.append(&f, .{ .bitpix = 16, .axes = &.{4} });
+    try img.writeAll(i16, &.{ 1, 2, 3, 4 }, .{});
+    const before = try testing.allocator.dupe(u8, mem.bytes());
+    defer testing.allocator.free(before);
+    const revision = img.hdu.header_revision;
+    const cards = try testing.allocator.dupe(@import("header/card.zig").Card, img.hdu.header.cards.items);
+    defer testing.allocator.free(cards);
+
+    f.mode = .read_only;
+    try testing.expectError(error.NotWritable, img.writeAll(i16, &.{ 5, 6, 7, 8 }, .{}));
+    try testing.expectError(error.NotWritable, img.writePixels(i16, &.{1}, &.{8}, .{}));
+    try testing.expectError(error.NotWritable, img.writeSection(i16, &.{0}, &.{2}, &.{2}, &.{ 8, 9 }, .{}));
+    try testing.expectError(error.NotWritable, img.reshape(32, &.{ 2, 2 }));
+    f.mode = .read_write;
+    try testing.expectError(error.BadDimensions, img.reshape(32, &.{std.math.maxInt(u64)}));
+    try testing.expectError(error.LimitExceeded, img.reshape(32, &.{ 4, 5 }));
+
+    try testing.expectEqualSlices(u8, before, mem.bytes());
+    try testing.expectEqual(@as(i64, 16), img.bitpix());
+    try testing.expectEqualSlices(u64, &.{4}, img.dims());
+    try testing.expectEqual(revision, img.hdu.header_revision);
+    try testing.expectEqual(cards.len, img.hdu.header.count());
+    for (cards, img.hdu.header.cards.items) |*old, *now| {
+        try testing.expectEqualSlices(u8, old.bytes(), now.bytes());
+    }
+}
+
+test "reshape allocation failures preserve bytes header geometry and following offsets" {
+    var fail_index: usize = 0;
+    var device_failures: usize = 0;
+    while (fail_index < 100) : (fail_index += 1) {
+        var mem = MemoryDevice.init(testing.allocator);
+        defer mem.deinit();
+        var f = try Fits.create(testing.allocator, mem.device(), .{});
+        defer f.deinit();
+        var img = try ImageView.append(&f, .{ .bitpix = 16, .axes = &.{4} });
+        try img.writeAll(i16, &.{ 10, 20, 30, 40 }, .{});
+        const ext = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{3} });
+        try f.dev.writeAll(&.{ 7, 8, 9 }, ext.data_off);
+        // Exact capacity forces both tail-growth steps to allocate. Reject in-place
+        // resizes below so the failure sweep covers the device as well as Fits staging.
+        const owned = try mem.buf.toOwnedSlice(testing.allocator);
+        mem.buf = .fromOwnedSlice(owned);
+        const before = try testing.allocator.dupe(u8, mem.bytes());
+        defer testing.allocator.free(before);
+        const cards = try testing.allocator.dupe(@import("header/card.zig").Card, img.hdu.header.cards.items);
+        defer testing.allocator.free(cards);
+        const old_data_off = img.hdu.data_off;
+        const ext_off = ext.header_off;
+        const scan_off = f.scan_off;
+        const revision = img.hdu.header_revision;
+
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        f.alloc = failing.allocator();
+        defer f.alloc = testing.allocator;
+        mem.alloc = failing.allocator();
+        defer mem.alloc = testing.allocator;
+        var axes = [_]u64{1} ** 40; // grow both the header and the data unit
+        axes[0] = 10000;
+        img.reshape(16, &axes) catch |err| {
+            if (err == error.DeviceFull) {
+                device_failures += 1;
+            } else {
+                try testing.expectEqual(error.OutOfMemory, err);
+            }
+            try testing.expectEqualSlices(u8, before, mem.bytes());
+            try testing.expectEqualSlices(u64, &.{4}, img.dims());
+            try testing.expectEqual(@as(i64, 16), img.bitpix());
+            try testing.expectEqual(@as(u64, 8), img.hdu.data_bytes);
+            try testing.expectEqual(old_data_off, img.hdu.data_off);
+            try testing.expectEqual(ext_off, ext.header_off);
+            try testing.expectEqual(scan_off, f.scan_off);
+            try testing.expectEqual(revision, img.hdu.header_revision);
+            try testing.expectEqual(cards.len, img.hdu.header.count());
+            for (cards, img.hdu.header.cards.items) |*old, *now| {
+                try testing.expectEqualSlices(u8, old.bytes(), now.bytes());
+            }
+            continue;
+        };
+        try testing.expect(fail_index > 0);
+        try testing.expect(device_failures >= 2);
+        try testing.expectEqual(img.hdu.nextOff(), ext.header_off);
+        var tail: [3]u8 = undefined;
+        try f.dev.readAll(&tail, ext.data_off);
+        try testing.expectEqualSlices(u8, &.{ 7, 8, 9 }, &tail);
+        failing.fail_index = std.math.maxInt(usize);
+        try img.reshape(16, &.{4}); // shrink both regions with the same prepared path
+        try testing.expectEqual(old_data_off, img.hdu.data_off);
+        try testing.expectEqual(ext_off, ext.header_off);
+        try f.dev.readAll(&tail, ext.data_off);
+        try testing.expectEqualSlices(u8, &.{ 7, 8, 9 }, &tail);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }

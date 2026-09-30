@@ -6,6 +6,7 @@ needed. The comment on each test references the finding it guards.
 """
 
 import ctypes as c
+import io
 
 import numpy as np
 import pytest
@@ -1919,3 +1920,572 @@ def test_blank_promoted_update_mode_flush_fails_loud(tmp_fits):
         hdul.close()
     with zf.open(p) as h2:  # the file is still structurally readable
         assert h2[0].data is not None
+
+
+@pytest.mark.parametrize("table_class,format", [(zf.BinTableHDU, "1J"), (zf.AsciiTableHDU, "I8")])
+def test_detached_builder_replacement_and_clear(table_class, format):
+    table = table_class.from_columns([zf.Column("X", format, array=[1, 2], unit="s")])
+    replacement = np.array([(41,), (42,), (43,)], dtype=[("X", "i4")])
+    table.data = replacement
+    with pytest.raises(TypeError):
+        table.data = [1, 2]
+    assert table.data is replacement
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as saved:
+        np.testing.assert_array_equal(saved[1].data["X"], [41, 42, 43])
+        assert saved[1].header["TFORM1"] == format
+        assert saved[1].header["TUNIT1"] == "s"
+    table.data = None
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as saved:
+        assert saved[1].header["TFIELDS"] == 0
+        assert saved[1].header["NAXIS2"] == 0
+
+
+@pytest.mark.parametrize("table_class", [zf.BinTableHDU, zf.AsciiTableHDU])
+def test_explicit_empty_builder_keeps_requested_rows(table_class):
+    table = table_class.from_columns([], nrows=3)
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as saved:
+        assert saved[1].header["TFIELDS"] == 0
+        assert saved[1].header["NAXIS2"] == 3
+
+
+@pytest.mark.parametrize("format,dtype,values", [
+    ("1L", "u1", [1, 0, 1]), ("1X", "u1", [0, 1, 1]),
+    ("1I", "u2", [0, 32768, 65535]),
+])
+def test_detached_binary_replacement_keeps_compatible_format(format, dtype, values):
+    table = zf.BinTableHDU.from_columns([zf.Column("X", format, array=np.zeros(1, dtype=dtype), unit="s")])
+    table.data = np.array(list(zip(values)), dtype=[("X", dtype)])
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as saved:
+        assert saved[1].header["TFORM1"] == format
+        assert saved[1].header["TUNIT1"] == "s"
+        np.testing.assert_array_equal(saved[1].data["X"], values)
+
+
+def test_detached_vla_replacement_uses_specification():
+    table = zf.BinTableHDU.from_columns([zf.Column("X", "1PJ", unit="m")])
+    replacement = np.empty(2, dtype=[("X", object)])
+    replacement["X"][0] = np.array([7, 8], dtype="i4")
+    replacement["X"][1] = np.array([9], dtype="i4")
+    table.data = replacement
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as saved:
+        assert saved[1].header["TFORM1"] == "1PJ"
+        assert saved[1].header["TUNIT1"] == "m"
+        np.testing.assert_array_equal(saved[1].data["X"][0], [7, 8])
+        np.testing.assert_array_equal(saved[1].data["X"][1], [9])
+
+
+def test_zimage_false_is_table_and_malformed_logical_fails():
+    def source(value):
+        def build(handle):
+            ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
+            ll.check(ll.lib.zf_create_tbl(handle, ll.BINARY_TBL, 0, 0, None, None, None, None))
+            if isinstance(value, bool):
+                ll.check(ll.lib.zf_write_key_log(handle, b"ZIMAGE", 6, int(value), None, 0))
+            else:
+                ll.check(ll.lib.zf_write_key_str(handle, b"ZIMAGE", 6, value, len(value), None, 0))
+        return _bytes_from(build)
+    with zf.from_bytes(source(False)) as saved:
+        assert isinstance(saved[1], zf.BinTableHDU)
+    with pytest.raises(zf.FitsTypeError):
+        zf.from_bytes(source(b"bad"))
+
+
+def test_failed_scan_releases_handle_without_flush(monkeypatch):
+    handle = c.c_void_p()
+    ll.check(ll.lib.zf_create_memory(None, c.byref(handle)))
+    ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
+    closed = []
+    native_close = ll.lib.zf_close
+    def close(h):
+        closed.append(h.value)
+        return native_close(h)
+    def fail_scan(self):
+        self.append(zf.PrimaryHDU())
+        self[0]._hdulist = self  # ensure a cycle would delay destructor cleanup
+        raise ValueError("scan failed")
+    monkeypatch.setattr(ll.lib, "zf_close", close)
+    monkeypatch.setattr(zf.HDUList, "_scan", fail_scan)
+    monkeypatch.setattr(zf.HDUList, "flush", lambda self: pytest.fail("partial scan must not flush"))
+    with pytest.raises(ValueError, match="scan failed"):
+        zf.HDUList._from_handle(handle, ll.READWRITE)
+    assert closed == [handle.value]
+
+
+def test_atomic_writeto_keeps_original_permissions_and_unrelated_temp(tmp_path, monkeypatch):
+    path = tmp_path / "saved.fits"
+    zf.HDUList([zf.PrimaryHDU()]).writeto(path)
+    path.chmod(0o640)
+    expected_mode = path.stat().st_mode & 0o777
+    before = path.read_bytes()
+    unrelated = tmp_path / "saved.fits.zigfitsio.tmp"
+    unrelated.write_bytes(b"another writer")
+    hdul = zf.HDUList([zf.PrimaryHDU(data=np.array([7, 8], dtype="i2"))])
+    emit = hdul._emit
+    def fail_emit(handle):
+        ll.check(ll.lib.zf_create_img(handle, 16, 1, (c.c_long * 1)(2)))
+        raise OSError("injected save failure")
+    monkeypatch.setattr(hdul, "_emit", fail_emit)
+    with pytest.raises(OSError, match="injected save failure"):
+        hdul.writeto(path, overwrite=True)
+    assert path.read_bytes() == before
+    assert unrelated.read_bytes() == b"another writer"
+    assert not list(tmp_path.glob(".*.zigfitsio-*.tmp"))
+    monkeypatch.setattr(hdul, "_emit", emit)
+    hdul.writeto(path, overwrite=True)
+    assert path.stat().st_mode & 0o777 == expected_mode
+
+
+@pytest.mark.parametrize("mask,expected", [("022", 0o644), ("027", 0o640)])
+def test_atomic_writeto_new_files_follow_umask(tmp_path, mask, expected):
+    import os
+    import subprocess
+    import sys
+    if os.name == "nt":
+        pytest.skip("POSIX umask permissions")
+    path = tmp_path / "new.fits"
+    script = """
+import os,sys
+import numpy as np
+import zigfitsio as zf
+os.umask(int(sys.argv[2],8))
+zf.HDUList([zf.PrimaryHDU(np.array([1,2],dtype='i2'))]).writeto(sys.argv[1])
+"""
+    env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(core.__file__)))
+    subprocess.run([sys.executable, "-c", script, str(path), mask], env=env, check=True, capture_output=True)
+    assert path.stat().st_mode & 0o777 == expected
+
+
+def test_atomic_writeto_private_destination_has_private_staging(tmp_path):
+    if core.os.name == "nt":
+        pytest.skip("POSIX file permissions")
+    path = tmp_path / "private.fits"
+    path.write_bytes(b"original")
+    path.chmod(0o600)
+    def write(fh):
+        assert core.os.fstat(fh.fileno()).st_mode & 0o077 == 0
+        fh.write(b"replacement")
+    core._atomic_write(path, write, overwrite=True)
+    assert path.read_bytes() == b"replacement"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_writeto_reconstructs_on_disk_and_to_bytes_remains_in_memory(tmp_path, monkeypatch):
+    hdul = zf.HDUList([zf.PrimaryHDU(np.arange(12, dtype="i2"))])
+    create_memory = ll.lib.zf_create_memory
+    def no_memory(*args):
+        pytest.fail("disk reconstruction must not allocate a whole output MemoryDevice")
+    monkeypatch.setattr(ll.lib, "zf_create_memory", no_memory)
+    path = tmp_path / "disk.fits"
+    hdul.writeto(path, checksum=True)
+    fits = pytest.importorskip("astropy.io.fits")
+    with fits.open(path, checksum=True) as saved:
+        np.testing.assert_array_equal(saved[0].data, np.arange(12))
+        assert saved[0].verify_checksum() == 1
+        assert saved[0].verify_datasum() == 1
+    calls = []
+    def memory(*args):
+        calls.append(True)
+        return create_memory(*args)
+    monkeypatch.setattr(ll.lib, "zf_create_memory", memory)
+    assert hdul.to_bytes()
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("failure", ["flush", "replace", "link"])
+def test_atomic_writeto_failures_preserve_destination(tmp_path, monkeypatch, failure):
+    path = tmp_path / "preserved.fits"
+    path.write_bytes(b"original bytes")
+    def fail(*args):
+        raise OSError("injected publication failure")
+    if failure == "flush":
+        monkeypatch.setattr(ll.lib, "zf_flush", fail)
+    else:
+        monkeypatch.setattr(core.os, failure, fail)
+    hdul = zf.HDUList([zf.PrimaryHDU(np.array([1, 2], dtype="i2"))])
+    if failure == "link":
+        with pytest.raises(OSError, match="injected publication failure"):
+            core._atomic_write(path, lambda fh: fh.write(b"complete"), overwrite=False)
+    else:
+        with pytest.raises(OSError, match="injected publication failure"):
+            hdul.writeto(path, overwrite=True)
+    assert path.read_bytes() == b"original bytes"
+    assert not list(tmp_path.glob(".*.zigfitsio-*.tmp"))
+
+
+def test_atomic_writeto_exclusive_collision_and_concurrent_destination(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    path = tmp_path / "target.fits"
+    collision = tmp_path / ".target.fits.zigfitsio-owned.tmp"
+    collision.write_bytes(b"another writer")
+    monkeypatch.setattr(core, "uuid4", lambda: SimpleNamespace(hex="owned"))
+    with pytest.raises(FileExistsError):
+        core._atomic_write(path, lambda fh: fh.write(b"complete"), overwrite=True)
+    assert collision.read_bytes() == b"another writer"
+    collision.unlink()
+    def race(fh):
+        fh.write(b"complete")
+        path.write_bytes(b"concurrent destination")
+    with pytest.raises(FileExistsError):
+        core._atomic_write(path, race, overwrite=False)
+    assert path.read_bytes() == b"concurrent destination"
+    assert not collision.exists()
+
+
+def test_atomic_writeto_fdopen_failure_closes_owned_descriptor(tmp_path, monkeypatch):
+    import os
+    fds = []
+    def fail(fd, mode):
+        fds.append(fd)
+        raise OSError("injected fdopen failure")
+    monkeypatch.setattr(core.os, "fdopen", fail)
+    with pytest.raises(OSError, match="injected fdopen failure"):
+        core._atomic_write(tmp_path / "target.fits", lambda fh: None, overwrite=False)
+    assert len(fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(fds[0])
+    assert not list(tmp_path.glob(".*.zigfitsio-*.tmp"))
+
+
+def test_writeto_missing_borrowed_file_symbol_fails_without_memory_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(ll.lib, "zf_create_file_handle_v1", None)
+    path = tmp_path / "missing.fits"
+    with pytest.raises(ll.FitsIOError, match="rebuild the native library"):
+        zf.HDUList([zf.PrimaryHDU()]).writeto(path)
+    assert not path.exists()
+    assert not list(tmp_path.glob(".*.zigfitsio-*.tmp"))
+
+
+def test_astropy_authored_table_metadata_follows_columns(tmp_path):
+    fits = pytest.importorskip("astropy.io.fits")
+    source, target = tmp_path / "source.fits", tmp_path / "target.fits"
+    table = fits.BinTableHDU.from_columns([
+        fits.Column(name="A", format="J", array=[1, 2], unit="s"),
+        fits.Column(name="B", format="2J", array=[[3, 4], [5, 6]], unit="m"),
+    ])
+    table.header["TNULL1"] = (-99, "A null")
+    table.header["TDIM2"] = ("(2)", "B shape")
+    table.header["TDISP2"] = ("I8", "B display")
+    table.header["OBSERVER"] = ("Ada", "observer comment")
+    table.header["HIERARCH OBS CAMERA"] = ("camera-" * 18, "long value comment")
+    table.header.add_history("processing provenance")
+    table.header.add_comment("science comment")
+    fits.HDUList([fits.PrimaryHDU(), table]).writeto(source)
+    with zf.open(source) as hdul:
+        hdul[1].data = hdul[1].data[["B", "A"]]
+        hdul.writeto(target, checksum=True)
+    with fits.open(target, checksum=True) as saved:
+        assert saved[1].header["TUNIT1"] == "m"
+        assert saved[1].header["TUNIT2"] == "s"
+        assert saved[1].header["TNULL2"] == -99
+        assert "TNULL1" not in saved[1].header
+        assert saved[1].header["TDIM1"] == "(2)"
+        assert saved[1].header.comments["TDIM1"] == "B shape"
+        assert saved[1].header["TDISP1"] == "I8"
+        assert saved[1].header["OBS CAMERA"] == "camera-" * 18
+        assert saved[1].header.comments["OBS CAMERA"] == "long value comment"
+        assert saved[1].header["HISTORY"] == "processing provenance"
+        assert saved[1].header["COMMENT"] == "science comment"
+        assert saved[1].verify_checksum() == 1
+        np.testing.assert_array_equal(saved[1].data["B"], [[3, 4], [5, 6]])
+
+
+def test_compressed_image_reconstruction_preserves_science_cards():
+    fits = pytest.importorskip("astropy.io.fits")
+    table = zf.CompImageHDU(data=np.arange(8, dtype="i2").reshape(2, 4), compression="GZIP_1")
+    table.header["OBSERVER"] = ("Ada", "observer comment")
+    table.header["ZP"] = 12.5  # a real user keyword, not a compression descriptor
+    table.header["HISTORY"] = "processing provenance"
+    with fits.open(io.BytesIO(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes())) as saved:
+        assert saved[1].header["OBSERVER"] == "Ada"
+        assert saved[1].header.comments["OBSERVER"] == "observer comment"
+        assert saved[1].header["ZP"] == 12.5
+        assert saved[1].header["HISTORY"] == "processing provenance"
+        np.testing.assert_array_equal(saved[1].data, np.arange(8).reshape(2, 4))
+
+
+@pytest.mark.parametrize("format", ["F12.5", "E16.8", "D20.12"])
+def test_astropy_ascii_reconstruction_keeps_exact_format(tmp_path, format):
+    fits = pytest.importorskip("astropy.io.fits")
+    source, target = tmp_path / "source.fits", tmp_path / "target.fits"
+    table = fits.TableHDU.from_columns([fits.Column(name="X", format=format, array=[1.23456, 9.87654], unit="s")])
+    fits.HDUList([fits.PrimaryHDU(), table]).writeto(source)
+    with zf.open(source) as hdul:
+        original = hdul[1].data["X"].copy()
+        hdul[1].header["NOTE"] = "force reconstruction"
+        hdul.writeto(target)
+    with fits.open(target) as saved:
+        assert saved[1].header["TFORM1"] == format
+        assert saved[1].header["TUNIT1"] == "s"
+        np.testing.assert_allclose(saved[1].data["X"], original, rtol=0, atol=1e-12)
+
+
+def test_astropy_q_vla_reconstruction_keeps_descriptor_and_metadata(tmp_path):
+    fits = pytest.importorskip("astropy.io.fits")
+    source, target = tmp_path / "source.fits", tmp_path / "target.fits"
+    arrays = np.empty(2, dtype=object)
+    arrays[0], arrays[1] = np.array([1, 2], dtype="i4"), np.array([3], dtype="i4")
+    table = fits.BinTableHDU.from_columns([fits.Column(name="X", format="QJ", array=arrays, unit="m")])
+    table.header["TDISP1"] = ("I8", "display comment")
+    fits.HDUList([fits.PrimaryHDU(), table]).writeto(source)
+    with fits.open(source) as original:
+        actual_format = original[1].header["TFORM1"]
+    with zf.open(source) as hdul:
+        hdul[1].header["NOTE"] = "force reconstruction"
+        hdul.writeto(target)
+    with fits.open(target) as saved:
+        assert saved[1].header["TFORM1"] == actual_format.split("(", 1)[0]
+        assert saved[1].header["TUNIT1"] == "m"
+        assert saved[1].header["TDISP1"] == "I8"
+        assert saved[1].header.comments["TDISP1"] == "display comment"
+        np.testing.assert_array_equal(saved[1].data["X"][0], [1, 2])
+        np.testing.assert_array_equal(saved[1].data["X"][1], [3])
+
+
+def _indexed_metadata_source():
+    table = zf.BinTableHDU.from_columns([
+        zf.Column(name, "1J", array=np.array(values, dtype="i4"), unit="s")
+        for name, values in (("A", [1, 2]), ("B", [101, 102]), ("C", [201, 202]))
+    ])
+    cards = {
+        "TNULL1": -99, "TDISP2": "I8", "TDIM3": "(1)",
+        "TLMIN1": 0, "TLMAX2": 109, "TDBIN2": 0.5, "TDMIN1": 1, "TDMAX1": 2,
+        "TCTYP1": "LINEAR", "TCTYP2": "LINEAR", "TCUNI1": "s", "TCRVL2": 20.0,
+        "TCTY1A": "LINEAR", "TCTY2A": "LINEAR", "TCRP1A": 2.0, "TCDE2A": 0.1,
+        "TP1_2A": 0.25, "TCD1_2D": 0.5, "TPV1_0A": 4.0, "TPS2_1A": "parameter",
+        "TCTY3B": "LINEAR", "TCRD3B": 0.01, "EQUI3B": 2000.0,
+        "1CTYP3": "LINEAR", "1CUNI3": "m", "1CTY3C": "LINEAR", "2CNA3C": "axis two",
+        "12PC3C": 0.125, "21CD3D": 0.25, "1PV3_0C": 3.0, "2S3_1C": "lookup",
+        "1V3_XC": 7.0, "WCAX3C": 2, "WCSN3C": "array coordinates", "LONP3C": 180.0,
+        "DOBS3": "2026-09-30", "TRPOS3": "TOPOCENTER",
+        "TLMIN0": 7, "TLMIN01": 8, "1000PC1": 9, "TCTYP1A": "custom",
+        "PC1_2A": 0.75, "OBS CAMERA": "camera",
+    }
+    for key, value in cards.items():
+        table.header[key] = (value, f"comment for {key}")
+    table.header.add_history("metadata provenance")
+    return zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()
+
+
+def test_indexed_table_metadata_follows_columns_axes_and_parameters():
+    with zf.from_bytes(_indexed_metadata_source()) as source:
+        source[1].data = source[1].data[["C", "A", "B"]]
+        with zf.from_bytes(source.to_bytes()) as saved:
+            header = saved[1].header
+            expected = {
+                "TNULL2": -99, "TDISP3": "I8", "TDIM1": "(1)", "TLMIN2": 0,
+                "TLMAX3": 109, "TDBIN3": 0.5, "TCTYP2": "LINEAR", "TCUNI2": "s",
+                "TCRVL3": 20.0, "TCRP2A": 2.0, "TCDE3A": 0.1,
+                "TP2_3A": 0.25, "TCD2_3D": 0.5, "TPV2_0A": 4.0, "TPS3_1A": "parameter",
+                "TCTY1B": "LINEAR", "TCRD1B": 0.01, "EQUI1B": 2000.0,
+                "1CTYP1": "LINEAR", "1CUNI1": "m", "1CTY1C": "LINEAR", "2CNA1C": "axis two",
+                "12PC1C": 0.125, "21CD1D": 0.25, "1PV1_0C": 3.0, "2S1_1C": "lookup",
+                "1V1_XC": 7.0, "WCAX1C": 2, "WCSN1C": "array coordinates", "LONP1C": 180.0,
+                "DOBS1": "2026-09-30", "TRPOS1": "TOPOCENTER",
+                "TLMIN0": 7, "TLMIN01": 8, "1000PC1": 9, "TCTYP1A": "custom",
+                "PC1_2A": 0.75, "OBS CAMERA": "camera",
+            }
+            for key, value in expected.items():
+                assert header[key] == value
+            assert header.comment_of("TP2_3A") == "comment for TP1_2A"
+            assert header.comment_of("12PC1C") == "comment for 12PC3C"
+            assert "TDMIN1" not in header and "TDMAX1" not in header
+            assert "TP1_2A" not in header and "1PV3_0C" not in header
+            assert saved[1].data.dtype.names == ("C", "A", "B")
+            np.testing.assert_array_equal(saved[1].data["A"], [1, 2])
+
+
+def test_indexed_ascii_range_and_pixel_wcs_follow_columns():
+    table = zf.AsciiTableHDU.from_columns([
+        zf.Column("A", "I8", array=np.array([1, 2], dtype="i4")),
+        zf.Column("B", "I8", array=np.array([101, 102], dtype="i4")),
+    ])
+    table.header["TLMIN1"] = 0
+    table.header["TLMIN2"] = 100
+    table.header["TCTY1A"] = "LINEAR"
+    table.header["TCTY2A"] = "LINEAR"
+    table.header["TP1_2A"] = 0.25
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as source:
+        source[1].data = source[1].data[["B", "A"]]
+        with zf.from_bytes(source.to_bytes()) as saved:
+            assert saved[1].header["TLMIN1"] == 100
+            assert saved[1].header["TLMIN2"] == 0
+            assert saved[1].header["TP2_1A"] == 0.25
+            assert "TP1_2A" not in saved[1].header
+
+
+@pytest.mark.parametrize("change", ["remove", "retype", "rename", "clear"])
+def test_indexed_table_metadata_drops_incomplete_wcs_and_stale_columns(change):
+    with zf.from_bytes(_indexed_metadata_source()) as source:
+        table = source[1]
+        if change == "remove":
+            table.data = table.data[["A", "C"]]
+        elif change == "clear":
+            table.data = None
+        else:
+            rec = np.empty(2, dtype=[("A", "i4"), ("D" if change == "rename" else "B", "f8"), ("C", "i4")])
+            for old, new in zip(("A", "B", "C"), rec.dtype.names):
+                rec[new] = table.data[old]
+            table.data = rec
+        with zf.from_bytes(source.to_bytes()) as saved:
+            header = saved[1].header
+            for key in ("TCTYP1", "TCTYP2", "TCTY1A", "TCTY2A", "TP1_2A", "TCD1_2D", "TPV1_0A", "TPS2_1A"):
+                assert key not in header
+            assert "TLMAX2" not in header and "TDISP2" not in header
+            if change != "clear":
+                index = 2 if change == "remove" else 3
+                assert header[f"TCTY{index}B"] == "LINEAR"
+                assert header[f"1CTY{index}C"] == "LINEAR"
+                assert header[f"WCSN{index}C"] == "array coordinates"
+            else:
+                assert header["TFIELDS"] == 0
+                assert "TCTY3B" not in header and "1CTY3C" not in header
+            assert header["1000PC1"] == 9 and header["OBS CAMERA"] == "camera"
+
+
+@pytest.mark.parametrize("attached", [False, True])
+def test_indexed_table_metadata_scaling_change_invalidates_provenance(attached):
+    table = zf.BinTableHDU.from_columns([zf.Column("X", "1I", array=np.array([1, 2], dtype="u2"), unit="s")])
+    table.header["TNULL1"] = -99
+    table.header["TLMIN1"] = 0
+    table.header["TCTYP1"] = "LINEAR"
+    hdul = zf.HDUList([zf.PrimaryHDU(), table])
+    if attached:
+        hdul = zf.from_bytes(hdul.to_bytes())
+        table = hdul[1]
+    try:
+        table.data = np.array([(1,), (2,)], dtype=[("X", "i2")])
+        with zf.from_bytes(hdul.to_bytes()) as saved:
+            header = saved[1].header
+            assert header["TFORM1"] == "1I" and header["TUNIT1"] == "s"
+            for key in ("TZERO1", "TNULL1", "TLMIN1", "TCTYP1"):
+                assert key not in header
+    finally:
+        hdul.close()
+
+
+def test_fresh_detached_indexed_metadata_uses_new_schema_and_measurements():
+    table = zf.BinTableHDU(data=np.array([(3,), (4,)], dtype=[("X", "i4")]))
+    table.header["TDMIN1"] = 3
+    table.header["TDMAX1"] = 4
+    table.header["TLMIN1"] = 0
+    table.header["TNULL9"] = -99
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as saved:
+        assert saved[1].header["TDMIN1"] == 3 and saved[1].header["TDMAX1"] == 4
+        assert saved[1].header["TLMIN1"] == 0 and "TNULL9" not in saved[1].header
+
+
+def test_indexed_table_wcs_keyword_growth_uses_short_alias_or_fails():
+    table = zf.BinTableHDU.from_columns([
+        zf.Column(f"C{i}", "1J", array=np.array([i], dtype="i4")) for i in range(103)
+    ])
+    table.header["TPC1_2A"] = 0.25
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as source:
+        original = source[1].data
+        order = ["C1"] + [f"C{i}" for i in range(2, 101)] + ["C0", "C101", "C102"]
+        source[1].data = original[order]
+        with zf.from_bytes(source.to_bytes()) as saved:
+            assert saved[1].header["TP101_1A"] == 0.25
+        source[1].data = original[[f"C{i}" for i in range(2, 103)] + ["C0", "C1"]]
+        with pytest.raises(zf.FitsHeaderError, match="exceeds eight characters"):
+            source.to_bytes()
+
+
+@pytest.mark.parametrize("table_type,format,override,values", [
+    (zf.BinTableHDU, "1J", "1I", np.array([40000], dtype="i4")),
+    (zf.AsciiTableHDU, "F12.5", "I3", np.array([1.23456], dtype="f8")),
+])
+def test_attached_table_format_comes_from_native_source(table_type, format, override, values):
+    table = table_type.from_columns([zf.Column("X", format, array=values, unit="m")])
+    table.header["TDISP1"] = "I8"
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as source:
+        expected = source[1].data["X"].copy()
+        source[1].header["TFORM1"] = override
+        source[1].header["TUNIT1"] = "s"
+        with zf.from_bytes(source.to_bytes()) as saved:
+            assert saved[1].header["TFORM1"] == format
+            assert saved[1].header["TUNIT1"] == "s"
+            assert saved[1].header["TDISP1"] == "I8"
+            np.testing.assert_array_equal(saved[1].data["X"], expected)
+
+
+@pytest.mark.parametrize("descriptor", ["P", "Q"])
+@pytest.mark.parametrize("emission", ["attached", "builder_arrays", "builder_replacement"])
+def test_materialized_vla_omits_stale_maximum(descriptor, emission):
+    format = f"1{descriptor}J(2)"
+    cells = np.empty(1, dtype=object)
+    cells[0] = np.array([1, 2], dtype="i4")
+    table = zf.BinTableHDU.from_columns([zf.Column("X", format, array=cells, unit="m")])
+    table.header["TDISP1"] = ("I8", "display comment")
+    hdul = zf.HDUList([zf.PrimaryHDU(), table])
+    if emission == "attached":
+        def build(handle):
+            ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
+            ll.check(ll.lib.zf_create_tbl_heap(
+                handle, ll.BINARY_TBL, 1, 1, (c.c_char_p * 1)(b"X"),
+                (c.c_char_p * 1)(format.encode()), (c.c_char_p * 1)(b"m"), None, 8,
+            ))
+            t = c.c_void_p()
+            ll.check(ll.lib.zf_table_open(handle, c.byref(t)))
+            try:
+                ll.check(ll.lib.zf_write_col_vla(t, ll.ZF_INT32, 0, 1, core._ptr(cells[0]), 2))
+            finally:
+                ll.lib.zf_table_close(t)
+            ll.check(ll.lib.zf_write_key_str(handle, b"TDISP1", 6, b"I8", 2, b"display comment", 15))
+        raw = _bytes_from(build)
+        hdul = zf.from_bytes(raw)
+        assert hdul.to_bytes() == raw  # pristine bounded descriptors remain exact
+        table = hdul[1]
+        table.data["X"][0] = np.arange(1, 6, dtype="i4")
+    elif emission == "builder_arrays":
+        cells[0] = np.arange(1, 6, dtype="i4")
+    else:
+        replacement = np.empty(1, dtype=[("X", object)])
+        replacement["X"][0] = np.arange(1, 6, dtype="i4")
+        table.data = replacement
+    try:
+        with zf.from_bytes(hdul.to_bytes()) as saved:
+            assert saved[1].header["TFORM1"] == f"1{descriptor}J"
+            assert saved[1].header["TUNIT1"] == "m"
+            assert saved[1].header["TDISP1"] == "I8"
+            assert saved[1].header.comment_of("TDISP1") == "display comment"
+            np.testing.assert_array_equal(saved[1].data["X"][0], [1, 2, 3, 4, 5])
+    finally:
+        hdul.close()
+
+
+@pytest.mark.parametrize("change", ["reorder", "remove", "retype"])
+def test_indexed_table_wcs_cross_reference_tracks_target_survival(change):
+    table = zf.BinTableHDU.from_columns([
+        zf.Column(name, "1J", array=np.array([i], dtype="i4")) for i, name in enumerate(("A", "B", "C"))
+    ])
+    for key, value in {
+        "1CTY1B": "LINEAR", "WCST1B": "XREF", "WCSX2A": "XREF", "WCSX3A": "xref",
+        "1CTY2C": "LINEAR", "CUSTOM": "XREF",
+    }.items():
+        table.header[key] = (value, f"comment for {key}")
+    with zf.from_bytes(zf.HDUList([zf.PrimaryHDU(), table]).to_bytes()) as source:
+        data = source[1].data
+        if change == "reorder":
+            source[1].data = data[["C", "B", "A"]]
+        elif change == "remove":
+            source[1].data = data[["B", "C"]]
+        else:
+            replacement = np.empty(1, dtype=[("A", "f8"), ("B", "i4"), ("C", "i4")])
+            for name in replacement.dtype.names:
+                replacement[name] = data[name]
+            source[1].data = replacement
+        with zf.from_bytes(source.to_bytes()) as saved:
+            header = saved[1].header
+            if change == "reorder":
+                assert header["WCST3B"] == header["WCSX2A"] == "XREF"
+                assert header["1CTY3B"] == "LINEAR"
+                assert header["WCSX1A"] == "xref"
+                assert header.comment_of("WCSX2A") == "comment for WCSX2A"
+            else:
+                ref_index, case_index = (1, 2) if change == "remove" else (2, 3)
+                assert f"WCSX{ref_index}A" not in header
+                assert "WCST1B" not in header and "1CTY1B" not in header
+                assert header[f"WCSX{case_index}A"] == "xref"
+            independent_index = 1 if change == "remove" else 2
+            assert header[f"1CTY{independent_index}C"] == "LINEAR"
+            assert header["CUSTOM"] == "XREF"

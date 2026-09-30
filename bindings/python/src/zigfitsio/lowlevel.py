@@ -387,7 +387,12 @@ _PROTOS = [
     # lifecycle
     ("zf_open_file", INT, [CHARP, SZ, INT, VOID, PVOID]),
     ("zf_create_file", INT, [CHARP, SZ, VOID, PVOID]),
+    ("zf_create_file_handle_v1", INT, [SZ, VOID, PVOID]),
     ("zf_open_memory", INT, [CHARP, SZ, INT, VOID, PVOID]),
+    ("zf_wopen_memory_begin_v1", INT, [SZ, PVOID, PVOID]),
+    ("zf_wopen_memory_begin_v2", INT, [SZ, VOID, PVOID, PVOID]),
+    ("zf_wopen_memory_commit_v1", INT, [VOID, INT, VOID, PVOID]),
+    ("zf_wopen_memory_abort_v1", None, [VOID]),
     ("zf_create_memory", INT, [VOID, PVOID]),
     ("zf_open_gzip", INT, [CHARP, SZ, VOID, PVOID]),
     ("zf_flush", INT, [VOID]),
@@ -491,9 +496,20 @@ _PROTOS = [
 ]
 
 
+_OPTIONAL_SYMBOLS = {
+    "zf_create_file_handle_v1",
+    "zf_wopen_memory_begin_v1", "zf_wopen_memory_begin_v2",
+    "zf_wopen_memory_commit_v1", "zf_wopen_memory_abort_v1",
+}
+
+
 def _declare() -> None:
     for name, restype, argtypes in _PROTOS:
-        fn = getattr(lib, name)
+        fn = getattr(lib, name, None)
+        if fn is None and name in _OPTIONAL_SYMBOLS:
+            continue
+        if fn is None:
+            raise AttributeError(f"required native symbol {name} is missing")
         fn.restype = restype
         fn.argtypes = argtypes
 

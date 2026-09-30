@@ -5,7 +5,7 @@
  * `values` is a flat TypedArray (numeric; `nrows*repeat` elements, complex
  * interleaved re/im), a `string[]`, or a per-row array of TypedArrays (VLA).
  */
-import { FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
+import { FitsHeaderError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import {
@@ -16,7 +16,7 @@ import {
   isTableStructuralKeyword,
   type HDUOptions,
 } from "./hdu.js";
-import type { HeaderMutation } from "./header.js";
+import type { Header, HeaderMutation } from "./header.js";
 import type { ElementOf } from "./fitsarray.js";
 import { decOut, enc, viewBytes } from "./util.js";
 
@@ -262,6 +262,11 @@ function vlaElemDtype(fmt: string): { dtype: dt.Dtype; isComplex: boolean } {
   return letter ? dt.binElemDtype(letter) : { dtype: "f8", isComplex: false };
 }
 
+/** Keep the VLA storage type, dropping a maximum that materialized cells may exceed. */
+function withoutVlaMax(fmt: string): string {
+  return fmt.trim().toUpperCase().match(/^([0-9]*[PQ][A-Z])\([0-9]+\)$/)?.[1] ?? fmt;
+}
+
 /**
  * Rebuild a binary-table TFORM string from column metadata (for
  * reconstructing an attached table on copy). The unsigned-integer convention
@@ -357,6 +362,102 @@ function binaryTformFor(info: ll.ColInfo | undefined, cd: ColumnData): string {
   if (info === undefined) return synth; // added/renamed column with no file counterpart
   const have = tformOf(info); // a scaled column throws here (unreconstructable) — preserved as today
   return tformInterchangeable(have, synth) ? have : synth;
+}
+
+type TableWcsKind = "pixel" | "array" | "shared" | "column" | null;
+interface TableMetadataKey {
+  match: RegExpExecArray;
+  columnGroups: readonly number[];
+  kind: TableWcsKind;
+  alternate: string;
+}
+
+// FITS 4.0 Table 22: n/k are columns; i/j are axes and m is a parameter.
+// Each grammar identifies only the capture groups containing column numbers.
+const META_COL = "([1-9][0-9]{0,2})";
+const META_AXIS = "([1-9][0-9]?)";
+const META_PARAM = "(0|[1-9][0-9]?)";
+const TABLE_METADATA: readonly [RegExp, readonly number[], TableWcsKind, number | null][] = (
+  [
+    ["(TNULL|TDISP|TDIM|TLMIN|TLMAX|TDMIN|TDMAX|TDBIN)" + META_COL, [2], null, null],
+    ["(TCTYP|TCUNI|TCRVL|TCDLT|TCRPX|TCROT|TCZPH|TCPER)" + META_COL, [2], "pixel", null],
+    ["(TCTY|TCUN|TCRV|TCDE|TCRP|TCNA|TCRD|TCSY|TCZP|TCPR)" + META_COL + "([A-Z]?)", [2], "pixel", 3],
+    ["(TPC|TP|TCD|TC)" + META_COL + "_" + META_COL + "([A-Z]?)", [2, 3], "pixel", 4],
+    ["(TPV|TV|TPS|TS)" + META_COL + "_" + META_PARAM + "([A-Z]?)", [2], "pixel", 4],
+    [META_AXIS + "(CTYP|CUNI|CRVL|CDLT|CRPX|CROT|CZPH|CPER|CRDE|CSYE)" + META_COL, [3], "array", null],
+    [META_AXIS + "(CTY|CUN|CRV|CDE|CRP|CNA|CRD|CSY|CZP|CPR)" + META_COL + "([A-Z]?)", [3], "array", 4],
+    ["((?:[1-9][0-9]?){2})(PC|CD)" + META_COL + "([A-Z]?)", [3], "array", 4],
+    [META_AXIS + "(PV|V|PS|S)" + META_COL + "_" + META_PARAM + "([A-Z]?)", [3], "array", 5],
+    [META_AXIS + "V" + META_COL + "_X([A-Z]?)", [2], "array", 3],
+    ["(WCAX|WCST|WCSX)" + META_COL + "([A-Z]?)", [2], "array", 3],
+    ["(WCSN|WCS|TWCS|LONP|LATP|EQUI|RADE|RFRQ|RWAV|SPEC|SOBS|SSRC|VSYS|ZSOU|VANG)" + META_COL + "([A-Z]?)", [2], "shared", 3],
+    ["(OBSGX|OBSGY|OBSGZ|DOBS|MJDOB|DAVG|MJDA|TRPOS|TRDIR)" + META_COL, [2], "column", null],
+  ] as [string, readonly number[], TableWcsKind, number | null][]
+).map(([pattern, groups, kind, alternate]) => [new RegExp(`^(?:${pattern})$`, "d"), groups, kind, alternate]);
+
+function tableMetadataKey(up: string): TableMetadataKey | null {
+  if (up.length > 8) return null; // HIERARCH/custom names are not this reserved grammar.
+  for (const [pattern, columnGroups, kind, alternateGroup] of TABLE_METADATA) {
+    const match = pattern.exec(up);
+    if (match !== null) return { match, columnGroups, kind, alternate: alternateGroup === null ? "" : match[alternateGroup] };
+  }
+  return null;
+}
+
+function tableMetadataMutations(
+  header: Header, ncols: number, srcIndex: readonly (number | null)[] | null,
+): { keys: Set<string>; mutations: HeaderMutation[] } {
+  const columnMap = new Map<number, number>();
+  if (srcIndex === null) {
+    for (let i = 1; i <= ncols; i++) columnMap.set(i, i);
+  } else {
+    srcIndex.forEach((old, index) => { if (old !== null) columnMap.set(old + 1, index + 1); });
+  }
+  const parsed: { card: ReturnType<Header["cards"]>[number]; metadata: TableMetadataKey }[] = [];
+  for (const card of header.cards()) {
+    const metadata = tableMetadataKey(card[0].toUpperCase());
+    if (metadata !== null) parsed.push({ card, metadata });
+  }
+  const arrayColumns = new Set(parsed.filter(({ metadata }) => metadata.kind === "array").map(({ metadata }) =>
+    `${metadata.match[metadata.columnGroups[0]]}:${metadata.alternate}`));
+  const wcsGroup = ({ match, columnGroups, kind, alternate }: TableMetadataKey): string => {
+    const column = Number(match[columnGroups[0]]);
+    if (kind === "shared") kind = arrayColumns.has(`${column}:${alternate}`) ? "array" : "pixel";
+    return kind === "array" || kind === "column" ? `${kind}:${alternate}:${column}` : `pixel:${alternate}`;
+  };
+  const hasMissingColumn = ({ match, columnGroups }: TableMetadataKey): boolean =>
+    columnGroups.some((group) => !columnMap.has(Number(match[group])));
+  const droppedWcs = new Set(parsed.filter(({ metadata }) => metadata.kind !== null && hasMissingColumn(metadata))
+    .map(({ metadata }) => wcsGroup(metadata)));
+  // WCST/WCSX resolve by their case-sensitive string labels, even across alternates.
+  const knownLabels = new Set<string>(), survivingLabels = new Set<string>();
+  for (const { card: [, value], metadata } of parsed) {
+    if (metadata.match[1] !== "WCST" || typeof value !== "string") continue;
+    knownLabels.add(value);
+    if (!droppedWcs.has(wcsGroup(metadata))) survivingLabels.add(value);
+  }
+  for (const { card: [, value], metadata } of parsed) {
+    if (metadata.match[1] === "WCSX" && typeof value === "string" && knownLabels.has(value) && !survivingLabels.has(value)) {
+      droppedWcs.add(wcsGroup(metadata));
+    }
+  }
+  const mutations: HeaderMutation[] = [];
+  for (const { card: [, value, comment], metadata } of parsed) {
+    const { match, columnGroups, kind } = metadata;
+    if (hasMissingColumn(metadata) || (kind !== null && droppedWcs.has(wcsGroup(metadata)))) continue;
+    // ponytail: flush fingerprints are mutable baselines, so drop inherited measurements
+    // on reconstruction; retain them only with immutable content provenance.
+    if (srcIndex !== null && (match[1] === "TDMIN" || match[1] === "TDMAX")) continue;
+    let key = match[0];
+    for (const group of [...columnGroups].reverse()) {
+      const [start, end] = match.indices![group]!;
+      key = key.slice(0, start) + columnMap.get(Number(match[group]))! + key.slice(end);
+    }
+    if (key.length > 8 && /^(TPC|TCD)/.test(key)) key = key.slice(0, 2) + key.slice(3);
+    if (key.length > 8) throw new FitsHeaderError(207, `remapped table WCS keyword ${JSON.stringify(key)} exceeds eight characters`);
+    mutations.push({ type: "upsert", key, value, comment: comment || null });
+  }
+  return { keys: new Set(parsed.map(({ card }) => card[0].toUpperCase())), mutations };
 }
 
 // ── write-side array normalization ──
@@ -715,7 +816,8 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
   // Stored untyped (default shape); the column-shape `T` is a compile-time
   // contract surfaced only at the public `data` boundary.
   /** @internal */ _data: TableData | null | typeof DATA_UNSET = DATA_UNSET;
-  /** @internal */ _columns: Column[] = [];
+  /** @internal Detached builder blueprint, including an explicitly empty schema. */
+  _columns: Column[] | null = null;
   /** @internal */ _nrows = 0;
   /** @internal Per-column baselines for update-mode in-place write-back. */
   _colFingerprints: Map<string, bigint> | null = null;
@@ -838,7 +940,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
 
   /** Column names for an attached table; the builder `Column`s for a detached one. */
   get columns(): string[] | Column[] {
-    return this._hdulist !== null ? this._readColumnsMeta() : this._columns;
+    return this._hdulist !== null ? this._readColumnsMeta() : this._columns ?? [];
   }
 
   private _readColumnsMeta(): string[] {
@@ -987,35 +1089,58 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    * @internal (columns, nrows) to serialize: the builder columns for a
    * detached HDU, or columns reconstructed from the live table for an
    * attached one (so a copied table keeps its rows). For the attached path,
-   * `srcIndex[i]` is the FILE column index whose stored format the emitted
+   * `srcIndex[i]` is the source column index whose stored format and scaling the emitted
    * column `i` still uses (null for an added/renamed/retyped column), so
-   * _writeTo can move that column's indexed metadata cards (TNULLn/TDISPn/
-   * TDIMn) to the column's new position; null srcIndex = detached path,
+   * _writeTo can move that column's indexed metadata and WCS to its new position;
+   * null srcIndex means a fresh detached schema,
    * where indexed cards already refer to the emitted order.
    */
   _emitColumns(): { cols: Column[]; nrows: number; srcIndex: (number | null)[] | null } {
-    if (this._columns.length > 0) {
+    if (this._hdulist === null && this._data === DATA_UNSET && this._columns !== null) {
       assertUniqueColumnNames(this._columns.map((col) => col.name));
-      return { cols: [...this._columns], nrows: this._nrows, srcIndex: null };
+      const cols = this._columns.map((col) => new Column(col.name, withoutVlaMax(col.format), {
+        array: col.array, unit: col.unit ?? undefined,
+      }));
+      return { cols, nrows: this._nrows, srcIndex: null };
     }
     const data = this.data;
-    if (data === null) return { cols: [], nrows: 0, srcIndex: null };
+    if (data === null) return { cols: [], nrows: 0, srcIndex: [] };
     if (this._hdulist === null) {
       // A detached HDU carrying a TableData: synthesize every TFORM from the
       // column data (there is no file column to reuse). Previously this fell
       // into the builder-columns early-return and silently emitted an EMPTY table.
-      if (this._tableType === ll.ASCII_TBL) {
-        throw new NotSupportedError(
-          410,
-          "cannot synthesize ASCII-table formats from TableData; build the table with AsciiTableHDU.fromColumns(...)",
-        );
-      }
-      const cols = data.names.map(
-        (name) => new Column(name, binaryTformFor(undefined, data.column(name)), { array: data.get(name) as ColumnArray }),
-      );
-      return { cols, nrows: data.nrows, srcIndex: null };
+      const specs = new Map((this._columns ?? []).map((col, index) => [col.name, { col, index }]));
+      const srcIndex: (number | null)[] = [];
+      const cols = data.names.map((name) => {
+        const entry = specs.get(name);
+        const cd = data.column(name);
+        let fmt: string;
+        if (this._tableType === ll.ASCII_TBL) {
+          if (entry === undefined) {
+            throw new NotSupportedError(410, "assigned ASCII-table data requires an existing Column format for every field");
+          }
+          fmt = entry.col.format;
+        } else {
+          fmt = binaryTformFor(undefined, cd);
+          if (entry !== undefined) {
+            const have = entry.col.format.trim().toUpperCase();
+            if (/[PQ]/.test(have)) {
+              if (cd.kind === "vla" && vlaElemDtype(have).dtype === cd.dtype) fmt = withoutVlaMax(entry.col.format);
+            } else if (cd.kind !== "vla" && tformInterchangeable(have, fmt)) {
+              fmt = entry.col.format;
+            }
+          }
+        }
+        const col = new Column(name, fmt, { array: data.get(name) as ColumnArray, unit: entry?.col.unit ?? undefined });
+        const compatible = entry !== undefined && fmt === withoutVlaMax(entry.col.format) && unsignedColTzeroOf(col) === unsignedColTzeroOf(entry.col);
+        srcIndex.push(compatible ? entry.index : null);
+        return col;
+      });
+      return { cols, nrows: data.nrows, srcIndex: this._columns === null ? null : srcIndex };
     }
     const h = this._select();
+    // Structural edits on a read-only public Header do not change the source layout.
+    const sourceHeader = this._readHeader();
     return withTable(h, (t) => {
       const ncolsOut = ll.outI32();
       ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
@@ -1031,6 +1156,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       const srcIndex: (number | null)[] = [];
       for (const name of data.names) {
         const entry = fileInfo.get(name);
+        const actualFmt = entry === undefined ? undefined : sourceHeader.get(`TFORM${entry.index + 1}`);
         let fmt: string;
         if (this._tableType === ll.ASCII_TBL) {
           if (entry === undefined) {
@@ -1040,21 +1166,26 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
                 "TableData; rebuild the table with AsciiTableHDU.fromColumns(...)",
             );
           }
-          fmt = asciiTformOf(entry.info);
+          fmt = typeof actualFmt === "string" ? actualFmt : asciiTformOf(entry.info);
         } else {
           fmt = binaryTformFor(entry?.info, data.column(name));
+          if (entry !== undefined && fmt === tformOf(entry.info) && typeof actualFmt === "string") fmt = withoutVlaMax(actualFmt);
         }
         // The unit rides the COLUMN, not its position: thread the source
         // TUNITn through the builder Column so zf_create_tbl re-emits it at
         // the column's new index (TUNITn itself is structural-skipped). A
         // retyped column keeps its unit — the physical quantity is unchanged.
         const unit = entry !== undefined ? this.header.get(`TUNIT${entry.index + 1}`) : undefined;
-        cols.push(new Column(name, fmt, { array: data.get(name) as ColumnArray, unit: typeof unit === "string" ? unit : undefined }));
+        const col = new Column(name, fmt, { array: data.get(name) as ColumnArray, unit: typeof unit === "string" ? unit : undefined });
+        cols.push(col);
         // Indexed metadata describes the STORED cells, so it only survives
         // when the emitted format is still the file column's own (a retyped
         // column's old TNULL sentinel / display / shape no longer apply).
-        const fileFmt = entry === undefined ? null : this._tableType === ll.ASCII_TBL ? asciiTformOf(entry.info) : tformOf(entry.info);
-        srcIndex.push(entry !== undefined && fmt === fileFmt ? entry.index : null);
+        const fileFmt = typeof actualFmt === "string" ? actualFmt : entry === undefined ? null :
+          this._tableType === ll.ASCII_TBL ? asciiTformOf(entry.info) : tformOf(entry.info);
+        const compatible = entry !== undefined && fileFmt !== null && fmt === withoutVlaMax(fileFmt) && entry.info.tscal === 1 &&
+          entry.info.tzero === (unsignedColTzeroOf(col) ?? 0);
+        srcIndex.push(compatible ? entry.index : null);
       }
       return { cols, nrows: data.nrows, srcIndex };
     });
@@ -1085,37 +1216,12 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       if (tz !== null) writeConventionOffset(handle, `TZERO${i + 1}`, tz);
     }
 
-    // Re-emit the user header cards (science keywords, COMMENT/HISTORY, HIERARCH)
-    // that zf_create_tbl does not carry, skipping the column descriptors it
-    // already wrote — mirroring ImageHDU._writeTo so a reconstruction save does
-    // not silently drop table metadata. On the attached reconstruction path
-    // (srcIndex set), indexed per-column cards are skipped from the verbatim
-    // pass too: their index refers to the SOURCE column order, and a by-name
-    // reorder/subset would leave them labeling the wrong column (a TNULLn on a
-    // float column is even spec-invalid). They are re-emitted below at each
-    // column's new position instead.
-    const remappedMetadata: HeaderMutation[] = [];
-    if (srcIndex !== null) {
-      for (let i = 0; i < srcIndex.length; i++) {
-        const j = srcIndex[i];
-        if (j === null) continue; // added/renamed/retyped: the old cards no longer describe it
-        for (const base of ["TNULL", "TDISP", "TDIM"] as const) {
-          const v = this.header.get(`${base}${j + 1}`);
-          if (v === undefined || v === null) continue;
-          remappedMetadata.push({
-            type: "upsert",
-            key: `${base}${i + 1}`,
-            value: v,
-            comment: this.header.commentOf(`${base}${j + 1}`) || null,
-          });
-        }
-      }
-    }
-    const indexedMeta = /^T(NULL|DISP|DIM)\d+$/;
+    // Ordinary science/commentary cards copy verbatim; column metadata follows provenance.
+    const { keys, mutations } = tableMetadataMutations(this.header, n, srcIndex);
     this._applyUserKeys(
       handle,
-      (up) => isTableStructuralKeyword(up) || (srcIndex !== null && indexedMeta.test(up)),
-      remappedMetadata,
+      (up) => isTableStructuralKeyword(up) || keys.has(up),
+      mutations,
     );
 
     withTable(handle, (t) => {

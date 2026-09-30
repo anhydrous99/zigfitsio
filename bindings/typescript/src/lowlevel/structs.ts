@@ -31,9 +31,21 @@ export interface OpenOptions {
 
 const toU64 = (v: number | bigint | undefined): bigint => (v === undefined ? 0n : BigInt(v));
 
+/** Effective payload allocation ceiling; zero selects the native default. */
+export function effectiveOpenAlloc(opts?: OpenOptions | null): bigint {
+  const value = opts?.maxOpenAlloc;
+  if (typeof value === "number" && (!Number.isSafeInteger(value) || value < 0)) {
+    throw new RangeError("maxOpenAlloc must be a nonnegative safe integer or bigint");
+  }
+  const cap = value === undefined ? 0n : BigInt(value);
+  if (cap < 0n || cap > 0xffff_ffff_ffff_ffffn) throw new RangeError("maxOpenAlloc is outside uint64");
+  return cap === 0n ? 0x1_0000_0000n : cap;
+}
+
 /** Encode `opts` as a 72-byte ZfOpenOpts, or return null (⇒ NULL pointer, all defaults). */
 export function encodeOpenOpts(opts?: OpenOptions | null): Uint8Array | null {
   if (opts == null) return null;
+  effectiveOpenAlloc(opts);
   const buf = new ArrayBuffer(72);
   const i32 = new Int32Array(buf); // element index = byte offset / 4
   const u32 = new Uint32Array(buf);

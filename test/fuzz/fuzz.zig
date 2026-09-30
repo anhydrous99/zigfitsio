@@ -127,7 +127,7 @@ fn fuzzGzip(_: void, smith: *Smith) anyerror!void {
 // anywhere in the serialized file and re-read it through `TiledImage`. Mutating near-valid
 // files reaches the ZIMAGE header/tile-table/decode seams that fully random bytes almost never
 // assemble. Contract: typed error or bounded success on every mutation.
-fn fuzzTileMutation(_: void, smith: *Smith) anyerror!void {
+fn fuzzTileMutation(decoded: ?*usize, smith: *Smith) anyerror!void {
     var raw: [16]u8 = undefined;
     smith.bytesWithHash(&raw, 0x08);
 
@@ -174,32 +174,112 @@ fn fuzzTileMutation(_: void, smith: *Smith) anyerror!void {
     var ti = fits.TiledImage.of(&f2, hdu) catch return;
     defer ti.deinit(alloc);
     var out: [64]f64 = undefined;
-    if (ti.elementCount() == out.len) ti.readAll(f64, &out) catch {};
+    if (ti.elementCount() == out.len) {
+        ti.readAll(f64, &out) catch return;
+        if (decoded) |count| count.* += 1;
+    }
+}
+
+// Smith.sliceWithHash consumes a little-endian u32 length BEFORE the payload. Raw codec/FITS
+// bytes would otherwise be interpreted as the length, usually reducing a seed to empty input.
+fn sliceSeed(payload: []const u8, hash: u32) ![]u8 {
+    const seed = try alloc.alloc(u8, 4 + payload.len);
+    errdefer alloc.free(seed);
+    std.mem.writeInt(u32, seed[0..4], @intCast(payload.len), .little);
+    @memcpy(seed[4..], payload);
+    var smith: Smith = .{ .in = seed };
+    const probe = try alloc.alloc(u8, payload.len);
+    defer alloc.free(probe);
+    try std.testing.expectEqual(payload.len, smith.sliceWithHash(probe, hash));
+    try std.testing.expectEqualSlices(u8, payload, probe);
+    return seed;
 }
 
 test "fuzz: card parser" {
-    try std.testing.fuzz({}, fuzzCard, .{});
+    var valid = [_]u8{' '} ** 80;
+    @memcpy(valid[0..30], "SIMPLE  =                    T");
+    _ = try fits.Card.parse(&valid);
+    try std.testing.fuzz({}, fuzzCard, .{ .corpus = &.{ &valid, &([_]u8{0xff} ** 80) } });
 }
 test "fuzz: TFORM parser" {
-    try std.testing.fuzz({}, fuzzTform, .{});
+    const valid = try sliceSeed("1PJ(64)", 0x02);
+    defer alloc.free(valid);
+    const hostile = try sliceSeed("999999999999999999999J", 0x02);
+    defer alloc.free(hostile);
+    _ = try fits.table_common.BinTform.parse("1PJ(64)");
+    try std.testing.fuzz({}, fuzzTform, .{ .corpus = &.{ valid, hostile } });
 }
 test "fuzz: whole-file open + HDU walk" {
-    try std.testing.fuzz({}, fuzzOpen, .{});
+    const block = try block2880(&.{ "SIMPLE  =                    T", "BITPIX  =                    8", "NAXIS   =                    0", "END" });
+    defer alloc.free(block);
+    const seed = try sliceSeed(block, 0x03);
+    defer alloc.free(seed);
+    var mem = try fits.MemoryDevice.initBytes(alloc, block);
+    defer mem.deinit();
+    var f = try fits.open(alloc, mem.device(), .read_only, .{});
+    defer f.deinit();
+    try std.testing.expectEqual(1, try f.hduCount());
+    try std.testing.fuzz({}, fuzzOpen, .{ .corpus = &.{ seed, seed[0 .. seed.len - 80] } });
 }
 test "fuzz: HCOMPRESS_1 decoder" {
-    try std.testing.fuzz({}, fuzzHcompress, .{});
+    const pixels = [_]i32{7} ** 64;
+    const encoded = try fits.hcompress.compress(alloc, &pixels, 8, 8, 0);
+    defer alloc.free(encoded);
+    const decoded = try fits.hcompress.decompress(alloc, encoded, 64, .{});
+    defer alloc.free(decoded.data);
+    try std.testing.expectEqual(64, decoded.data.len);
+    const seed = try sliceSeed(encoded, 0x04);
+    defer alloc.free(seed);
+    try std.testing.fuzz({}, fuzzHcompress, .{ .corpus = &.{ seed, seed[0 .. seed.len - 1] } });
 }
 test "fuzz: RICE_1 decoder" {
-    try std.testing.fuzz({}, fuzzRice, .{});
+    var seeds: [3][]u8 = undefined;
+    var count: usize = 0;
+    defer for (seeds[0..count]) |seed| alloc.free(seed);
+    inline for (.{ 1, 2, 4 }, 0..) |bytepix, i| {
+        const pixels = [_]u8{0xff} ** (256 * bytepix);
+        const encoded = try fits.rice.compress(alloc, &pixels, bytepix, 32);
+        defer alloc.free(encoded);
+        const decoded = try fits.rice.decompress(alloc, encoded, 256, bytepix, 32);
+        defer alloc.free(decoded);
+        try std.testing.expectEqualSlices(u8, &pixels, decoded);
+        seeds[i] = try sliceSeed(encoded, 0x05);
+        count += 1;
+    }
+    try std.testing.fuzz({}, fuzzRice, .{ .corpus = &seeds });
 }
 test "fuzz: PLIO_1 decoder" {
-    try std.testing.fuzz({}, fuzzPlio, .{});
+    // The first header byte is zero, so this harness requests exactly one pixel.
+    const encoded = try fits.plio.compress(alloc, &.{7});
+    defer alloc.free(encoded);
+    const decoded = try fits.plio.decompress(alloc, encoded, 1);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(i32, &.{7}, decoded);
+    const seed = try sliceSeed(encoded, 0x06);
+    defer alloc.free(seed);
+    try std.testing.fuzz({}, fuzzPlio, .{ .corpus = &.{ seed, seed[0 .. seed.len - 1] } });
 }
 test "fuzz: GZIP_1/GZIP_2 decoder" {
-    try std.testing.fuzz({}, fuzzGzip, .{});
+    const pixels = "valid gzip seed!";
+    const encoded = try fits.gzip.gzipEncode(alloc, pixels);
+    defer alloc.free(encoded);
+    const decoded = try fits.gzip.gzipDecode(alloc, encoded, 1 << 16);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, pixels, decoded);
+    const seed = try sliceSeed(encoded, 0x07);
+    defer alloc.free(seed);
+    try std.testing.fuzz({}, fuzzGzip, .{ .corpus = &.{ seed, seed[0 .. seed.len - 1] } });
 }
 test "fuzz: compressed-HDU byte mutation" {
-    try std.testing.fuzz({}, fuzzTileMutation, .{});
+    const seeds = [3][16]u8{ [_]u8{0} ** 16, .{1} ++ [_]u8{0} ** 15, .{2} ++ [_]u8{0} ** 15 };
+    // Four equal flips cancel: each codec seed must reach a successful complete tile decode.
+    var decoded: usize = 0;
+    for (&seeds) |*seed| {
+        var smith: Smith = .{ .in = seed };
+        try fuzzTileMutation(&decoded, &smith);
+    }
+    try std.testing.expectEqual(3, decoded);
+    try std.testing.fuzz(@as(?*usize, null), fuzzTileMutation, .{ .corpus = &.{ &seeds[0], &seeds[1], &seeds[2] } });
 }
 
 // ── deterministic hostile-input seeds (validate-before-allocate, NFR-SAFE-1) ─────────────

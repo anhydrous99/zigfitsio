@@ -18,7 +18,7 @@ BUILD  := build
 GEN    := $(BUILD)/gen_sources
 CMP    := $(GOLDEN)/compress
 
-.PHONY: golden normalize verify clean
+.PHONY: golden normalize verify benchmark clean
 
 golden: $(GEN)
 	@mkdir -p $(GOLDEN)/images $(GOLDEN)/tables $(CMP) $(GOLDEN)/wcs \
@@ -80,6 +80,13 @@ CFITSIO_LIBS   ?= $(shell pkg-config --libs cfitsio 2>/dev/null || echo -L$(CFIT
 $(GEN): c/gen_sources.c
 	@mkdir -p $(BUILD)
 	$(CC) c/gen_sources.c $(CFITSIO_CFLAGS) $(CFITSIO_LIBS) -o $(GEN)
+
+$(BUILD)/bench_memory: c/bench_memory.c
+	@mkdir -p $(BUILD)
+	$(CC) -O3 -DNDEBUG c/bench_memory.c $(CFITSIO_CFLAGS) $(CFITSIO_LIBS) -o $@
+
+benchmark: $(BUILD)/bench_memory
+	$(PYTHON) bench_compare.py
 
 # Strip wall-clock cards (DATE) and timestamp text from any committed golden, in place, so the
 # bytes are reproducible. A no-op on the clean pipeline above; here as a hard invariant.

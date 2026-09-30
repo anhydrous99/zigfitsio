@@ -8,7 +8,8 @@ notes and the wheels + sdist attached. The same tag also runs
 `.github/workflows/typescript.yml`, which builds the single `zigfitsio.wasm` module and
 publishes the one `zigfitsio` npm package via npm trusted publishing. Both publisher
 workflows generate and validate the Zig, Python, and TypeScript API references before an
-external upload. The Python workflow retains that exact validated bundle as an artifact. After
+external upload. Both workflows also run external CFITSIO/Astropy interop on the release's own
+SHA. The Python workflow retains that exact validated bundle as an artifact. After
 both workflows succeed for the same tag and commit, `.github/workflows/publish-wiki.yml`
 downloads the artifact from the gate-selected Python run, publishes its Markdown to the GitHub
 Wiki, and attaches an immutable API-reference archive to the GitHub Release.
@@ -17,14 +18,18 @@ Wiki, and attaches an immutable API-reference archive to the GitHub Release.
 version-check ──┐
 api-docs ───────┤
 zig-test ───────┤  (tag/dispatch only)
+external-interop┤  (tag/dispatch only, same source SHA)
 wheels (×5) ────┼──► publish-pypi ──► github-release        [tag pushes]
-sdist ──────────┤ └─► publish-testpypi                      [manual dispatch]
+sdist + rebuild ┤ └─► publish-testpypi                      [manual dispatch]
 smoke ──────────┘
 
 version-check ──┐
 api-docs ───────┤  (tag/dispatch only)
-test (×6) ──────┼──► publish-npm                            [tag pushes]
-interop ────────┘ └─► publish-rehearsal (--dry-run)         [manual dispatch]
+test (×5) ──────┤  (Node 24 Vitest + Bun)
+interop ────────┤
+external-interop┤  (tag/dispatch only, same source SHA)
+pack once ─► Node 18.0.0/20 consumers + Chrome ─► publish-npm [tag pushes]
+               └─► same tested archive ─► publish-rehearsal [manual dispatch]
 
 python api-docs artifact ─┐
 github-release ─────────┤
@@ -39,6 +44,15 @@ before the publishing job receives write permission. That privileged job checks 
 only the trusted default branch; tagged code runs in the unprivileged Python workflow, and its
 artifact is accepted only as data after its release metadata, exact allowed filenames,
 managed-page hashes, and page ownership are validated again.
+
+Wheel tests require installed package and bundled-library provenance instead of importing the
+checkout. The sdist job extracts the archive into a temporary directory, builds and installs a
+wheel there, and runs the same strict installed suite. The npm package job runs `npm pack` once;
+Node 18.0.0 and Node 20 consumers and a Vite production browser build test that tarball outside
+the checkout. Chrome waits for an explicit round-trip success after default `ready()` loads the
+bundled wasm. Both npm publish jobs download and publish that exact tested archive, without
+rebuilding it or rerunning `prepack`. New PR artifact checks depend only on unconditional jobs;
+release-only API and external gates stay on the publishing jobs.
 
 ## One-time setup
 
@@ -96,11 +110,21 @@ Done once per index/repo; nothing here stores a secret.
 
 ## Cutting a release
 
-1. Bump the version in all five spots (CI's `version-check` jobs enforce they agree):
+1. Bump the version in the release files (CI's `version-check` jobs enforce they agree):
    - `build.zig.zon` — `.version`
    - `src/version.zig` — `version_string` **and** the `expectEqualStrings` test literal
    - `pyproject.toml` — `[project] version`
    - `bindings/typescript/package.json` — `version`
+   - `bindings/typescript/package-lock.json` — `version` and `packages[""].version`
+
+   Update the npm version fields together, then verify consistency after updating the Zig and
+   Python files:
+
+   ```sh
+   npm --prefix bindings/typescript version X.Y.Z --no-git-tag-version
+   node bindings/typescript/scripts/check-versions.mjs
+   ```
+
 2. Move the `## [Unreleased]` content in `CHANGELOG.md` into a new
    `## [X.Y.Z] - YYYY-MM-DD` section (leave `_Nothing yet._` under Unreleased). This section
    becomes the GitHub Release notes verbatim. Don't add link-reference lines

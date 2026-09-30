@@ -12,15 +12,15 @@ const NO_FS =
   "zigfitsio: filesystem access is unavailable in the browser. Use fromBytes()/toBytes() with your own " +
   "fetch/File I/O instead of path-based open()/writeTo().";
 
-export function readFile(_path: string): Uint8Array {
+export function readFile(_path: string, _maxBytes: bigint): Uint8Array {
   throw new FitsIOError(104, NO_FS);
 }
 
-export function writeFile(_path: string, _data: Uint8Array): void {
+export function writeFile(_path: string | number, _data: Uint8Array): void {
   throw new FitsIOError(104, NO_FS);
 }
 
-export function gunzip(_data: Uint8Array): Uint8Array {
+export function gunzip(_data: Uint8Array, _maxBytes: bigint): Uint8Array {
   // A browser can inflate with DecompressionStream (async); the synchronous path-based
   // open() cannot, so callers should inflate to bytes themselves and use fromBytes().
   throw new FitsIOError(104, NO_FS);
@@ -30,10 +30,10 @@ export function existsSync(_path: string): boolean {
   return false;
 }
 
-export function renameSync(_from: string, _to: string): void {
-  throw new FitsIOError(104, NO_FS);
-}
-
-export function rmSync(_path: string): void {
+export function atomicWrite(
+  _path: string,
+  _write: (fd: number) => void,
+  _options: { overwrite?: boolean; followSymlink?: boolean } = {},
+): void {
   throw new FitsIOError(104, NO_FS);
 }

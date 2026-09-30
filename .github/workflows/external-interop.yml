@@ -1,0 +1,57 @@
+name: External FITS interoperability
+
+# Reused on each CI event and explicitly for each publisher's tag/dispatch SHA.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    name: CFITSIO, funpack, Astropy & golden parity
+    runs-on: ubuntu-latest
+    env:
+      ZIG_VERSION: "0.16.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install CFITSIO + fpack/funpack + Astropy
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y fitsverify libcfitsio-dev libcfitsio-bin pkg-config
+          python -m pip install --upgrade pip
+          python -m pip install -r interop/requirements.txt
+      - name: Inbound — Astropy reads & cross-validates every committed CFITSIO golden (X-XVAL)
+        run: |
+          set -e
+          python interop/verify_outbound.py test/golden   # conformance (skips conformance/malformed)
+          python interop/xval.py test/golden               # pixel/cell values match the ramp/formulas
+      - name: Outbound — funpack/Astropy read every zigfitsio-written file (X-INTEROP outbound)
+        run: |
+          set -e
+          OUT="$RUNNER_TEMP/outbound"
+          zig build emit-fixtures -- "$OUT"
+          python interop/check_funpack.py "$OUT"           # CFITSIO funpack decodes every codec to the ramp
+          python interop/verify_outbound.py "$OUT"         # Astropy opens/verifies every emitted file
+          fitsverify -q "$OUT/image_checksum.fits"          # checksum-bearing fixture is a hard gate
+          for f in "$OUT"/*.fits; do fitsverify -q "$f" || true; done   # informational structural report
+      - name: Golden drift-guard — regenerate & byte-diff (informational; needs CFITSIO 4.6.4)
+        continue-on-error: true
+        run: |
+          make -C interop golden
+          git diff --stat -- test/golden
+          # Name the ambient toolchain in the warning so a skew is self-explaining from the log.
+          FPACK_V="$(fpack -V 2>&1 | head -1 || true)"
+          CFITSIO_V="$(pkg-config --modversion cfitsio 2>/dev/null || echo unknown)"
+          git diff --exit-code -- test/golden \
+            || echo "::warning::regenerated goldens differ from committed bytes (committed: CFITSIO 4.6.4; ambient: cfitsio ${CFITSIO_V}, fpack ${FPACK_V}); the semantic interop checks above are authoritative"
+      - name: Optimized memory benchmark comparison (informational)
+        continue-on-error: true
+        run: make -C interop benchmark

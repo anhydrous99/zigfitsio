@@ -27,6 +27,8 @@
  * little-endian, matching the x64/arm64 native-endian contract.
  */
 import type { NativeArg, NativeFn, NativeLibrary, NativeResult, NativeType, Proto, Ptr } from "./types.js";
+import { FitsOverflowError } from "../errors.js";
+import { effectiveOpenAlloc } from "../lowlevel/structs.js";
 
 /** The exports this backend requires from the instantiated `zigfitsio.wasm`. */
 export interface WasmExports {
@@ -39,6 +41,8 @@ export interface WasmExports {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+// Numeric ZfType codes 1..10, in the order defined by zigfitsio.h.
+const IMAGE_ELEMENT_BYTES = [0, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8];
 
 type BufDir = "in" | "out" | "inout";
 
@@ -74,12 +78,24 @@ export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "o
   zf_open_gzip: { 0: "in" }, //           ([bytes], len, opts, out) — read-only source copy
 };
 
-// These C ABI additions are not used by the TypeScript high-level API. Treat them as optional so
-// a pre-strided-ABI module can still use the legacy staged-copy paths below.
+// Additive fast paths are optional; older modules retain the staged-copy fallback.
 const OPTIONAL_WASM_SYMBOLS = new Set([
+  "zf_create_file_handle_v1",
   "zf_read_col_strided_v1",
   "zf_read_col_str_strided_v1",
+  "zf_wopen_memory_begin_v1",
+  "zf_wopen_memory_begin_v2",
+  "zf_wopen_memory_commit_v1",
+  "zf_wopen_memory_abort_v1",
 ]);
+
+function checkOpenLength(len: number | bigint, opts: ArrayBufferView | null | undefined): void {
+  if (opts && opts.byteLength < 72) throw new RangeError("ZfOpenOpts requires 72 bytes");
+  const cap = effectiveOpenAlloc(opts ? {
+    maxOpenAlloc: new DataView(opts.buffer, opts.byteOffset, opts.byteLength).getBigUint64(56, true),
+  } : null);
+  if (BigInt(len) > cap) throw new FitsOverflowError(412, "input exceeds maxOpenAlloc");
+}
 
 /** Per-proto plan: the `buf` copy direction for each arg index (undefined ⇒ not a `buf`). */
 function planDirs(proto: Proto): (BufDir | undefined)[] {
@@ -163,9 +179,14 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
     const dirs = planDirs(proto);
 
     fn[proto.name] = (...args: NativeArg[]): NativeResult => {
+      if (proto.name === "zf_open_memory") {
+        checkOpenLength(args[1] as number | bigint, args[3] as ArrayBufferView | null);
+        const input = args[0] as ArrayBufferView | null;
+        if (input) checkOpenLength(input.byteLength, args[3] as ArrayBufferView | null);
+      }
       const frees: number[] = [];
       // Buffers to copy back into the caller's view after the call (out / inout `buf`s).
-      const copyBacks: { off: number; view: ArrayBufferView }[] = [];
+      const copyBacks: { off: number; view: ArrayBufferView; index: number }[] = [];
       const call: (number | bigint)[] = new Array(args.length);
 
       // `finally` frees every staged block even if marshalling or the call throws (e.g. an OOM
@@ -188,7 +209,7 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
                 // Stage the input bytes. Re-derive the view (a prior alloc may have grown memory).
                 u8().set(new Uint8Array(view.buffer, view.byteOffset, len), off);
               }
-              if (dir !== "in") copyBacks.push({ off, view });
+              if (dir !== "in") copyBacks.push({ off, view, index: i });
               call[i] = off;
               frees.push(off);
               break;
@@ -266,7 +287,14 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
         if (copyBacks.length > 0) {
           const mem = u8(); // the call may have grown memory
           for (const cb of copyBacks) {
-            const len = cb.view.byteLength;
+            // Bounds/decode failures do not produce image pixels. Preserve the caller's
+            // destination while still returning diagnostic outputs from other ABI calls.
+            const image = proto.name === "zf_read_img" && cb.index === 6;
+            const subset = proto.name === "zf_read_subset" && cb.index === 9;
+            if ((image || subset) && Number(out) !== 0) continue;
+            const len = image || subset
+              ? Math.min(cb.view.byteLength, Number(args[image ? 3 : 6]) * IMAGE_ELEMENT_BYTES[Number(args[1])])
+              : cb.view.byteLength;
             if (len > 0) new Uint8Array(cb.view.buffer, cb.view.byteOffset, len).set(mem.subarray(cb.off, cb.off + len));
           }
         }
@@ -277,7 +305,8 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
     };
   }
 
-  const begin = ex.zf_wopen_memory_begin_v1;
+  const beginV2 = ex.zf_wopen_memory_begin_v2;
+  const begin = typeof beginV2 === "function" ? beginV2 : ex.zf_wopen_memory_begin_v1;
   const commit = ex.zf_wopen_memory_commit_v1;
   const abort = ex.zf_wopen_memory_abort_v1;
   const openMemoryOwned: NativeLibrary["openMemoryOwned"] =
@@ -292,6 +321,7 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
           let active = false;
           try {
             validateLength(dataLength);
+            checkOpenLength(dataLength, opts);
             const scratch = alloc(8);
             frees.push(scratch);
             let optsOff = 0;
@@ -300,7 +330,9 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
               frees.push(optsOff);
               u8().set(new Uint8Array(opts.buffer, opts.byteOffset, opts.byteLength), optsOff);
             }
-            const status = Number(begin(dataLength, scratch, scratch + 4));
+            const status = Number(typeof beginV2 === "function"
+              ? begin(dataLength, optsOff, scratch, scratch + 4)
+              : begin(dataLength, scratch, scratch + 4));
             const out = dv(); // begin may have grown memory
             builder = out.getUint32(scratch, true);
             const dataOff = out.getUint32(scratch + 4, true);

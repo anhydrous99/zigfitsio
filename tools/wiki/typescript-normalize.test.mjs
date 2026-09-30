@@ -33,14 +33,20 @@ const TOOLCHAIN = {
 
 test("parses every literal PROTOS declaration in source order", async () => {
   const protos = parseTypeScriptProtos(await readFile(PROTOS_SOURCE, "utf8"));
-  assert.equal(protos.length, 99);
+  assert.equal(protos.length, 104);
   assert.equal(protos[0].name, "zf_version");
   assert.equal(protos.at(-1).name, "zf_write_compressed3");
   assert.equal(new Set(protos.map((proto) => proto.name)).size, protos.length);
   assert.equal(formatTypeScriptProtoSignature(protos[0]), "lib.zf_version(): string");
-  assert.equal(protos[37].name, "zf_key_exists");
+  assert.ok(protos.some((proto) => proto.name === "zf_key_exists"));
   assert.deepEqual(
-    protos.slice(53, 58).map((proto) => proto.name),
+    protos.find((proto) => proto.name === "zf_create_file_handle_v1")?.args,
+    ["usize", "buf", "buf"],
+  );
+  const insertRecord = protos.findIndex((proto) => proto.name === "zf_insert_record");
+  assert.ok(insertRecord >= 0);
+  assert.deepEqual(
+    protos.slice(insertRecord, insertRecord + 5).map((proto) => proto.name),
     [
       "zf_insert_record",
       "zf_header_snapshot_query_v1",

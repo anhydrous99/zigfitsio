@@ -23,7 +23,7 @@ const Fingerprint128StateV1 = abi.Fingerprint128StateV1;
 const gpa = abi.gpa;
 
 /// Opaque owner used by the WebAssembly binding to fill the final `MemoryDevice` allocation
-/// directly. It is intentionally not part of the public C header.
+/// directly. Released by abort or consumed by commit, including failed commits.
 pub const MemoryBuilder = struct {
     owned: []u8,
 };
@@ -146,8 +146,22 @@ pub export fn zf_wfree(ptr: ?[*]u8) void {
 /// The builder must be consumed by `zf_wopen_memory_commit_v1` or released with
 /// `zf_wopen_memory_abort_v1`.
 pub export fn zf_wopen_memory_begin_v1(len: usize, out_builder: *?*MemoryBuilder, out_data: *?[*]u8) c_int {
+    return zf_wopen_memory_begin_v2(len, null, out_builder, out_data);
+}
+
+fn checkOpenSize(len: usize, opts: ?*const ZfOpenOpts) c_int {
+    const requested = if (opts) |o| o.max_open_alloc else 0;
+    const ceiling = if (requested != 0) requested else (fits.Limits{}).max_open_alloc;
+    if (len > ceiling) return abi.fail(null, error.LimitExceeded);
+    return 0;
+}
+
+/// Like v1, but validates the caller's allocation ceiling before allocating the payload.
+pub export fn zf_wopen_memory_begin_v2(len: usize, opts: ?*const ZfOpenOpts, out_builder: *?*MemoryBuilder, out_data: *?[*]u8) c_int {
     out_builder.* = null;
     out_data.* = null;
+    const status = checkOpenSize(len, opts);
+    if (status != 0) return status;
     const owned = gpa.alloc(u8, len) catch return abi.fail(null, error.OutOfMemory);
     const builder = gpa.create(MemoryBuilder) catch {
         gpa.free(owned);
@@ -179,6 +193,11 @@ fn allocHandle() ?*Handle {
 /// Open a handle over `owned`, consuming and freeing the slice on every failure path.
 fn openOwnedMemory(owned: []u8, mode: c_int, opts: ?*const ZfOpenOpts, out: *?*Handle) c_int {
     out.* = null;
+    const status = checkOpenSize(owned.len, opts);
+    if (status != 0) {
+        gpa.free(owned);
+        return status;
+    }
     const h = allocHandle() orelse {
         gpa.free(owned);
         return abi.fail(null, error.OutOfMemory);
@@ -231,10 +250,27 @@ pub export fn zf_create_file(path_ptr: [*]const u8, path_len: usize, opts: ?*con
     return 0;
 }
 
+/// Create over a borrowed POSIX fd or Windows HANDLE; never closes the caller's handle.
+pub export fn zf_create_file_handle_v1(native_handle: usize, opts: ?*const ZfOpenOpts, out_opt: ?*?*Handle) c_int {
+    const out = out_opt orelse return abi.failNull();
+    out.* = null;
+    if (@import("builtin").os.tag == .freestanding) return abi.fail(null, error.NotWritable);
+    const h = allocHandle() orelse return abi.fail(null, error.OutOfMemory);
+    h.fits = fits.Fits.createFileHandle(gpa, native_handle, abi.optsFrom(opts, &h.diag)) catch |e| {
+        const code = abi.fail(&h.diag, e);
+        gpa.destroy(h);
+        return code;
+    };
+    out.* = h;
+    return 0;
+}
+
 /// Open a FITS file held in memory (the bytes are copied into a handle-owned buffer). `mode`
 /// 2 (create) is treated as read-write; use `zf_create_memory` to build a new in-RAM file.
 pub export fn zf_open_memory(buf_ptr: [*]const u8, buf_len: usize, mode: c_int, opts: ?*const ZfOpenOpts, out: *?*Handle) c_int {
     out.* = null;
+    const status = checkOpenSize(buf_len, opts);
+    if (status != 0) return status;
     const owned = gpa.dupe(u8, buf_ptr[0..buf_len]) catch return abi.fail(null, error.OutOfMemory);
     return openOwnedMemory(owned, mode, opts, out);
 }
@@ -493,10 +529,17 @@ fn flatToCoord(axes: []const u64, flat: u64, coord: []u64) void {
     }
 }
 
+fn validateImageRange(view: *const fits.ImageView, first0: u64, nelem: u64) fits.Error!usize {
+    const total = view.elementCount();
+    if (first0 >= total or nelem > total - first0) return error.BadDimensions;
+    return std.math.cast(usize, nelem) orelse error.BadDimensions;
+}
+
 fn imgReadT(comptime T: type, view: *fits.ImageView, first0: u64, ptr: *anyopaque, nelem: usize, nulval: ?*const anyopaque, sc: ?fits.Scaling) fits.Error!void {
     const out = @as([*]T, @ptrCast(@alignCast(ptr)))[0..nelem];
     const sentinel = sentinelOf(T, nulval);
-    if (view.isCompressed() or (first0 == 0 and nelem == view.elementCount())) {
+    if (view.isCompressed() and (first0 != 0 or nelem != view.elementCount())) return error.UnsupportedCodec;
+    if (first0 == 0 and nelem == view.elementCount()) {
         return view.readAll(T, out, .{ .null_sentinel = sentinel, .scaling = sc });
     }
     var coord_buf: [999]u64 = undefined;
@@ -555,24 +598,28 @@ fn imgWrite(view: *fits.ImageView, ty: ZfType, first0: u64, ptr: *const anyopaqu
 /// overrides BSCALE/BZERO/BLANK.
 pub export fn zf_read_img(h_opt: ?*Handle, dtype: c_int, firstelem: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *anyopaque) c_int {
     const h = h_opt orelse return abi.failNull();
-    if (nelem <= 0) return 0;
+    if (nelem == 0) return 0;
+    if (nelem < 0) return abi.fail(&h.diag, error.BadDimensions);
     if (firstelem < 1) return abi.fail(&h.diag, error.BadDimensions);
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
+    const count = validateImageRange(&view, @intCast(firstelem - 1), @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
-    imgRead(&view, @enumFromInt(dtype), @intCast(firstelem - 1), array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
+    imgRead(&view, @enumFromInt(dtype), @intCast(firstelem - 1), array, count, nulval, sc) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
 /// Write `nelem` pixels to the current image starting at 1-based flat `firstelem`.
 pub export fn zf_write_img(h_opt: ?*Handle, dtype: c_int, firstelem: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, scaling: ?*const ZfScaling, array: *const anyopaque) c_int {
     const h = h_opt orelse return abi.failNull();
-    if (nelem <= 0) return 0;
+    if (nelem == 0) return 0;
+    if (nelem < 0) return abi.fail(&h.diag, error.BadDimensions);
     if (firstelem < 1) return abi.fail(&h.diag, error.BadDimensions);
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
+    const count = validateImageRange(&view, @intCast(firstelem - 1), @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
-    imgWrite(&view, @enumFromInt(dtype), @intCast(firstelem - 1), array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
+    imgWrite(&view, @enumFromInt(dtype), @intCast(firstelem - 1), array, count, nulval, sc) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 

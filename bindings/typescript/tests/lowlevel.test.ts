@@ -41,6 +41,13 @@ describe("lowlevel basics", () => {
     expect(typeof ll.native.withMemoryBytes).toBe("function");
   });
 
+  test("native file-handle creation is unavailable in bundled wasm", () => {
+    const out = ll.outU64();
+    out[0] = 123n;
+    expect(Number(ll.lib.zf_create_file_handle_v1(1, null, out))).toBe(112);
+    expect(out[0]).toBe(0n);
+  });
+
   test("fingerprint hashes the exact bytes of a subarray one-shot and streamed", () => {
     const source = Uint8Array.from([0xff, 0x61, 0x62, 0x63, 0xee]);
     const out = new Uint8Array(16);
@@ -478,7 +485,7 @@ describe("allocate-and-return", () => {
 describe("wasm buf-direction map", () => {
   const byName = new Map(PROTOS.map((p) => [p.name, p]));
   test("prototype count and packed VLA directions match the ABI", () => {
-    expect(PROTOS).toHaveLength(99);
+    expect(PROTOS).toHaveLength(104);
     expect(BUF_DIRS.zf_fingerprint128_v1).toEqual({ 0: "in", 2: "out" });
     // A wasm32 state pointer occupies only the low half of the BigUint64Array out slot; keep
     // default inout staging so its zeroed upper bytes survive copy-back.
@@ -510,6 +517,59 @@ describe("wasm buf-direction map", () => {
 });
 
 describe("wasm failure-atomic copy-back", () => {
+  test("failed image reads preserve pixels while error diagnostics still copy back", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    let next = 64;
+    const ex = {
+      memory,
+      zf_walloc: (len: number) => { const off = next; next += Math.max(len, 1); return off; },
+      zf_wfree: () => undefined,
+      zf_read_img: () => 213,
+      zf_read_subset: () => 213,
+      zf_header_apply_v1: (...args: number[]) => {
+        new Uint8Array(memory.buffer)[args[7]] = 17;
+        return 412;
+      },
+    } as unknown as WasmExports;
+    const lib = openWasmLibrary(ex, PROTOS.filter((p) =>
+      ["zf_read_img", "zf_read_subset", "zf_header_apply_v1"].includes(p.name)));
+    const pixels = new Int32Array([99, 98]);
+    expect(lib.fn.zf_read_img(1n, 5, 0n, 2n, null, null, pixels)).toBe(213);
+    expect(lib.fn.zf_read_subset(1n, 5, 0, null, null, null, 2n, null, null, pixels)).toBe(213);
+    expect(Array.from(pixels)).toEqual([99, 98]);
+    const diagnostics = new Uint8Array(32);
+    expect(lib.fn.zf_header_apply_v1(1n, 0n, null, null, 0n, null, 0n, diagnostics)).toBe(412);
+    expect(diagnostics[0]).toBe(17);
+  });
+
+  test("actual wasm image bounds and compressed offsets fail without touching pixels", () => {
+    const h = createMemory();
+    try {
+      ll.check(ll.lib.zf_create_img(h, 32, 2, ll.longArray([2, 2])));
+      const original = new Int32Array([1, 2, 3, 4]);
+      ll.check(ll.lib.zf_write_img(h, 5, 1n, 4n, null, null, original));
+      for (const [first, count] of [[0n, 1n], [5n, 1n], [4n, 2n], [0x7fff_ffff_ffff_ffffn, 1n]]) {
+        const out = new Int32Array([99, 98]);
+        expect(ll.lib.zf_read_img(h, 5, first, count, null, null, out)).toBe(213);
+        expect(Array.from(out)).toEqual([99, 98]);
+        expect(ll.lib.zf_write_img(h, 5, first, count, null, null, out)).toBe(213);
+      }
+      const out = new Int32Array(4);
+      ll.check(ll.lib.zf_read_img(h, 5, 1n, 4n, null, null, out));
+      expect(Array.from(out)).toEqual(Array.from(original));
+      ll.check(ll.lib.zf_read_img(h, 5, 0n, 0n, null, null, out));
+      expect(Array.from(out)).toEqual(Array.from(original));
+      out.fill(99);
+      ll.check(ll.lib.zf_read_img(h, 5, 2n, 1n, null, null, out));
+      expect(Array.from(out)).toEqual([2, 99, 99, 99]);
+      ll.check(ll.lib.zf_write_compressed(h, 5, 32, 2, ll.longArray([2, 2]), null, "RICE_1", null, 1, original, 4n));
+      ll.check(ll.lib.zf_select(h, 2));
+      out.fill(99);
+      expect(ll.lib.zf_read_img(h, 5, 2n, 3n, null, null, out)).toBe(413);
+      expect(Array.from(out)).toEqual([99, 99, 99, 99]);
+    } finally { ll.lib.zf_close(h); }
+  });
+
   test("zf_header_snapshot_fill_v1 preserves every caller buffer on failure", () => {
     let next = 64;
     const ex = {
@@ -610,6 +670,39 @@ describe("wasm32 marshalling limits", () => {
 });
 
 describe("wasm owned-memory fast paths", () => {
+  test("owned v2 and legacy fallbacks enforce maxOpenAlloc before staging", () => {
+    for (const v2 of [false, true]) {
+      let allocations = 0;
+      let begins = 0;
+      const memory = new WebAssembly.Memory({ initial: 1 });
+      const ex = {
+        memory,
+        zf_walloc: () => { allocations++; return 64; },
+        zf_wfree: () => undefined,
+        zf_open_memory: () => 0,
+        zf_wopen_memory_begin_v1: () => { begins++; return 412; },
+        ...(v2 ? { zf_wopen_memory_begin_v2: (_len: number, opts: number) => {
+          expect(new DataView(memory.buffer).getBigUint64(opts + 56, true)).toBe(3n);
+          begins++; return 412;
+        } } : {}),
+        zf_wopen_memory_commit_v1: () => 0,
+        zf_wopen_memory_abort_v1: () => undefined,
+      } as unknown as WasmExports;
+      const lib = openWasmLibrary(ex, PROTOS.filter((p) => p.name === "zf_open_memory"));
+      const opts = ll.encodeOpenOpts({ maxOpenAlloc: 3 })!;
+      expect(() => lib.openMemoryOwned!(new Uint8Array(4), 0, opts)).toThrow(FitsOverflowError);
+      expect(() => lib.fn.zf_open_memory(new Uint8Array(4), 4, 0, opts, ll.outU64())).toThrow(FitsOverflowError);
+      expect(allocations).toBe(0);
+      expect(begins).toBe(0);
+      expect(lib.openMemoryOwned!(new Uint8Array(3), 0, opts).status).toBe(412);
+      expect(begins).toBe(1);
+    }
+    // Adding builder prototypes must not make old modules unloadable.
+    const old = { memory: new WebAssembly.Memory({ initial: 1 }), zf_walloc: () => 64,
+      zf_wfree: () => undefined } as unknown as WasmExports;
+    expect(openWasmLibrary(old, PROTOS.filter((p) => p.name.startsWith("zf_wopen_memory"))).openMemoryOwned).toBeUndefined();
+  });
+
   test("builder open rejects a 4-GiB input before wasm32 coercion", () => {
     let began = false;
     const ex = {
@@ -656,7 +749,7 @@ describe("wasm owned-memory fast paths", () => {
         expect(builder).toBe(500);
         committed = Array.from(new Uint8Array(memory.buffer, 1024, 5));
         committedMode = mode;
-        committedOpts = Array.from(new Uint8Array(memory.buffer, opts, 3));
+        committedOpts = Array.from(new Uint8Array(memory.buffer, opts, 72));
         new DataView(memory.buffer).setUint32(outHandle, 700, true);
         return 0;
       },
@@ -665,14 +758,15 @@ describe("wasm owned-memory fast paths", () => {
     const lib = openWasmLibrary(ex, []);
     const source = Uint8Array.from([1, 2, 3, 4, 5]);
 
-    const result = lib.openMemoryOwned!(source, 1, Uint8Array.from([9, 8, 7]));
+    const opts = ll.encodeOpenOpts({ maxOpenAlloc: 9 })!;
+    const result = lib.openMemoryOwned!(source, 1, opts);
     source[0] = 99;
 
     expect(result).toEqual({ status: 0, handle: 700n });
     expect(committed).toEqual([1, 2, 3, 4, 5]);
     expect(committedMode).toBe(1);
-    expect(committedOpts).toEqual([9, 8, 7]);
-    expect(allocations).toEqual([8, 3]); // scratch + options; never an input-sized staging block
+    expect(committedOpts).toEqual(Array.from(opts));
+    expect(allocations).toEqual([8, 72]); // scratch + options; never an input-sized staging block
   });
 
   test("builder re-derives a Wasm-backed source after begin grows memory", () => {
@@ -766,8 +860,9 @@ describe("wasm owned-memory fast paths", () => {
     expect(Array.from(copied.bytes)).toEqual([4, 3, 2, 1]);
   });
 
-  test("older 92-symbol modules load without optional fast paths", () => {
-    const missing = new Set(["zf_read_col_strided_v1", "zf_read_col_str_strided_v1"]);
+  test("older modules load without optional fast paths", () => {
+    const missing = new Set(["zf_read_col_strided_v1", "zf_read_col_str_strided_v1",
+      "zf_wopen_memory_begin_v1", "zf_wopen_memory_begin_v2", "zf_wopen_memory_commit_v1", "zf_wopen_memory_abort_v1"]);
     const ex: Record<string, unknown> = {
       memory: new WebAssembly.Memory({ initial: 1 }),
       zf_walloc: () => 64,

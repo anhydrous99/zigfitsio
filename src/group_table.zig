@@ -66,7 +66,7 @@ pub fn freeGroupLinks(alloc: Allocator, links: []GroupLink) void {
 const GroupCol = struct { name: []const u8, tform: []const u8 };
 const GROUP_COLS = [_]GroupCol{
     .{ .name = "MEMBER_XTENSION", .tform = "20A" },
-    .{ .name = "MEMBER_NAME", .tform = "48A" },
+    .{ .name = "MEMBER_NAME", .tform = "68A" },
     .{ .name = "MEMBER_VERSION", .tform = "1J" },
     .{ .name = "MEMBER_POSITION", .tform = "1J" },
     .{ .name = "MEMBER_URI_TYPE", .tform = "8A" },
@@ -139,7 +139,7 @@ pub const GroupTable = struct {
     pub fn groupName(self: *const GroupTable, alloc: Allocator) GroupError!?[]u8 {
         const hdr = &self.table.hdu.header;
         if (!hdr.has("GRPNAME")) return null;
-        return hdr.getString(alloc, "GRPNAME") catch |e| switch (e) {
+        return hdr.getLongString(alloc, "GRPNAME") catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
@@ -190,7 +190,7 @@ pub const GroupTable = struct {
             defer alloc.free(nm);
             if (nm.len > 0) {
                 const ver: i64 = if (self.col_version) |vi| try self.readIntCell(vi, row) else 1;
-                return matchByNameVer(fits, nm, ver);
+                return try matchByNameVer(fits, nm, ver);
             }
         }
         return null;
@@ -240,12 +240,20 @@ pub const GroupTable = struct {
         const grp_pos = try self.position();
         const mpos = (hduIndex(fits, member) orelse return error.WrongHduType) + 1;
 
+        // Resolve complete logical strings and validate the opened column widths before
+        // adding a row or touching the member's GRPID cards.
+        const alloc = fits.alloc;
+        const xtension = if (self.col_xtension) |ci| try self.hduStringCell(ci, member, "XTENSION") else null;
+        defer if (xtension) |cell| alloc.free(cell);
+        const name = if (self.col_name) |ci| try self.hduStringCell(ci, member, "EXTNAME") else null;
+        defer if (name) |cell| alloc.free(cell);
+        const n = try nextGrpidIndex(&member.header);
+
         const new_row = self.table.rowCount();
         try self.table.appendRows(1);
 
-        // Fill the new row's identity cells from the member's header.
-        if (self.col_xtension) |ci| try self.writeHduString(ci, new_row, member, "XTENSION");
-        if (self.col_name) |ci| try self.writeHduString(ci, new_row, member, "EXTNAME");
+        if (xtension) |cell| try self.table.writeColumn(u8, .{ .index = self.col_xtension.? }, new_row, cell, .{});
+        if (name) |cell| try self.table.writeColumn(u8, .{ .index = self.col_name.? }, new_row, cell, .{});
         if (self.col_version) |ci| {
             const ver = member.header.getValue(i64, "EXTVER") catch 1;
             try self.writeIntCell(ci, new_row, ver);
@@ -255,7 +263,6 @@ pub const GroupTable = struct {
         // member lives in the same file.
 
         // Member-side linkage: add the next free GRPIDn = grouping-table position.
-        const n = try nextGrpidIndex(&member.header);
         var kw: [16]u8 = undefined;
         try member.header.update(fits.alloc, grpidName(&kw, n), .{ .int = @intCast(grp_pos) }, null);
         try fits.rewriteHeaderInPlace(member);
@@ -314,17 +321,14 @@ pub const GroupTable = struct {
         if (changed) try fits.rewriteHeaderInPlace(member);
     }
 
-    fn writeHduString(self: *GroupTable, col_idx: u16, row: u64, hdu: *Hdu, kw: []const u8) GroupError!void {
+    fn hduStringCell(self: *GroupTable, col_idx: u16, hdu: *Hdu, kw: []const u8) GroupError![]u8 {
         const alloc = self.table.fits.alloc;
-        const s = hdu.header.getString(alloc, kw) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                try self.writeStrCell(col_idx, row, "");
-                return;
-            },
+        const s = hdu.header.getLongString(alloc, kw) catch |e| switch (e) {
+            error.KeywordNotFound => return self.paddedStringCell(col_idx, ""),
+            else => return e,
         };
         defer alloc.free(s);
-        try self.writeStrCell(col_idx, row, std.mem.trim(u8, s, " "));
+        return self.paddedStringCell(col_idx, std.mem.trim(u8, s, " "));
     }
 
     fn readStrCell(self: *GroupTable, alloc: Allocator, col_idx: u16, row: u64) GroupError![]u8 {
@@ -341,20 +345,21 @@ pub const GroupTable = struct {
         return alloc.dupe(u8, trimmed);
     }
 
-    fn writeStrCell(self: *GroupTable, col_idx: u16, row: u64, s: []const u8) GroupError!void {
-        const alloc = self.table.fits.alloc;
+    fn paddedStringCell(self: *GroupTable, col_idx: u16, s: []const u8) GroupError![]u8 {
         const col = &self.table.columns[col_idx];
-        // Narrow the attacker-controlled u64 width FALLIBLY: on a 32-bit-usize target (wasm32) a
-        // repeat ≥ 2^32 would panic a plain @intCast before the ceiling guard below ever runs.
+        if (col.tform.type != .char) return error.BadTform;
         const w = std.math.cast(usize, col.tform.repeat) orelse return error.LimitExceeded;
-        if (w == 0) return;
-        // Bound the attacker-controlled column width before allocating (NFR-SAFE-1), matching readStrCell/cellNonBlank.
+        if (s.len > w) return error.BadDimensions;
         if (w > self.table.fits.limits.max_open_alloc) return error.LimitExceeded;
-        const buf = try alloc.alloc(u8, w);
-        defer alloc.free(buf);
+        const buf = try self.table.fits.alloc.alloc(u8, w);
         @memset(buf, ' ');
-        const n = @min(w, s.len);
-        @memcpy(buf[0..n], s[0..n]);
+        @memcpy(buf[0..s.len], s);
+        return buf;
+    }
+
+    fn writeStrCell(self: *GroupTable, col_idx: u16, row: u64, s: []const u8) GroupError!void {
+        const buf = try self.paddedStringCell(col_idx, s);
+        defer self.table.fits.alloc.free(buf);
         try self.table.writeColumn(u8, .{ .index = col_idx }, row, buf, .{});
     }
 
@@ -423,11 +428,13 @@ fn hduIndex(fits: *Fits, hdu: *const Hdu) ?usize {
 }
 
 // Match a member by EXTNAME (case-insensitive, blank-trimmed) and EXTVER (default 1).
-fn matchByNameVer(fits: *Fits, name: []const u8, ver: i64) ?*Hdu {
+fn matchByNameVer(fits: *Fits, name: []const u8, ver: i64) GroupError!?*Hdu {
     for (fits.hdus.items) |h| {
-        var buf: [80]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        const en = h.header.getString(fba.allocator(), "EXTNAME") catch continue;
+        const en = h.header.getLongString(fits.alloc, "EXTNAME") catch |err| switch (err) {
+            error.KeywordNotFound => continue,
+            else => return err,
+        };
+        defer fits.alloc.free(en);
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, en, " "), name)) continue;
         const v = h.header.getValue(i64, "EXTVER") catch 1;
         if (v == ver) return h;
@@ -756,4 +763,51 @@ test "addMember/removeMember are rejected on a read-only handle" {
     defer grp2.deinit(alloc);
     try testing.expectError(error.NotWritable, grp2.addMember(h2));
     try testing.expectError(error.NotWritable, grp2.removeMember(h2));
+}
+
+test "group member names use full logical values and reject narrow cells before mutation" {
+    const alloc = testing.allocator;
+    const name = "continued-member-name-" ** 5;
+    for ([_]usize{ 68, 48, 120 }) |width| {
+        var b = try newHandle(alloc);
+        defer b.deinit(alloc);
+        const f = &b.f;
+        _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+        const member = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{3} });
+        const full_name = name[0..if (width == 68) @as(usize, 60) else name.len];
+        try member.header.update(alloc, "EXTNAME", .{ .string = full_name }, null);
+        try f.rewriteHeaderInPlace(member);
+
+        var header = try buildGroupingHeader(alloc, null);
+        var buf: [16]u8 = undefined;
+        const rowbytes = try header.getValue(i64, "NAXIS1");
+        try header.update(alloc, "TFORM2", .{ .string = try std.fmt.bufPrint(&buf, "{d}A", .{width}) }, null);
+        try header.update(alloc, "NAXIS1", .{ .int = rowbytes - 68 + @as(i64, @intCast(width)) }, null);
+        const ghdu = try f.appendHdu(header);
+        var group = try GroupTable.of(f, ghdu);
+        defer group.deinit(alloc);
+        const before = try alloc.dupe(u8, b.mem.bytes());
+        defer alloc.free(before);
+        const revision = member.header_revision;
+        if (width < full_name.len) {
+            try testing.expectError(error.BadDimensions, group.addMember(member));
+            try testing.expectEqual(@as(u64, 0), group.memberCount());
+            try testing.expect(!member.header.has("GRPID1"));
+            try testing.expectEqual(revision, member.header_revision);
+            try testing.expectEqualSlices(u8, before, b.mem.bytes());
+            continue;
+        }
+        _ = try group.addMember(member);
+        try group.writeIntCell(group.col_position.?, 0, 0); // require the name fallback
+        try testing.expectEqual(@as(?*Hdu, member), try group.resolveMember(0));
+
+        var reopened = try Fits.open(alloc, b.mem.device(), .read_only, .{});
+        defer reopened.deinit();
+        var reread = try GroupTable.of(&reopened, try reopened.select(3));
+        defer reread.deinit(alloc);
+        const saved_name = (try reread.memberName(alloc, 0)).?;
+        defer alloc.free(saved_name);
+        try testing.expectEqualStrings(full_name, saved_name);
+        try testing.expectEqual(@as(?*Hdu, try reopened.select(2)), try reread.resolveMember(0));
+    }
 }

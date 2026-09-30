@@ -38,12 +38,55 @@ pub fn gzipEncode(alloc: Allocator, in: []const u8) (CompressError || Alloc)![]u
 pub fn gzipDecode(alloc: Allocator, in: []const u8, max_out: u64) (CompressError || Alloc)![]u8 {
     var rdr = std.Io.Reader.fixed(in);
     var window: [flate.max_window_len]u8 = undefined;
-    var dec = flate.Decompress.init(&rdr, .gzip, &window);
-    return dec.reader.allocRemaining(alloc, std.Io.Limit.limited64(max_out)) catch |err| switch (err) {
+    return decodeMembers(alloc, &rdr, &window, max_out) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.CorruptTile, // exceeded the tile-size ceiling
         else => error.CorruptTile,
     };
+}
+
+/// Append through EOF with an inclusive payload ceiling. Capacity growth never exceeds it.
+pub fn appendBounded(alloc: Allocator, reader: *std.Io.Reader, out: *std.ArrayList(u8), max_out: u64) (Alloc || error{ LimitExceeded, ReadFailed })!void {
+    const cap = std.math.cast(usize, max_out) orelse std.math.maxInt(usize);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        if (out.items.len >= cap) {
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => return,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            return error.LimitExceeded;
+        }
+        const n = try reader.readSliceShort(buf[0..@min(buf.len, cap - out.items.len)]);
+        if (n == 0) return;
+        const needed = out.items.len + n;
+        if (needed > out.capacity) {
+            const grown = out.capacity +| @max(out.capacity, buf.len);
+            try out.ensureTotalCapacityPrecise(alloc, @min(cap, @max(needed, grown)));
+        }
+        out.appendSliceAssumeCapacity(buf[0..n]);
+    }
+}
+
+/// Decode every RFC-1952 member and verify each footer against that member's payload.
+/// The aggregate payload ceiling is inclusive; the caller supplies reusable deflate scratch.
+pub fn decodeMembers(alloc: Allocator, reader: *std.Io.Reader, window: []u8, max_out: u64) (Alloc || error{ LimitExceeded, Corrupt })![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        const start = out.items.len;
+        var dec = flate.Decompress.init(reader, .gzip, window);
+        appendBounded(alloc, &dec.reader, &out, max_out) catch |err| switch (err) {
+            error.ReadFailed => return error.Corrupt,
+            else => |e| return e,
+        };
+        const payload = out.items[start..];
+        const footer = dec.container_metadata.gzip;
+        if (footer.crc != std.hash.Crc32.hash(payload) or footer.count != @as(u32, @truncate(payload.len))) return error.Corrupt;
+        _ = reader.peekByte() catch |err| switch (err) {
+            error.EndOfStream => return out.toOwnedSlice(alloc),
+            error.ReadFailed => return error.Corrupt,
+        };
+    }
 }
 
 /// GZIP_2: decompress, then un-shuffle for the given element byte width. `elem_width` of 1
@@ -116,6 +159,30 @@ test "decode enforces the output ceiling" {
     const enc = try gzipEncode(testing.allocator, original);
     defer testing.allocator.free(enc);
     try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, enc, 100));
+}
+
+test "gzip validates every concatenated member and the inclusive aggregate ceiling" {
+    const first = try gzipEncode(testing.allocator, "abc");
+    defer testing.allocator.free(first);
+    const second = try gzipEncode(testing.allocator, "de");
+    defer testing.allocator.free(second);
+    const joined = try std.mem.concat(testing.allocator, u8, &.{ first, second });
+    defer testing.allocator.free(joined);
+    const decoded = try gzipDecode(testing.allocator, joined, 5);
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualStrings("abcde", decoded);
+    try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, joined, 4));
+    for ([_]usize{ 8, 4 }) |distance| {
+        joined[joined.len - distance] ^= 1;
+        try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, joined, 5));
+        joined[joined.len - distance] ^= 1;
+    }
+    try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, joined[0 .. joined.len - 1], 5));
+    const empty = try gzipEncode(testing.allocator, "");
+    defer testing.allocator.free(empty);
+    const empty_out = try gzipDecode(testing.allocator, empty, 0);
+    defer testing.allocator.free(empty_out);
+    try testing.expectEqual(@as(usize, 0), empty_out.len);
 }
 
 test "corrupt gzip stream fails typed" {

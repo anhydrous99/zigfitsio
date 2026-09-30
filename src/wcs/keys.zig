@@ -38,7 +38,7 @@ pub const Wcs = struct {
     crpix: []f64 = &.{},
     crval: []f64 = &.{},
     cdelt: []f64 = &.{},
-    crota: []f64 = &.{}, // legacy, read-only
+    crota: []f64 = &.{}, // legacy; serialized as an equivalent sparse PC matrix
     transform: Transform = .none,
     pv: []PvTerm = &.{},
     ps: []PsTerm = &.{},
@@ -115,11 +115,33 @@ pub const Wcs = struct {
         return self;
     }
 
-    /// Serialize the keyword set into `h`. `CROTAi` is **not** written when a `PC`/`PV`/`PS`
-    /// representation is present (FR-WCS-1). Mandatory-keyword ordering is the HDU's concern;
-    /// this appends the WCS cards.
+    /// Replace this alternate WCS description, preserving other alternates and unrelated cards.
+    /// Legacy CROTA rotation is emitted as an equivalent sparse PC matrix.
     pub fn writeTo(self: *const Wcs, a: Allocator, h: *Header) (WcsError || @import("../errors.zig").HeaderError || std.mem.Allocator.Error)!void {
+        var staged: Header = .{ .inherit = h.inherit };
+        defer staged.deinit(a);
+        var had_end = false;
+        for (h.cards.items) |card| {
+            if (card.kind == .end) {
+                had_end = true;
+            } else try staged.cards.append(a, card);
+        }
+        for (h.cards.items) |card| {
+            if (isWcsKeyword(card.name.text(), self.alt)) staged.delete(card.name.text()) catch {};
+        }
+        try self.writeCards(a, &staged);
+        if (had_end) try staged.ensureEnd(a);
+        std.mem.swap(Header, h, &staged);
+    }
+
+    fn writeCards(self: *const Wcs, a: Allocator, h: *Header) (WcsError || @import("../errors.zig").HeaderError || std.mem.Allocator.Error)!void {
         var buf: [8]u8 = undefined;
+        const legacy_axes = if (self.transform == .none) blk: {
+            for (self.crota) |angle| {
+                if (angle != 0) break :blk try self.celestialAxes();
+            }
+            break :blk null;
+        } else null;
         try h.appendValue(a, nameAlt(&buf, "WCSAXES", self.alt), .{ .int = self.axes }, null);
         // An index/axis whose keyword would exceed 8 chars (CTYPE1000, CDi_j with i/j ≥ 100)
         // is unrepresentable in standard FITS keywords -> error.BadWcs rather than a panic.
@@ -128,11 +150,29 @@ pub const Wcs = struct {
             if (self.ctype[i].len > 0) try h.appendValue(a, indexedName(&buf, "CTYPE", idx, self.alt) orelse return error.BadWcs, .{ .string = self.ctype[i] }, null);
             try h.appendValue(a, indexedName(&buf, "CRPIX", idx, self.alt) orelse return error.BadWcs, .{ .float = self.crpix[i] }, null);
             try h.appendValue(a, indexedName(&buf, "CRVAL", idx, self.alt) orelse return error.BadWcs, .{ .float = self.crval[i] }, null);
-            try h.appendValue(a, indexedName(&buf, "CDELT", idx, self.alt) orelse return error.BadWcs, .{ .float = self.cdelt[i] }, null);
+            var scale = self.cdelt[i];
+            if (legacy_axes) |axes| {
+                if (i == axes.lon or i == axes.lat) scale = 1;
+            }
+            try h.appendValue(a, indexedName(&buf, "CDELT", idx, self.alt) orelse return error.BadWcs, .{ .float = scale }, null);
             if (self.cunit[i].len > 0) try h.appendValue(a, indexedName(&buf, "CUNIT", idx, self.alt) orelse return error.BadWcs, .{ .string = self.cunit[i] }, null);
         }
         switch (self.transform) {
-            .none => {},
+            .none => {
+                if (legacy_axes) |axes| {
+                    // Put the complete celestial scale/rotation in PC with CDELT=1.
+                    // Other axes retain their scales and implicit identity PC terms.
+                    const m = self.legacyCd(axes.lon, axes.lat);
+                    const indices = [_]usize{ axes.lon, axes.lat };
+                    for (indices, 0..) |i, row| {
+                        for (indices, 0..) |j, column| {
+                            const v = m[row][column];
+                            if (v == (if (i == j) @as(f64, 1) else 0)) continue;
+                            try h.appendValue(a, matrixName(&buf, "PC", i + 1, j + 1, self.alt) orelse return error.BadWcs, .{ .float = v }, null);
+                        }
+                    }
+                }
+            },
             .pc => |m| try writeMatrix(a, h, "PC", m, self.alt),
             .cd => |m| try writeMatrix(a, h, "CD", m, self.alt),
         }
@@ -146,8 +186,44 @@ pub const Wcs = struct {
         if (self.latpole) |v| try h.appendValue(a, nameAlt(&buf, "LATPOLE", self.alt), .{ .float = v }, null);
         if (self.equinox) |v| try h.appendValue(a, nameAlt(&buf, "EQUINOX", self.alt), .{ .float = v }, null);
         if (self.radesys) |r| try h.appendValue(a, nameAlt(&buf, "RADESYS", self.alt), .{ .string = r }, null);
-        // CROTAi is deprecated and intentionally not written when PC/PV/PS exist; since we
-        // always serialize via PC/CD, CROTAi is never emitted here (FR-WCS-1).
+    }
+
+    /// Find the unique matching longitude/latitude axes without validating a projection.
+    pub fn celestialAxes(self: *const Wcs) WcsError!struct { lon: usize, lat: usize } {
+        const w = self;
+        const n: usize = w.axes;
+        if (n < 2 or w.ctype.len < n) return error.BadWcs;
+        var lon_axis: ?usize = null;
+        var lat_axis: ?usize = null;
+        var lon_family: ?CelestialFamily = null;
+        var lat_family: ?CelestialFamily = null;
+        for (w.ctype[0..n], 0..) |ctype, i| {
+            if (longitudeFamily(ctype)) |family| {
+                if (lon_axis != null) return error.BadWcs;
+                lon_axis = i;
+                lon_family = family;
+            }
+            if (latitudeFamily(ctype)) |family| {
+                if (lat_axis != null) return error.BadWcs;
+                lat_axis = i;
+                lat_family = family;
+            }
+        }
+        const lon = lon_axis orelse return error.BadWcs;
+        const lat = lat_axis orelse return error.BadWcs;
+        if (lon_family.? != lat_family.?) return error.BadWcs;
+        return .{ .lon = lon, .lat = lat };
+    }
+
+    /// AIPS CROTA linear transform, absorbing CDELT on the two celestial axes.
+    pub fn legacyCd(self: *const Wcs, lon: usize, lat: usize) [2][2]f64 {
+        const rho = self.crota[lat] * std.math.pi / 180.0;
+        const cr = std.math.cos(rho);
+        const sr = std.math.sin(rho);
+        return .{
+            .{ self.cdelt[lon] * cr, -self.cdelt[lat] * sr },
+            .{ self.cdelt[lon] * sr, self.cdelt[lat] * cr },
+        };
     }
 
     /// Release all allocator-owned strings and matrices in this WCS definition.
@@ -173,6 +249,54 @@ pub const Wcs = struct {
         if (self.radesys) |r| a.free(r);
     }
 };
+
+const CelestialFamily = enum { equatorial, galactic, ecliptic };
+
+fn longitudeFamily(ctype: []const u8) ?CelestialFamily {
+    if (ctype.len < 5) return null;
+    const prefix = ctype[0..5];
+    if (std.ascii.eqlIgnoreCase(prefix, "RA---")) return .equatorial;
+    if (std.ascii.eqlIgnoreCase(prefix, "GLON-")) return .galactic;
+    if (std.ascii.eqlIgnoreCase(prefix, "ELON-")) return .ecliptic;
+    return null;
+}
+
+fn latitudeFamily(ctype: []const u8) ?CelestialFamily {
+    if (ctype.len < 5) return null;
+    const prefix = ctype[0..5];
+    if (std.ascii.eqlIgnoreCase(prefix, "DEC--")) return .equatorial;
+    if (std.ascii.eqlIgnoreCase(prefix, "GLAT-")) return .galactic;
+    if (std.ascii.eqlIgnoreCase(prefix, "ELAT-")) return .ecliptic;
+    return null;
+}
+
+// Names are normalized by Card.parse. Match the complete numeric grammar so
+// unrelated names such as PCOUNT cannot be mistaken for a PC matrix keyword.
+fn isWcsKeyword(name: []const u8, alt: u8) bool {
+    const base = if (alt == ' ' or alt == 0) name else blk: {
+        if (name.len == 0 or name[name.len - 1] != alt) return false;
+        break :blk name[0 .. name.len - 1];
+    };
+    for ([_][]const u8{ "WCSAXES", "LONPOLE", "LATPOLE", "EQUINOX", "RADESYS" }) |key| {
+        if (std.mem.eql(u8, base, key)) return true;
+    }
+    for ([_][]const u8{ "CTYPE", "CUNIT", "CRPIX", "CRVAL", "CDELT", "CROTA" }) |prefix| {
+        if (std.mem.startsWith(u8, base, prefix) and allDigits(base[prefix.len..])) return true;
+    }
+    for ([_][]const u8{ "PC", "CD", "PV", "PS" }) |prefix| {
+        if (!std.mem.startsWith(u8, base, prefix)) continue;
+        const indices = base[prefix.len..];
+        const sep = std.mem.indexOfScalar(u8, indices, '_') orelse continue;
+        if (allDigits(indices[0..sep]) and allDigits(indices[sep + 1 ..])) return true;
+    }
+    return false;
+}
+
+fn allDigits(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
 
 // ── name builders ──────────────────────────────────────────────────────────────────────
 
@@ -349,6 +473,9 @@ fn writeMatrix(a: Allocator, h: *Header, comptime base: []const u8, m: [][]f64, 
     var buf: [8]u8 = undefined;
     for (m, 0..) |row, i| {
         for (row, 0..) |v, j| {
+            // PC defaults to identity. Omit those terms before formatting so high,
+            // untouched axes do not require unrepresentable names such as PC100_100.
+            if (std.mem.eql(u8, base, "PC") and v == (if (i == j) @as(f64, 1) else 0)) continue;
             // i/j ≥ 100 would make `base{i}_{j}` exceed 8 chars — unrepresentable in standard
             // FITS keywords, so the WCS cannot be serialized.
             const name = matrixName(&buf, base, i + 1, j + 1, alt) orelse return error.BadWcs;
@@ -536,4 +663,122 @@ test "alternate WCS description with a suffix" {
     try testing.expectEqual(@as(u16, 1), w.axes);
     try testing.expectEqualStrings("WAVE", w.ctype[0]);
     try testing.expectEqual(@as(f64, 5000.0), w.crval[0]);
+}
+
+test "CROTA serialization preserves swapped celestial axes and replaces only its alternate" {
+    const Celestial = @import("celestial.zig").Celestial;
+    const a = testing.allocator;
+    for ([_]u8{ ' ', 'A' }) |alt| {
+        for ([_][3][]const u8{ .{ "RA---TAN", "DEC--TAN", "FREQ" }, .{ "FREQ", "DEC--TAN", "RA---TAN" } }) |ctypes| {
+            for ([_][2]f64{ .{ -0.05, 0.08 }, .{ -1e-240, 0.08 }, .{ 0.08, -1e-240 } }) |scales| {
+                var source: Header = .{};
+                defer source.deinit(a);
+                var buf: [8]u8 = undefined;
+                try source.appendValue(a, nameAlt(&buf, "WCSAXES", alt), .{ .int = 3 }, null);
+                for (ctypes, 0..) |ctype, i| {
+                    try source.appendValue(a, indexedName(&buf, "CTYPE", i + 1, alt).?, .{ .string = ctype }, null);
+                    try source.appendValue(a, indexedName(&buf, "CRPIX", i + 1, alt).?, .{ .float = 1 }, null);
+                    const lon = std.mem.startsWith(u8, ctype, "RA");
+                    const lat = std.mem.startsWith(u8, ctype, "DEC");
+                    try source.appendValue(a, indexedName(&buf, "CRVAL", i + 1, alt).?, .{ .float = if (lon) 120 else if (lat) 30 else 1420 }, null);
+                    try source.appendValue(a, indexedName(&buf, "CDELT", i + 1, alt).?, .{ .float = if (lon) scales[0] else if (lat) scales[1] else 2 }, null);
+                    if (lat) try source.appendValue(a, indexedName(&buf, "CROTA", i + 1, alt).?, .{ .float = 37 }, null);
+                }
+                var w = try Wcs.fromHeader(a, &source, alt);
+                defer w.deinit(a);
+                const before = try Celestial.fromWcs(&w);
+                var dest: Header = .{};
+                defer dest.deinit(a);
+                try dest.appendValue(a, "PCOUNT", .{ .int = 29 }, null);
+                try dest.appendValue(a, matrixName(&buf, "PC", 5, 5, alt).?, .{ .float = 1 }, null);
+                try dest.appendValue(a, indexedName(&buf, "CROTA", 2, alt).?, .{ .float = -12 }, null);
+                const other: u8 = if (alt == ' ') 'A' else ' ';
+                try dest.appendValue(a, matrixName(&buf, "CD", 1, 1, other).?, .{ .float = 7 }, null);
+                try dest.appendValue(a, indexedName(&buf, "CROTA", 2, other).?, .{ .float = 19 }, null);
+                try dest.ensureEnd(a);
+                try w.writeTo(a, &dest);
+                try testing.expect(dest.at(dest.count() - 1).kind == .end);
+                const count = dest.count();
+                try w.writeTo(a, &dest);
+                try testing.expectEqual(count, dest.count());
+                try testing.expectEqual(@as(i64, 29), try dest.getValue(i64, "PCOUNT"));
+                try testing.expect(!dest.has(matrixName(&buf, "PC", 5, 5, alt).?));
+                try testing.expect(!dest.has(indexedName(&buf, "CROTA", 2, alt).?));
+                try testing.expectEqual(@as(f64, 7), try dest.getValue(f64, matrixName(&buf, "CD", 1, 1, other).?));
+                try testing.expectEqual(@as(f64, 19), try dest.getValue(f64, indexedName(&buf, "CROTA", 2, other).?));
+                var reread = try Wcs.fromHeader(a, &dest, alt);
+                defer reread.deinit(a);
+                const after = try Celestial.fromWcs(&reread);
+                try testing.expectEqual(@as(f64, 1), reread.cdelt[after.lon_axis]);
+                try testing.expectEqual(@as(f64, 1), reread.cdelt[after.lat_axis]);
+                for (ctypes, 0..) |ctype, i| {
+                    if (std.mem.eql(u8, ctype, "FREQ")) try testing.expectEqual(@as(f64, 2), reread.cdelt[i]);
+                }
+                for (before.m, after.m) |want_row, got_row| {
+                    for (want_row, got_row) |want, got| try testing.expectApproxEqRel(want, got, 1e-12);
+                }
+                try reread.writeTo(a, &dest);
+                try testing.expectEqual(count, dest.count());
+                for ([_][2]f64{ .{ 1, 1 }, .{ 2, 3 }, .{ -5, 20 } }) |pixel| {
+                    const expected = try before.pixelToWorld(pixel);
+                    const actual = try after.pixelToWorld(pixel);
+                    for (expected, actual) |want, got| try testing.expectApproxEqAbs(want, got, 1e-10);
+                }
+            }
+        }
+    }
+}
+
+test "CROTA serialization remains sparse through a 100-axis reparse and rewrite" {
+    const Celestial = @import("celestial.zig").Celestial;
+    const a = testing.allocator;
+    var source: Header = .{};
+    defer source.deinit(a);
+    try source.appendValue(a, "WCSAXES", .{ .int = 100 }, null);
+    try source.appendValue(a, "CTYPE1", .{ .string = "RA---TAN" }, null);
+    try source.appendValue(a, "CTYPE2", .{ .string = "DEC--TAN" }, null);
+    try source.appendValue(a, "CRVAL1", .{ .float = 120 }, null);
+    try source.appendValue(a, "CRVAL2", .{ .float = 30 }, null);
+    try source.appendValue(a, "CDELT1", .{ .float = -0.05 }, null);
+    try source.appendValue(a, "CDELT2", .{ .float = 0.08 }, null);
+    try source.appendValue(a, "CDELT100", .{ .float = 2 }, null);
+    try source.appendValue(a, "CROTA2", .{ .float = 37 }, null);
+    var original = try Wcs.fromHeader(a, &source, ' ');
+    defer original.deinit(a);
+    const before = try Celestial.fromWcs(&original);
+
+    var dest: Header = .{};
+    defer dest.deinit(a);
+    try dest.ensureEnd(a);
+    try original.writeTo(a, &dest);
+    try testing.expect(!dest.has("CD1_1"));
+    try testing.expect(dest.has("PC1_1"));
+    try testing.expect(!dest.has("PC100_1"));
+    try testing.expectEqual(@as(f64, 1), try dest.getValue(f64, "CDELT1"));
+    try testing.expectEqual(@as(f64, 1), try dest.getValue(f64, "CDELT2"));
+    try testing.expectEqual(@as(f64, 2), try dest.getValue(f64, "CDELT100"));
+    const count = dest.count();
+    var reparsed = try Wcs.fromHeader(a, &dest, ' ');
+    defer reparsed.deinit(a);
+    try reparsed.writeTo(a, &dest);
+    try testing.expectEqual(count, dest.count());
+    try testing.expectEqual(.end, dest.at(dest.count() - 1).kind);
+    var final = try Wcs.fromHeader(a, &dest, ' ');
+    defer final.deinit(a);
+    try testing.expectEqual(@as(f64, 1), final.transform.pc[99][99]);
+    try testing.expectEqual(@as(f64, 0), final.transform.pc[99][0]);
+    const after = try Celestial.fromWcs(&final);
+    for ([_][2]f64{ .{ 1, 1 }, .{ 2, 3 }, .{ -5, 20 } }) |pixel| {
+        const expected = try before.pixelToWorld(pixel);
+        const actual = try after.pixelToWorld(pixel);
+        for (expected, actual) |want, got| try testing.expectApproxEqAbs(want, got, 1e-10);
+    }
+    // A required, nondefault PC100_100 still cannot fit a FITS keyword. Failure
+    // must preserve the destination rather than publishing the staged prefix.
+    const saved = try a.dupe(Card, dest.cards.items);
+    defer a.free(saved);
+    final.transform.pc[99][99] = 2;
+    try testing.expectError(error.BadWcs, final.writeTo(a, &dest));
+    try testing.expectEqual(saved.len, dest.count());
+    for (saved, dest.cards.items) |*want, *got| try testing.expectEqualSlices(u8, want.bytes(), got.bytes());
 }

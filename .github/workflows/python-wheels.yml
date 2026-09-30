@@ -149,6 +149,11 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test --summary all
 
+  external-interop:
+    name: external interoperability (release SHA)
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/external-interop.yml
+
   wheels:
     name: wheels ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -195,8 +200,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Build sdist
-        run: pipx run build --sdist
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build sdist and rebuild/install its wheel outside the checkout
+        run: |
+          set -euo pipefail
+          python -m pip install build
+          python -m build --sdist
+          work="$RUNNER_TEMP/sdist-consumer"
+          mkdir -p "$work/source" "$work/wheels"
+          tar -xzf dist/*.tar.gz -C "$work/source" --strip-components=1
+          cd "$work/source"
+          env -u PYTHONPATH -u ZIGFITSIO_LIBRARY python -m build --wheel --outdir "$work/wheels"
+          python -m venv "$work/venv"
+          "$work/venv/bin/python" -m pip install "$work"/wheels/*.whl pytest astropy
+          cd "$work"
+          env -u PYTHONPATH -u ZIGFITSIO_LIBRARY "$work/venv/bin/python" -m pytest --installed-package "$work/source/bindings/python/tests" -q
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sdist
@@ -230,7 +250,7 @@ jobs:
   publish-testpypi:
     name: publish to TestPyPI (rehearsal)
     if: github.event_name == 'workflow_dispatch' && inputs.publish_testpypi
-    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke]
+    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke, external-interop]
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -259,7 +279,7 @@ jobs:
     name: publish to PyPI
     # Strictly tag pushes: a workflow_dispatch run pointed at a tag ref must NOT publish here.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke]
+    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke, external-interop]
     runs-on: ubuntu-latest
     environment:
       name: pypi
