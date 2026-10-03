@@ -128,3 +128,14 @@ jobs:
   interop:
     name: external interop & golden parity
     uses: ./.github/workflows/external-interop.yml
+
+  interop-status:
+    # Keep this check name stable: the protect-main ruleset requires it.
+    name: external interop & golden parity (X-INTEROP/X-XVAL/X-SUM)
+    needs: interop
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "$INTEROP_RESULT" = success
+        env:
+          INTEROP_RESULT: ${{ needs.interop.result }}
