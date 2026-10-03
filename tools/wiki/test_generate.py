@@ -31,7 +31,7 @@ class GenerateWikiTests(unittest.TestCase):
 
     def test_c_header_has_ordered_neutral_abi(self) -> None:
         prototypes = _header_zf_prototypes()
-        self.assertEqual(len(prototypes), 99)
+        self.assertEqual(len(prototypes), 104)
         self.assertEqual(
             prototypes[0],
             {"name": "zf_version", "returns": "cstring_ret", "args": []},
@@ -48,6 +48,12 @@ class GenerateWikiTests(unittest.TestCase):
         )
         self.assertEqual(typescript["zf_open_file"]["args"][0], "buf")
         self.assertEqual(typescript["zf_open_file"]["args"][3], "buf")
+        self.assertEqual(python["zf_create_file_handle_v1"]["args"], ["usize", "void_ptr", "void_ptr_ptr"])
+        self.assertEqual(typescript["zf_create_file_handle_v1"]["args"], ["usize", "buf", "buf"])
+        self.assertEqual(python["zf_wopen_memory_begin_v2"]["args"], ["usize", "void_ptr", "void_ptr_ptr", "void_ptr_ptr"])
+        self.assertEqual(typescript["zf_wopen_memory_begin_v2"]["args"], ["usize", "buf", "buf", "buf"])
+        self.assertEqual(python["zf_wopen_memory_abort_v1"]["args"], ["void_ptr"])
+        self.assertEqual(typescript["zf_wopen_memory_abort_v1"]["args"], ["handle"])
         self.assertEqual(typescript["zf_create_tbl"]["args"][-4], "cstr_arr")
         self.assertEqual(typescript["zf_create_tbl"]["args"][-1], "cstr")
         self.assertEqual(

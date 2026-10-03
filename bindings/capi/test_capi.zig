@@ -1,6 +1,7 @@
 //! Round-trip tests for the C-ABI shim, calling the exported `zf_*` functions directly (no
 //! dlopen — the functions are imported as ordinary Zig symbols).
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const capi = @import("capi.zig");
 const abi = @import("abi.zig");
@@ -114,6 +115,30 @@ test "create in-memory image, write and read back f32" {
     try testing.expectEqualSlices(f32, &pixels, &out);
 }
 
+test "flat image bounds reject wrapping and crossing ranges without mutation" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const axes = [_]c_long{ 2, 2 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(h, 16, 2, &axes));
+    const pixels = [_]i16{ 1, 2, 3, 4 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(h, I16, 1, 4, null, null, &pixels));
+    for ([_]c_longlong{ 0, -1, 5, std.math.maxInt(c_longlong) }) |first| {
+        var out = [_]i16{ 99, 98 };
+        try testing.expectEqual(@as(c_int, 213), capi.zf_read_img(h, I16, first, 1, null, null, &out));
+        try testing.expectEqualSlices(i16, &.{ 99, 98 }, &out);
+        try testing.expectEqual(@as(c_int, 213), capi.zf_write_img(h, I16, first, 1, null, null, &out));
+    }
+    var out = [_]i16{ 99, 98 };
+    try testing.expectEqual(@as(c_int, 213), capi.zf_read_img(h, I16, 4, 2, null, null, &out));
+    try testing.expectEqual(@as(c_int, 213), capi.zf_write_img(h, I16, 4, 2, null, null, &out));
+    try testing.expectEqual(@as(c_int, 213), capi.zf_read_img(h, I16, 1, -1, null, null, &out));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(h, I16, 0, 0, null, null, &out));
+    var actual: [4]i16 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(h, I16, 1, 4, null, null, &actual));
+    try testing.expectEqualSlices(i16, &pixels, &actual);
+}
+
 test "Wasm memory builder adopts bytes and scoped view exposes the final device" {
     var source: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
@@ -154,6 +179,56 @@ test "Wasm memory builder adopts bytes and scoped view exposes the final device"
     try testing.expect(capi.zf_wopen_memory_commit_v1(malformed, 0, null, &rejected) != 0);
     try testing.expect(rejected == null); // commit consumed and freed the malformed builder
     capi.zf_close(source);
+}
+
+test "memory open and owned builder enforce allocation limits before copying" {
+    var opts = abi.ZfOpenOpts{ .max_open_alloc = 3 };
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 412), capi.zf_open_memory("data", 4, 0, &opts, &h));
+    try testing.expect(h == null);
+    var builder: ?*capi.MemoryBuilder = null;
+    var bytes: ?[*]u8 = null;
+    try testing.expectEqual(@as(c_int, 412), capi.zf_wopen_memory_begin_v2(4, &opts, &builder, &bytes));
+    try testing.expect(builder == null and bytes == null);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wopen_memory_begin_v2(3, &opts, &builder, &bytes));
+    capi.zf_wopen_memory_abort_v1(builder);
+    // Legacy begin can allocate with defaults, but commit must apply the supplied ceiling.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_wopen_memory_begin_v1(4, &builder, &bytes));
+    @memcpy(bytes.?[0..4], "data");
+    try testing.expectEqual(@as(c_int, 412), capi.zf_wopen_memory_commit_v1(builder, 0, &opts, &h));
+    try testing.expect(h == null);
+}
+
+test "borrowed file handle C ABI writes disk bytes without owning the OS handle" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing.io, "borrowed.fits", .{ .read = true });
+    defer file.close(testing.io);
+    const native_handle: usize = if (builtin.os.tag == .windows) @intFromPtr(file.handle) else @intCast(file.handle);
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 104), capi.zf_create_file_handle_v1(native_handle, null, null));
+    h = @ptrFromInt(16); // failure must clear even a caller's non-null sentinel
+    try testing.expectEqual(@as(c_int, 112), capi.zf_create_file_handle_v1(std.math.maxInt(usize), null, &h));
+    try testing.expect(h == null);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_file_handle_v1(native_handle, null, &h));
+    {
+        defer capi.zf_close(h);
+        const axes = [_]c_long{2};
+        try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(h, 16, 1, &axes));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(h, I16, 1, 2, null, null, &[_]i16{ 17, -23 }));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_flush(h));
+        var pixels: [2]i16 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(h, I16, 1, 2, null, null, &pixels));
+        try testing.expectEqualSlices(i16, &.{ 17, -23 }, &pixels);
+    }
+    var stored: [4]u8 = undefined;
+    try testing.expectEqual(stored.len, try file.readPositionalAll(testing.io, &stored, 2880));
+    try testing.expectEqualSlices(u8, &.{ 0, 17, 255, 233 }, &stored);
+    try testing.expectEqual(@as(u64, 5760), try file.length(testing.io));
+    h = null;
+    try testing.expectEqual(@as(c_int, 112), capi.zf_create_file_handle_v1(native_handle, null, &h));
+    try testing.expect(h == null);
+    try testing.expectEqual(@as(u64, 5760), try file.length(testing.io));
 }
 
 test "geometry and header keyword round-trip" {
@@ -713,6 +788,11 @@ test "tile-compressed image round-trips through zf_read_img" {
     var out: [256]i32 = undefined;
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, I32, 1, 256, null, null, &out));
     try testing.expectEqualSlices(i32, &ramp, &out);
+    // Partial compressed reads have no flat-range implementation: fail before writing pixels.
+    out = @splat(99);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_read_img(hh, I32, 2, 255, null, null, &out));
+    for (out) |value| try testing.expectEqual(@as(i32, 99), value);
+    try testing.expectEqual(@as(c_int, 213), capi.zf_read_img(hh, I32, 2, 256, null, null, &out));
 }
 
 test "zf_write_compressed2: lossy HCOMPRESS knobs cross the ABI (arg order, ZVAL cards, bounds)" {

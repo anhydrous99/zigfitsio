@@ -21,6 +21,17 @@ generators live **only** here — the CI `guards` job greps `src tools test` for
 CFITSIO prefix defaults to `/opt/homebrew/Cellar/cfitsio/4.6.4`; override with
 `make golden CFITSIO_PREFIX=/path/to/cfitsio`.
 
+## Memory benchmark comparison
+
+For an informational performance comparison, run `make -C interop benchmark`. It builds the
+external C baseline with `-O3` and runs the Zig benchmark with `ReleaseFast`, reporting medians
+from five independent process runs. Both use memory files, native arrays containing `i % 1000`,
+1024×1024 f32/f64/i16/i32 images, matching 40/20/40/40 bulk transfer counts, and a warmed
+512×512 i16 GZIP_1 image with 32×32 tiles and 20 reads. Every run checks the pixel round trip.
+The tools include their respective default buffering and codec behavior; ratios describe these
+workloads on the current machine and do not establish a universal speed claim or block releases.
+The C baseline remains confined to `interop/`; the core keeps its empty dependency set.
+
 ## Determinism contract (why CFITSIO, not Astropy, writes the bytes)
 
 Committed binary goldens must be **byte-identical across regenerations** or the CI drift-guard

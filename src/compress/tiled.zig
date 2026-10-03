@@ -851,13 +851,11 @@ pub const TiledImage = struct {
 
     // Decode (or read) the stored-value bytes of tile `row`, choosing the payload column per the
     // §10.1 precedence: COMPRESSED_DATA → GZIP_COMPRESSED_DATA → UNCOMPRESSED_DATA → all-zero.
-    // The gzip decode ceiling is `expected + 1`: `std`'s bounded reader reports `StreamTooLong`
-    // when the stream meets *or exceeds* the limit, so an exact-size tile needs headroom of one
-    // byte; the caller's `stored_bytes.len == expected` check still enforces exactness. RICE/PLIO/
+    // The gzip decode ceiling is inclusive; the caller also checks exact payload size. RICE/PLIO/
     // HCOMPRESS produce stored values that this routine re-encodes big-endian (width `w`) so the
     // common placement loop can read them with `endian.read`.
     fn decodeTile(self: *TiledImage, reader: *RawPayloadReader, alloc: Allocator, payload: ResolvedPayload, w: usize, expected: u64, npix_tile: u64, tdim: []const u64) ReadError![]u8 {
-        const cap = expected + 1;
+        const cap = expected;
         switch (payload.source) {
             .compressed => {
                 const cbytes = try reader.read(alloc, payload.raw.?);
@@ -1936,8 +1934,8 @@ pub const TileTable = struct {
                 const cbytes = try payloads.read(alloc, payload);
                 defer alloc.free(cbytes);
                 const stored = switch (c.codec) {
-                    .gzip_1 => try gzip.gzipDecode(alloc, cbytes, expected + 1),
-                    .gzip_2 => try gzip.gzip2Decode(alloc, cbytes, w, expected + 1),
+                    .gzip_1 => try gzip.gzipDecode(alloc, cbytes, expected),
+                    .gzip_2 => try gzip.gzip2Decode(alloc, cbytes, w, expected),
                     else => unreachable,
                 };
                 defer alloc.free(stored);

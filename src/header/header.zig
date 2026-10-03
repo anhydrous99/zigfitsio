@@ -52,7 +52,10 @@ pub const Header = struct {
         errdefer self.deinit(alloc);
         var i: usize = 0;
         while (i < max_cards) : (i += 1) {
-            const raw = try reader.cardAt(first_card + i);
+            const raw = reader.cardAt(first_card + i) catch |err| switch (err) {
+                error.EndOfStream => return error.MissingEnd,
+                else => return err,
+            };
             const card = try Card.parse(raw);
             try self.cards.append(alloc, card);
             if (card.kind == .end) return .{ .header = self, .cards_consumed = i + 1 };

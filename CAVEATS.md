@@ -1,11 +1,10 @@
 # Caveats & Known Limitations
 
-Honest caveats for the FITS-conformance hardening work (originally delivered on branch
-`finish-fits-conformance`, since merged). The library builds clean and passes **564/564 Zig
-tests** (plus the 25-test C-ABI suite and 117 Python binding tests), `zig build wasm-check`,
-`zig build fuzz` (headers, tables, AND the tile codecs — direct decoder targets plus a
-compressed-HDU byte-mutation target), and `zig build bench`, with **zero `@cImport`** (pure
-Zig std, `GC-1`/`GC-2`).
+Current limits of the FITS core and its bindings. Verification uses `zig build test` (core,
+C ABI, corpus, e2e, and goldens), `zig build wasm-check`, and `zig build fuzz` (headers,
+tables, direct tile decoders, and compressed-HDU mutation). The core remains pure Zig std,
+with no C imports or third-party build dependencies. Measured validation results are dated
+at the end of this document.
 
 The cross-tool interoperability previously listed here as *unconfirmed* is now **verified
 against CFITSIO 4.6.4 + Astropy** (§1); the genuinely-remaining limits are stated plainly below.
@@ -145,14 +144,22 @@ The bindings under `bindings/` are **additive**: a `zf_*` C-ABI shim (`bindings/
 `zig build capi`) over the public Zig module, a low-level `ctypes` binding, a high-level
 NumPy/Astropy-style API, and a TypeScript package (`bindings/typescript/`) mirroring the same two
 layers (a single WebAssembly build of the same C ABI under an astropy-style TypedArray API,
-running on Node/Bun/browsers). `src/` is unchanged
-and contains **no C** (the `.h` contract lives under `bindings/c/`, outside the `GC-1` guard's
+running on Node/Bun/browsers). `src/` contains **no C** (the `.h` contract lives under
+`bindings/c/`, outside the `GC-1` guard's
 `src tools test` scope). Interoperability is verified both directions against Astropy and the
 committed golden corpus, plus a TS↔Python cross-check in CI. Honest limits as delivered (they
 apply to both language bindings unless noted; TypeScript-specific ones are listed at the end):
 
 - **Not a CFITSIO drop-in.** The exported symbols are `zf_*`, not `fits_*`/`ff*`; the ABI is
   purpose-built for bindings (opaque handles + runtime datatype codes), not a CFITSIO replacement.
+- **Compressed image transfers require the whole image.** C-ABI `zf_read_img` accepts a
+  compressed image only with `firstelem = 1` and its complete element count. Partial compressed
+  reads/writes and sections remain unsupported; plain-image ranges are checked before access.
+- **Allocation limits apply before memory ownership and inflation.** `max_open_alloc` bounds
+  native and wasm memory opens, owned-buffer builders, and decoded gzip output. The additive
+  `zf_wopen_memory_begin_v2` accepts options before allocation; v1 retains its signature and
+  default limit, and commit rechecks the supplied options. These are per-allocation limits,
+  not a cap on total process or WebAssembly linear memory.
 - **Integer null masks.** Float nulls surface as NaN. Integer **images** declaring `BLANK`
   (or `ZBLANK`/plain `BLANK` in a tile-compressed header) are promoted to float with NaN at the
   blanked pixels, matching astropy/funpack; the unsigned-`BZERO`-convention path intentionally
@@ -254,11 +261,10 @@ unchanged and always sufficient. Honest boundaries of that sugar:
 
 None of these require ABI changes to address — they are extension points, not design constraints.
 
-## 4. Bug-hunt fixes (branch `fix/bug-hunt-2026-07-02`) — known limitations & deferrals
+## 4. Update and reconstruction boundaries
 
-This branch fixes ~30 confirmed bugs across the compression interop, core safety, the C-ABI, and
-the Python bindings (see `CHANGELOG.md`). Everything below is a deliberate, documented boundary of
-that work — each is *fail-loud* (a clear error), never silent data loss.
+The fixes are recorded in `CHANGELOG.md`. The remaining boundaries below raise clear errors
+when the requested reconstruction or update is unsupported.
 
 - **Python: in-place update of a *compressed* image is not supported.** Mutating a materialized
   `CompImageHDU`'s pixels and then `flush()`/`close()` (update mode) raises `NotImplementedError`
@@ -277,9 +283,17 @@ that work — each is *fail-loud* (a clear error), never silent data loss.
   user keywords, VLA heaps, compression bytes, and checksums survive verbatim. Documented
   boundaries, each fail-loud: the **primary HDU must remain first** (`insert(0, …)`, `del h[0]`,
   `reverse()` raise `NotImplementedError` — use `writeto()`); the **same HDU object may not occupy
-  two positions** (`ValueError` — insert a copy instead); an HDU adopted from *another* HDUList is
-  re-serialized through the reconstruct path, which does not yet preserve a table's user keywords
-  (pre-existing `_emit` limitation, tracked in `BUGHUNT-2026-07-06.md`). One undetected aliasing
+  two positions** (`ValueError` — insert a copy instead). An HDU adopted from *another* HDUList is
+  re-serialized through the reconstruct path: science and provenance cards are preserved while
+  layout, scaling, and indexed column metadata are regenerated or remapped to the emitted schema.
+  Column ranges and table WCS use compatible source-column identities, including alternate
+  descriptions and matrix terms. Removing or retyping a required coordinate column drops its
+  affected WCS description as a set; references to a removed coordinate target are also dropped,
+  using the case-sensitive labels specified by [FITS WCS cross-references](https://ned.ipac.caltech.edu/level5/Sept02/Greisen/Greisen3_5.html).
+  Inherited measured `TDMINn`/`TDMAXn` bounds are omitted on
+  reconstruction; fresh detached schemas may explicitly supply bounds, and pristine byte copies
+  preserve them.
+  One undetected aliasing
   edge (same as astropy): a single `Header` object shared between two different HDUs — the
   last-flushed HDU wins the header's live-persist hook; give each HDU its own `Header`.
 - **Python: `append` and structural table edits go through the file, not a scratch copy.** Appending
@@ -307,17 +321,44 @@ that work — each is *fail-loud* (a clear error), never silent data loss.
   goldens use an all-positive field so every reference build agrees on every bit; the hermetic
   round-trip unit tests (`NO_DITHER`, `SUBTRACTIVE_DITHER_2`, lossless-fallback/±Inf tiles,
   ZBLANK) still cover zero-crossing data semantically.
-- **ASCII-table float TFORM is reconstructed heuristically on copy.** When a *modified* ASCII table
-  is re-serialized, a float column's `Ew.d` precision is derived as `E{w}.{w-7}` from the column
-  width, because the C ABI's `ZfColInfo` exposes width and typecode but not the original `TDISP`/
-  format string — a re-written ASCII float column may not preserve the source's exact displayed
-  precision. Integer (`Iw`) and character (`Aw`) ASCII columns reconstruct exactly. Reading ASCII
-  columns (including wide `I11`-style integers) is exact.
+- **Table reconstruction uses stored formats.** Attached `TFORMn` values come from a fresh native
+  header snapshot, so local edits to structural cards do not redefine stored cells. Materialized
+  VLA writes retain their P/Q descriptor and element type but omit optional maximum lengths;
+  pristine raw copies retain their original bytes and maxima.
+- **ASCII table reconstruction requires known column formats.** Source `TFORMn` cards and
+  detached `from_columns`/`fromColumns` specifications preserve exact `Iw`, `Aw`, and `Fw.d`/
+  `Ew.d`/`Dw.d` formats. Same-schema replacement reuses those formats after validation. Schema
+  changes that require ASCII format inference raise a clear unsupported error; construct explicit
+  columns instead. Replacing or clearing detached builder data never reuses the original arrays.
+- **Atomic file replacement is not a crash-recovery journal.** TypeScript update close writes
+  the exact flushed bytes through an exclusive sibling temporary file, then renames it into place;
+  partial-write and rename failures preserve the original. `writeTo()` and Python `writeto()` use
+  the same staging policy, preserving an existing file's permissions. New Python files honor
+  umask; reconstruction emits directly through `zf_create_file_handle_v1` into the already-open
+  exclusive temporary file. The native FITS handle borrows that descriptor and never closes it;
+  Python retains it until native flush/close completes. This avoids a whole-output memory buffer
+  and requires a native library with that additive symbol. Native Python update close
+  still flushes its open native file in place. These APIs do not promise `fsync` durability or
+  recovery from a process or system crash during an in-place native update.
 
 ### Delivery status (point-in-time)
 
-The work lives on branch `fix/bug-hunt-2026-07-02`, organized as area-staged, individually-green
-commits (compression interop, core memory-safety/DoS, C-ABI, low-severity hardening, Python
-data-loss+correctness, Python features, and a self-review fixup). All suites pass: **519/519 Zig
-tests in both Debug and ReleaseFast**, `zig build capi-test`, `zig build wasm-check`, and the
-Python suite (`pytest bindings/python/tests`). This section is moot once the branch is merged.
+Local validation on 2026-09-30 passed 720 hermetic Zig tests plus 12 seeded fuzz tests,
+with one additional Linux-only direct-I/O test skipped on macOS, `zig build wasm-check`,
+311 Python tests, and 369 Vitest tests on Node 24. Bun passed 368 tests with one deliberate skip
+for a Node-only file-growth injection. The installed sdist-built wheel passed all 311 Python tests
+with package and native-library provenance checked in site-packages.
+The packed npm artifact passed Node 18.0.0 and Node 20 consumer checks and a Vite production
+build in real Chrome using default `ready()` wasm loading. The external checks verified 30
+inbound goldens and 13 outbound FITS files with Astropy, funpack, and checksum-bearing fitsverify.
+Additional Astropy-authored table probes checked remapped primary/alternate coordinates and
+grown variable-length cells through both bindings; the written files passed `fitsverify`.
+The direct-file writer matched native file output's peak memory (about 95 MiB for a 64 MiB image),
+compared with about 195 MiB for the whole-output memory path in the same separate-process probe.
+Linux and Windows native builds cross-compiled; those platform runtimes were not exercised here.
+
+CI now requires external interop on every PR/main run and schedule, and explicitly on each
+release SHA. Its big-endian job requires `qemu-s390x` and runs the full build suite without a
+fallback that could hide a failed cell; that Linux/QEMU job was not executed on this macOS host.
+`make -C interop benchmark` reports five-run optimized memory-workload medians against CFITSIO;
+the measured ratios are informational and make no universal speed or release-threshold claim.

@@ -151,6 +151,17 @@ pub const Fits = struct {
         return openFile(alloc, path, .create, opts);
     }
 
+    /// Create over a caller-owned empty blocking read/write regular file. The handle owns
+    /// only its device wrapper; the caller keeps the native OS handle open through deinit.
+    pub fn createFileHandle(alloc: Allocator, native_handle: usize, opts: OpenOpts) FitsError!Fits {
+        if (freestanding) return error.NotWritable;
+        const dev = try FileDevice.fromHandle(alloc, native_handle);
+        errdefer dev.close();
+        var self = try create(alloc, dev, opts);
+        self.owns_device = true;
+        return self;
+    }
+
     /// Open a whole-file gzip-compressed FITS image already in memory (`compressed` holds the raw
     /// `*.fits.gz` bytes): inflate it into a fresh in-memory device the handle owns and open it
     /// read-only (FR-RMT-2). A corrupt/truncated container is reported as `error.ReadFailed` and a
@@ -243,20 +254,30 @@ pub const Fits = struct {
     fn scanOne(self: *Fits) FitsError!?*Hdu {
         if (self.fully_scanned) return null;
         const size = try self.dev.getSize();
-        if (self.scan_off >= size or size - self.scan_off < block.BLOCK) {
+        if (self.scan_off >= size) {
+            self.fully_scanned = true;
+            return null;
+        }
+        if (self.hdus.items.len > 0) {
+            // Classify special records by their signature, never by a parser error: a
+            // recognizable extension must report malformed headers and device failures.
+            var signature: [8]u8 = undefined;
+            if (size - self.scan_off < signature.len) {
+                self.fully_scanned = true;
+                return null;
+            }
+            try self.dev.readAll(&signature, self.scan_off);
+            if (!std.ascii.eqlIgnoreCase(&signature, "XTENSION")) {
+                self.fully_scanned = true;
+                return null;
+            }
+        } else if (size - self.scan_off < block.BLOCK) {
             self.fully_scanned = true;
             return null;
         }
         const first_card = self.scan_off / block.CARD;
         const max_cards = @as(u64, self.limits.max_header_blocks) * block.CARDS_PER_BLOCK;
-        const res = Header.parse(self.alloc, &self.reader, first_card, @intCast(max_cards)) catch |err| {
-            // After at least one HDU, a non-header tail is treated as special records, not an error.
-            if (self.hdus.items.len > 0) {
-                self.fully_scanned = true;
-                return null;
-            }
-            return err;
-        };
+        const res = try Header.parse(self.alloc, &self.reader, first_card, @intCast(max_cards));
 
         const is_primary = self.hdus.items.len == 0;
         const hdu_ptr = self.alloc.create(Hdu) catch |e| {
@@ -265,23 +286,8 @@ pub const Fits = struct {
             return e;
         };
         errdefer self.alloc.destroy(hdu_ptr);
-        // Hdu.init takes ownership of the header (frees it on its own error). Special-records
-        // policy (§3.5): once at least one HDU has been scanned, a trailing 2880-byte region that
-        // is NOT a recognizable extension HDU is treated as special records — not a hard error —
-        // exactly as the Header.parse failure above is. The "special-records signature" is a block
-        // that lacks a valid `XTENSION` (`MissingRequiredKeyword`) or names an unknown extension
-        // type (`BadExtension`); a structurally-intended-but-malformed extension (bad BITPIX /
-        // NAXIS / keyword order / limit overflow) still propagates so the caller learns of it.
-        hdu_ptr.* = Hdu.init(self.alloc, res.header, is_primary, self.scan_off, res.cards_consumed, self.limits) catch |err| {
-            if (self.hdus.items.len > 0 and
-                (err == error.MissingRequiredKeyword or err == error.BadExtension))
-            {
-                self.alloc.destroy(hdu_ptr); // success-return path: the errdefer above won't fire
-                self.fully_scanned = true;
-                return null;
-            }
-            return err; // errdefer destroys hdu_ptr; Hdu.init already freed res.header
-        };
+        // Hdu.init takes ownership of the header, including on failure.
+        hdu_ptr.* = try Hdu.init(self.alloc, res.header, is_primary, self.scan_off, res.cards_consumed, self.limits);
         errdefer hdu_ptr.deinit(self.alloc);
         // Enforce the documented NFR-SAFE-1 ceiling on scanned HDU count (was never checked, so a
         // file of many tiny headers could be scanned without bound).
@@ -664,57 +670,116 @@ pub const Fits = struct {
     /// structural keywords (`NAXISn`/`TFORM`/`TFIELDS`/`BITPIX`). Re-inits the block reader.
     pub fn rewriteHeaderInPlace(self: *Fits, hdu: *Hdu) FitsError!void {
         if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        var staged: Header = .{ .inherit = hdu.header.inherit };
+        defer staged.deinit(self.alloc);
+        try staged.cards.appendSlice(self.alloc, hdu.header.cards.items);
+        try self.replaceStructuralHeaderInPlace(hdu, &staged);
+    }
+
+    /// Commit a staged structural header and its geometry. Preparation errors leave the
+    /// live HDU and device unchanged. On success `staged` owns the former header. Physical
+    /// I/O failures receive best-effort rollback; this is not a journaled transaction.
+    pub fn replaceStructuralHeaderInPlace(self: *Fits, hdu: *Hdu, staged: *Header) FitsError!void {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        const scanned_count = self.hdus.items.len;
+        const scan_off = self.scan_off;
+        const fully_scanned = self.fully_scanned;
+        errdefer {
+            for (self.hdus.items[scanned_count..]) |added| {
+                added.deinit(self.alloc);
+                self.alloc.destroy(added);
+            }
+            self.hdus.shrinkRetainingCapacity(scanned_count);
+            self.scan_off = scan_off;
+            self.fully_scanned = fully_scanned;
+        }
         try self.ensureScannedAll();
-        try hdu.header.ensureEnd(self.alloc);
+        try staged.ensureEnd(self.alloc);
+        const naxis = staged.getValue(u16, "NAXIS") catch return error.BadNaxis;
+        if (naxis > 999) return error.BadNaxis;
+        try self.reorderMandatoryOrder(staged, hdu.kind, naxis);
+        try hdu_mod.validate(staged, hdu.kind);
 
-        // In-place edits (`Header.update`) append new keywords at the END of the header, so e.g.
-        // promoting an image to a higher dimension leaves the freshly-added NAXISn out of its
-        // mandated position. Normalize the mandatory-keyword order before serializing so the
-        // rewritten file stays conformant with the §4.4.1.1 ordering that `hdu.validate` enforces
-        // when the file is later re-scanned.
-        const naxis_now: u16 = blk: {
-            const v = hdu.header.getValue(i64, "NAXIS") catch break :blk hdu.naxis;
-            if (v < 0 or v > 999) break :blk hdu.naxis;
-            break :blk @intCast(v);
-        };
-        try self.reorderMandatoryOrder(&hdu.header, hdu.kind, naxis_now);
+        // Compute geometry on a separate value, preserving the registered HDU's identity.
+        var candidate = hdu.*;
+        candidate.header = staged.*;
+        candidate.axes = &.{};
+        try candidate.recomputeGeometry(self.alloc, self.limits);
+        defer self.alloc.free(candidate.axes);
 
-        // Validate + commit the new geometry BEFORE touching the device. recomputeGeometry is
-        // atomic (leaves the HDU unchanged on failure) and derives everything from the edited
-        // header, so an invalid edit (bad BITPIX, over-limit NAXIS product, …) fails HERE — before
-        // any shiftTail/writeTo grows or relocates bytes — instead of leaving a grown, partially
-        // rewritten device with no rollback. `old_data_bytes` is the current on-disk data length,
-        // captured before the commit for the resize below.
-        const old_data_bytes = hdu.data_bytes;
-        try hdu.recomputeGeometry(self.alloc, self.limits);
-        const new_data_bytes = hdu.data_bytes;
+        const old_header_blocks = hdu.data_off - hdu.header_off;
+        const new_header_blocks = block.roundUpBlocks(try limits.mul(staged.count(), block.CARD));
+        if (new_header_blocks / block.BLOCK > self.limits.max_header_blocks) return error.LimitExceeded;
+        try limits.ensureWithin(old_header_blocks, self.limits.max_open_alloc, null);
+        try limits.ensureWithin(new_header_blocks, self.limits.max_open_alloc, null);
+        const old_len = std.math.cast(usize, old_header_blocks) orelse return error.LimitExceeded;
+        const new_len = std.math.cast(usize, new_header_blocks) orelse return error.LimitExceeded;
+        const old_data_blocks = block.roundUpBlocks(hdu.data_bytes);
+        const new_data_blocks = block.roundUpBlocks(candidate.data_bytes);
+        const header_delta = try byteDelta(new_header_blocks, old_header_blocks);
+        const data_delta = try byteDelta(new_data_blocks, old_data_blocks);
+        const total_delta = std.math.add(i64, header_delta, data_delta) catch return error.LimitExceeded;
+        const new_data_off = try limits.add(hdu.header_off, new_header_blocks);
+        const old_next = try limits.add(hdu.data_off, old_data_blocks);
+        const shifted_next = try limits.add(new_data_off, old_data_blocks);
+        const new_next = try limits.add(new_data_off, new_data_blocks);
+        const old_size = try self.dev.getSize();
+        if (old_next > old_size) return error.EndOfStream;
+        const shifted_size = try checkedDelta(old_size, header_delta);
+        _ = try checkedDelta(shifted_size, data_delta);
+        _ = try checkedDelta(self.scan_off, total_delta);
 
-        // Belt-and-suspenders: restore the device size if any device write below fails.
-        const pre_size = try self.dev.getSize();
-        errdefer self.dev.setSize(pre_size) catch {};
+        // Allocate and serialize before moving bytes, including the replacement read cache.
+        const old_bytes = try self.alloc.alloc(u8, old_len);
+        defer self.alloc.free(old_bytes);
+        try self.dev.readAll(old_bytes, hdu.header_off);
+        const new_bytes = try self.alloc.alloc(u8, new_len);
+        defer self.alloc.free(new_bytes);
+        @memset(new_bytes, ' ');
+        for (staged.cards.items, 0..) |*card, i| {
+            @memcpy(new_bytes[i * block.CARD ..][0..block.CARD], card.bytes());
+        }
+        var fresh_reader = try block.BlockReader.init(self.alloc, self.dev, 0);
+        var fresh_owned = true;
+        defer if (fresh_owned) fresh_reader.deinit();
 
-        const old_header_blocks = hdu.data_off - hdu.header_off; // already block-aligned
-        const new_header_blocks = block.roundUpBlocks(@as(u64, hdu.header.count()) * block.CARD);
-        const header_delta: i64 =
-            @as(i64, @intCast(new_header_blocks)) - @as(i64, @intCast(old_header_blocks));
+        var header_shifted = false;
+        var data_shifted = false;
+        errdefer {
+            if (data_shifted) self.shiftTailImpl(new_next, -data_delta, false) catch {};
+            if (header_shifted) self.shiftTailImpl(new_data_off, -header_delta, false) catch {};
+            self.dev.writeAll(old_bytes, hdu.header_off) catch {};
+            self.dev.setSize(old_size) catch {};
+            self.reader.loaded = false;
+        }
         if (header_delta != 0) {
-            try self.shiftTail(hdu.data_off, header_delta);
-            self.shiftFollowing(hdu, header_delta);
-            hdu.data_off = hdu.header_off + new_header_blocks;
+            try self.shiftTailImpl(hdu.data_off, header_delta, false);
+            header_shifted = true;
         }
-
-        // Re-write the header cards at their (possibly unchanged) offset, padding with spaces.
-        var bw = try block.BlockWriter.init(self.alloc, self.dev, hdu.header_off, 0);
-        defer bw.deinit();
-        try hdu.header.writeTo(&bw);
-
-        // Re-align the data if the new geometry changed its size.
-        if (new_data_bytes != old_data_bytes) {
-            hdu.data_bytes = old_data_bytes; // restore so resizeHduData sees the on-disk size
-            try self.resizeHduData(hdu, new_data_bytes); // re-inits the reader
-        } else {
-            try self.reinitReader();
+        if (data_delta != 0) {
+            try self.shiftTailImpl(shifted_next, data_delta, false);
+            data_shifted = true;
         }
+        const keep = @min(hdu.data_bytes, candidate.data_bytes);
+        try self.fillRange(new_data_off + keep, new_data_blocks - keep, dataFillByte(hdu));
+        try self.dev.writeAll(new_bytes, hdu.header_off);
+
+        self.shiftFollowing(hdu, total_delta);
+        hdu.data_off = new_data_off;
+        const old_header = hdu.header;
+        hdu.header = staged.*;
+        staged.* = old_header;
+        const old_axes = hdu.axes;
+        hdu.axes = candidate.axes;
+        candidate.axes = old_axes;
+        hdu.bitpix = candidate.bitpix;
+        hdu.naxis = candidate.naxis;
+        hdu.pcount = candidate.pcount;
+        hdu.gcount = candidate.gcount;
+        hdu.data_bytes = candidate.data_bytes;
+        self.reader.deinit();
+        self.reader = fresh_reader;
+        fresh_owned = false;
         hdu.bumpHeaderRevision();
     }
 
@@ -899,6 +964,30 @@ fn validBitpix(b: i64) bool {
         8, 16, 32, 64, -32, -64 => true,
         else => false,
     };
+}
+
+fn createBorrowedForAllocationTest(alloc: Allocator, native_handle: usize) !void {
+    var f = try Fits.createFileHandle(alloc, native_handle, .{});
+    defer f.deinit();
+}
+
+test "borrowed file handle remains open after create allocation failures" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const caller = try tmp.dir.createFile(testing.io, "borrowed.fits", .{ .read = true });
+    defer caller.close(testing.io);
+    const handle: usize = if (builtin.os.tag == .windows) @intFromPtr(caller.handle) else @intCast(caller.handle);
+    try testing.checkAllAllocationFailures(testing.allocator, createBorrowedForAllocationTest, .{handle});
+    try testing.expectEqual(@as(u64, 0), try caller.length(testing.io));
+    try caller.writePositionalAll(testing.io, "still open", 0);
+}
+
+fn byteDelta(new: u64, old: u64) errors.LimitError!i64 {
+    return std.math.cast(i64, @as(i128, new) - @as(i128, old)) orelse error.LimitExceeded;
+}
+
+fn checkedDelta(off: u64, delta: i64) errors.LimitError!u64 {
+    return std.math.cast(u64, @as(i128, off) + delta) orelse error.LimitExceeded;
 }
 
 // Apply a signed byte delta to an unsigned offset. Callers only ever shift offsets that lie at
@@ -1415,7 +1504,7 @@ test "copyHdu refuses to copy the primary and leaves the device unchanged" {
     try testing.expectEqual(count_before, try f.hduCount()); // no phantom HDU appended
 }
 
-test "trailing special records are not scanned as an HDU (Hdu.init signature swallowed)" {
+test "trailing special records are identified before header parsing" {
     var b = try newHandle(testing.allocator);
     defer b.deinit(testing.allocator);
     const f = &b.f;
@@ -1425,8 +1514,7 @@ test "trailing special records are not scanned as an HDU (Hdu.init signature swa
     const eof = try f.dev.getSize();
     try writeSpecialRecords(f.dev, eof);
 
-    // The trailing block parses as a header but is not a valid extension, so once ≥1 HDU exists it
-    // is treated as special records (consistent with the Header.parse path) and not counted.
+    // The trailing block has no extension signature, so it is not parsed or counted as an HDU.
     var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
     defer f2.deinit();
     try testing.expectEqual(@as(usize, 2), try f2.hduCount());
@@ -1440,8 +1528,7 @@ test "a trailing malformed extension still errors the scan (not special records)
     try f.flush();
     const eof = try f.dev.getSize();
 
-    // A block that names an extension but with an INVALID BITPIX (7). That is not the
-    // special-records signature (MissingRequiredKeyword/BadExtension), so it must propagate.
+    // An extension signature with invalid BITPIX must propagate its structural error.
     var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
     writeCardInto(&blk, 0, "XTENSION= 'IMAGE'");
     writeCardInto(&blk, 1, "BITPIX  =                    7");
@@ -1526,4 +1613,83 @@ test "distinct Fits handles run concurrently from multiple threads" {
     }
     for (&threads) |t| t.join();
     for (oks) |ok| try testing.expect(ok);
+}
+
+test "extension signature propagates missing keywords malformed values and missing END" {
+    const Case = struct { bitpix: ?[]const u8, end: bool = true, want: FitsError };
+    const cases = [_]Case{
+        .{ .bitpix = null, .want = error.MissingRequiredKeyword },
+        .{ .bitpix = "BITPIX  = 'broken'", .want = error.MissingRequiredKeyword },
+        .{ .bitpix = "BITPIX  =                    8", .end = false, .want = error.MissingEnd },
+    };
+    for (cases) |case| {
+        var b = try newHandle(testing.allocator);
+        defer b.deinit(testing.allocator);
+        _ = try b.f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+        var blk = [_]u8{' '} ** block.BLOCK;
+        writeCardInto(&blk, 0, "XTENSION= 'IMAGE'");
+        if (case.bitpix) |card| writeCardInto(&blk, 1, card);
+        writeCardInto(&blk, 2, "NAXIS   =                    0");
+        writeCardInto(&blk, 3, "PCOUNT  =                    0");
+        writeCardInto(&blk, 4, "GCOUNT  =                    1");
+        if (case.end) writeCardInto(&blk, 5, "END");
+        try b.f.dev.writeAll(&blk, block.BLOCK);
+        var reopened = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+        defer reopened.deinit();
+        try testing.expectError(case.want, reopened.hduCount());
+        try testing.expect(!reopened.fully_scanned);
+        const validate = @import("validate.zig");
+        var findings = try validate.verify(testing.allocator, &reopened);
+        defer validate.deinitFindings(testing.allocator, &findings);
+        try testing.expect(findings.items.len > 0);
+    }
+
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    _ = try b.f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    try b.f.dev.writeAll("XTENSION", block.BLOCK); // even a sub-block extension must not vanish
+    var reopened = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{});
+    defer reopened.deinit();
+    try testing.expectError(error.MissingEnd, reopened.hduCount());
+}
+
+test "extension scan propagates allocation and backing-read failures" {
+    const FaultReader = struct {
+        inner: Device,
+        fail_large_read: bool = false,
+        fn read(ctx: *anyopaque, buf: []u8, off: u64) errors.IoError!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.fail_large_read and buf.len > 8) return error.ReadFailed;
+            return self.inner.pread(buf, off);
+        }
+        fn size(ctx: *anyopaque) errors.IoError!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.getSize();
+        }
+        fn sync(_: *anyopaque) errors.IoError!void {}
+        fn close(_: *anyopaque) void {}
+        fn device(self: *@This()) Device {
+            return .{ .ptr = self, .vtable = &.{ .pread = read, .pwrite = null, .getSize = size, .setSize = null, .sync = sync, .close = close } };
+        }
+    };
+    const mem = try twoHduFile(testing.allocator);
+    defer {
+        mem.deinit();
+        testing.allocator.destroy(mem);
+    }
+    var faulty: FaultReader = .{ .inner = mem.device() };
+    var f = try Fits.open(testing.allocator, faulty.device(), .read_only, .{});
+    defer f.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    f.alloc = failing.allocator();
+    try testing.expectError(error.OutOfMemory, f.hduCount());
+    f.alloc = testing.allocator;
+    try testing.expect(!f.fully_scanned);
+
+    faulty.fail_large_read = true;
+    f.reader.loaded = false;
+    try testing.expectError(error.ReadFailed, f.hduCount());
+    try testing.expect(!f.fully_scanned);
+    faulty.fail_large_read = false;
+    try testing.expectEqual(@as(usize, 2), try f.hduCount());
 }

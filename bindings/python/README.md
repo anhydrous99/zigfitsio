@@ -19,8 +19,8 @@ I/O library. The native code is a Zig-built shared library loaded via `ctypes`, 
 pip install zigfitsio
 ```
 
-Prebuilt wheels need no compiler. Building from source requires a Zig 0.16 toolchain (supplied
-automatically by the `ziglang` build dependency, or a system `zig` on `PATH`).
+Prebuilt wheels need no compiler. To build from source, install Zig 0.16.0 and put `zig` on
+`PATH` before running pip. The build hook does not install the toolchain automatically.
 
 ## Quickstart
 
@@ -122,11 +122,17 @@ ll.lib.zf_close(h)
   automatically on read (images and table columns) and honored on write; the output dtype is
   widened to float when real scaling is present, or to `u2/u4/u8` for the unsigned convention.
 - Errors are raised as typed `FitsError` subclasses (`KeywordNotFound` is also a `KeyError`).
+- `writeto()` reconstructs directly into an exclusively created sibling file, without retaining
+  a second complete output in RAM. New files use normal umask permissions; replacing a file
+  preserves its existing mode. The bundled native library must provide `zf_create_file_handle_v1`
+  for reconstruction; `to_bytes()` remains the explicit in-memory serialization API.
 
 ## Known limitations
 
 - Not a CFITSIO drop-in — the ABI is purpose-built `zf_*` symbols, not `fits_*`.
-- Integer `BLANK`/`TNULLn` values are not auto-masked (no `numpy.ma`); float nulls surface as NaN.
+- Integer images declaring `BLANK` are promoted to float with NaN at blank pixels (the unsigned
+  `BZERO` convention keeps raw unsigned values). Table `TNULLn` values are not returned as
+  `numpy.ma` masks; float nulls surface as NaN.
 - In-place update of compressed images, VLA or scaled columns, or a changed row count raises —
   use `writeto()` to a new file instead.
 - Tables with duplicate effective column names can be inspected as metadata or copied verbatim,
@@ -134,6 +140,17 @@ ll.lib.zf_close(h)
   indexed column reads when duplicates must be addressed.
 - `writeto()` of a *scanned* quantized-float compressed image re-quantizes at the default level
   (the FITS header does not record the level).
+- Reconstructed tables and compressed images preserve science/provenance headers. Table layout,
+  units, scaling, and indexed metadata follow the emitted columns; unsupported scaled or complex
+  VLA reconstructions raise instead of replaying incompatible cards. Table WCS descriptions are
+  removed together if a required coordinate column or referenced coordinate target is deleted
+  or retyped. Attached formats come from the native source header; materialized VLA writes retain
+  their P/Q descriptor and element type but omit optional maximum lengths. Inherited measured
+  `TDMINn`/`TDMAXn` bounds are omitted during reconstruction because their validity cannot be
+  established after edits; pristine raw copies retain them.
+- Detached `from_columns()` tables honor later `.data` replacement and clearing. ASCII
+  replacement requires the same schema and reuses explicit/source formats; use new `Column`
+  specifications for schema changes.
 
 The full list lives in
 [CAVEATS.md](https://github.com/anhydrous99/zigfitsio/blob/main/CAVEATS.md).
@@ -145,6 +162,12 @@ zig build capi                    # build the shared library into zig-out/lib
 pip install -e .[test]            # editable install (builds the lib via the hook)
 pytest bindings/python/tests -q   # run the suite (incl. astropy cross-checks)
 ```
+
+Missing native libraries fail the suite rather than skipping it. For wheel verification, run
+`pytest --installed-package /path/to/source/bindings/python/tests -q` from outside the checkout
+after installing the wheel. That mode bypasses source/loader overrides and requires both the
+package in the interpreter's site-packages and its native library inside the installed package.
+CI also rebuilds a wheel from the sdist outside the checkout and runs this installed check.
 
 ## License
 

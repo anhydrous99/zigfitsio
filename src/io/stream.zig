@@ -12,6 +12,7 @@ const IoError = @import("../errors.zig").IoError;
 const LimitError = @import("../errors.zig").LimitError;
 const MemoryDevice = @import("memory.zig").MemoryDevice;
 const Device = @import("device.zig").Device;
+const gzip = @import("../compress/gzip.zig");
 
 /// Read every remaining byte of a sequential `reader` into a fresh in-memory `Device`,
 /// bounded by `max_bytes` (NFR-SAFE-1). The returned `MemoryDevice` owns its buffer; call
@@ -21,13 +22,13 @@ pub fn materialize(
     reader: *std.Io.Reader,
     max_bytes: u64,
 ) (LimitError || std.mem.Allocator.Error)!MemoryDevice {
-    const data = reader.allocRemaining(allocator, std.Io.Limit.limited64(max_bytes)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return error.LimitExceeded,
-        else => return error.LimitExceeded, // read failure: surface as a bounded-read failure
+    var data: std.ArrayList(u8) = .empty;
+    errdefer data.deinit(allocator);
+    gzip.appendBounded(allocator, reader, &data, max_bytes) catch |err| switch (err) {
+        error.ReadFailed => return error.LimitExceeded,
+        else => |e| return e,
     };
-    defer allocator.free(data);
-    return MemoryDevice.initBytes(allocator, data);
+    return MemoryDevice.initOwnedBytes(allocator, try data.toOwnedSlice(allocator));
 }
 
 /// Write all of `bytes` to a sequential `writer` (e.g. stdout or a gzip sink), flushing.
@@ -37,9 +38,9 @@ pub fn drainAll(writer: *std.Io.Writer, bytes: []const u8) IoError!void {
 }
 
 /// Local error for the gzip decode path: a malformed/truncated container or a deflate stream
-/// that fails to inflate. The `flate` decoder reports its concrete fault (bad magic, CRC32
-/// mismatch, oversubscribed Huffman tree, ...) by surfacing `error.ReadFailed`; we collapse
-/// every such fault into one typed value so callers fail-fast (FR-ERR-1/2) instead of
+/// that fails to inflate. The shared gzip decoder checks every member's CRC32 and ISIZE
+/// after the stdlib consumes its footer. Container and deflate faults collapse into one
+/// typed value so callers fail-fast (FR-ERR-1/2) instead of
 /// panicking on garbage input (NFR-INTEROP-1). Defined locally because `errors.zig`'s
 /// `CompressError` is the *tiled*-image codec set, not the whole-file gzip container.
 pub const GzipError = error{Corrupt};
@@ -55,10 +56,10 @@ const window_len = std.compress.flate.max_window_len;
 /// `std.compress.flate.Decompress` with `Container.gzip` — never hand-rolled.
 ///
 /// The *decompressed* size is bounded by `max_bytes` (NFR-SAFE-1): a payload that inflates to
-/// `max_bytes` or more is rejected with `error.LimitExceeded` rather than exhausting memory on
+/// more than `max_bytes` is rejected with `error.LimitExceeded` rather than exhausting memory on
 /// a zip-bomb. The returned `MemoryDevice` owns its buffer; call `deinit` on it.
 ///
-/// Errors: `LimitExceeded` (inflated size hit the ceiling), `OutOfMemory`, or `Corrupt`
+/// Errors: `LimitExceeded` (inflated size exceeds the ceiling), `OutOfMemory`, or `Corrupt`
 /// (bad/garbage/truncated gzip — surfaced as a typed error, never a panic).
 pub fn materializeGzip(
     allocator: std.mem.Allocator,
@@ -68,19 +69,8 @@ pub fn materializeGzip(
     const window = try allocator.alloc(u8, window_len);
     defer allocator.free(window);
 
-    var decompress = std.compress.flate.Decompress.init(reader, .gzip, window);
-    const data = decompress.reader.allocRemaining(
-        allocator,
-        std.Io.Limit.limited64(max_bytes),
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return error.LimitExceeded, // inflated past the ceiling
-        // The decoder reports its concrete fault via `decompress.err`; any decode failure or
-        // backing-read failure arrives here as `ReadFailed`. Collapse to a typed `Corrupt`.
-        error.ReadFailed => return error.Corrupt,
-    };
-    defer allocator.free(data);
-    return MemoryDevice.initBytes(allocator, data);
+    const data = try gzip.decodeMembers(allocator, reader, window, max_bytes);
+    return MemoryDevice.initOwnedBytes(allocator, data);
 }
 
 /// gzip-compress `bytes` into `writer` (the output side of whole-file gzip, FR-RMT-2) and

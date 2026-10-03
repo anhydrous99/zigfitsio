@@ -1,5 +1,5 @@
 /**
- * The 99 `zf_*` prototypes, mirroring `bindings/c/zigfitsio.h` (and the
+ * The `zf_*` prototypes, mirroring `bindings/c/zigfitsio.h` (and the
  * Python `lowlevel.py` `_PROTOS` table) exactly, in header order.
  *
  * ctypes → neutral mapping: handle args → "handle"; every out-scalar /
@@ -31,7 +31,12 @@ export const PROTOS: readonly Proto[] = [
   // ── lifecycle ──
   p("zf_open_file", "int", "buf", "usize", "int", "buf", "buf"),
   p("zf_create_file", "int", "buf", "usize", "buf", "buf"),
+  p("zf_create_file_handle_v1", "int", "usize", "buf", "buf"),
   p("zf_open_memory", "int", "buf", "usize", "int", "buf", "buf"),
+  p("zf_wopen_memory_begin_v1", "int", "usize", "buf", "buf"),
+  p("zf_wopen_memory_begin_v2", "int", "usize", "buf", "buf", "buf"),
+  p("zf_wopen_memory_commit_v1", "int", "handle", "int", "buf", "buf"),
+  p("zf_wopen_memory_abort_v1", "void", "handle"),
   p("zf_create_memory", "int", "buf", "buf"),
   p("zf_open_gzip", "int", "buf", "usize", "buf", "buf"),
   p("zf_flush", "int", "handle"),

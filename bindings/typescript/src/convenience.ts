@@ -1,6 +1,6 @@
 /** Module-level conveniences (port of the Python `core.py` module functions). */
 import { gunzip, readFile } from "./fsbridge.js";
-import { FitsIOError, FitsTypeError } from "./errors.js";
+import { FitsError, FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import { FitsArray } from "./fitsarray.js";
 import type { TypedArray } from "./dtypes.js";
@@ -44,10 +44,12 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
     throw new FitsTypeError(410, `invalid mode ${JSON.stringify(mode)}: expected 'readonly', 'update', or 'append'`);
   }
   const optBuf = opts === undefined ? null : ll.encodeOpenOpts(opts);
+  const maxAlloc = ll.effectiveOpenAlloc(opts);
   let bytes: Uint8Array;
   try {
-    bytes = readFile(path);
+    bytes = readFile(path, maxAlloc);
   } catch (e) {
+    if (e instanceof FitsError) throw e;
     // Surface a missing/unreadable file as a typed FITS error (parity with the old
     // path-based zf_open_file, which returned a FITS status rather than a raw fs error).
     throw new FitsIOError(104, `could not open file ${JSON.stringify(path)}: ${(e as Error).message}`);
@@ -59,7 +61,7 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
     if (modeCode !== ll.READONLY) {
       throw new FitsIOError(112, "a .gz file can only be opened in 'readonly' mode");
     }
-    const plain = gunzip(bytes);
+    const plain = gunzip(bytes, maxAlloc);
     return HDUList._fromHandle(openMemory(plain, ll.READONLY, optBuf), modeCode, opts?.checksumOnClose === true);
   }
   const hdul = HDUList._fromHandle(openMemory(bytes, modeCode, optBuf), modeCode, opts?.checksumOnClose === true);

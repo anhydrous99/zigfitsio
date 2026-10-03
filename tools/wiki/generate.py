@@ -181,6 +181,7 @@ _C_SCALARS = {
         "double": "f64",
         "long": "long",
         "size_t": "usize",
+        "uintptr_t": "usize",
 }
 
 
@@ -275,6 +276,7 @@ def _header_python_abi() -> list[dict[str, Any]]:
         if base in {
             "void",
             "ZfFits",
+            "ZfMemoryBuilder",
             "ZfTable",
             "ZfFindings",
             "ZfFingerprint128StateV1",
@@ -306,7 +308,7 @@ def _header_typescript_abi() -> list[dict[str, Any]]:
     """Map C declarations to the semantic neutral-FFI categories used by TypeScript."""
 
     result: list[dict[str, Any]] = []
-    handles = {"ZfFits", "ZfTable", "ZfFindings", "ZfFingerprint128StateV1"}
+    handles = {"ZfFits", "ZfMemoryBuilder", "ZfTable", "ZfFindings", "ZfFingerprint128StateV1"}
     for prototype in _raw_header_zf_prototypes():
         name = prototype["name"]
 

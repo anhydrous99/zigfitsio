@@ -287,8 +287,8 @@ pub const TimeSys = enum {
             .{ "TDB", TimeSys.tdb }, .{ "TCG", TimeSys.tcg }, .{ "TCB", TimeSys.tcb },
             .{ "UT1", TimeSys.ut1 }, .{ "GPS", TimeSys.gps }, .{ "LOCAL", TimeSys.local },
             // Deprecated synonyms (Table 30): TDT/ET ⇒ TT, IAT ⇒ TAI, GMT ⇒ UTC.
-            .{ "TDT", TimeSys.tt }, .{ "ET", TimeSys.tt },
-            .{ "IAT", TimeSys.tai }, .{ "GMT", TimeSys.utc },
+            .{ "TDT", TimeSys.tt },  .{ "ET", TimeSys.tt },   .{ "IAT", TimeSys.tai },
+            .{ "GMT", TimeSys.utc },
         };
         inline for (map) |e| if (std.ascii.eqlIgnoreCase(t, e[0])) return e[1];
         // A bare `UT` (generic Universal Time) is taken as UT1.
@@ -299,9 +299,16 @@ pub const TimeSys = enum {
     /// The canonical keyword string for this scale, or `null` for `.unknown`.
     pub fn toString(self: TimeSys) ?[]const u8 {
         return switch (self) {
-            .utc => "UTC", .tai => "TAI", .tt => "TT", .tdb => "TDB",
-            .tcg => "TCG", .tcb => "TCB", .ut1 => "UT1", .gps => "GPS",
-            .local => "LOCAL", .unknown => null,
+            .utc => "UTC",
+            .tai => "TAI",
+            .tt => "TT",
+            .tdb => "TDB",
+            .tcg => "TCG",
+            .tcb => "TCB",
+            .ut1 => "UT1",
+            .gps => "GPS",
+            .local => "LOCAL",
+            .unknown => null,
         };
     }
 };
@@ -337,12 +344,12 @@ pub const RefPos = enum {
         const map = .{
             .{ "TOP", RefPos.topocenter }, .{ "GEO", RefPos.geocenter },
             .{ "BAR", RefPos.barycenter }, .{ "REL", RefPos.relocatable },
-            .{ "CUS", RefPos.custom }, .{ "HEL", RefPos.heliocenter },
-            .{ "GAL", RefPos.galactic }, .{ "EMB", RefPos.embarycenter },
-            .{ "MER", RefPos.mercury }, .{ "VEN", RefPos.venus },
-            .{ "MAR", RefPos.mars }, .{ "JUP", RefPos.jupiter },
-            .{ "SAT", RefPos.saturn }, .{ "URA", RefPos.uranus },
-            .{ "NEP", RefPos.neptune }, .{ "PLU", RefPos.pluto },
+            .{ "CUS", RefPos.custom },     .{ "HEL", RefPos.heliocenter },
+            .{ "GAL", RefPos.galactic },   .{ "EMB", RefPos.embarycenter },
+            .{ "MER", RefPos.mercury },    .{ "VEN", RefPos.venus },
+            .{ "MAR", RefPos.mars },       .{ "JUP", RefPos.jupiter },
+            .{ "SAT", RefPos.saturn },     .{ "URA", RefPos.uranus },
+            .{ "NEP", RefPos.neptune },    .{ "PLU", RefPos.pluto },
         };
         inline for (map) |e| if (std.ascii.eqlIgnoreCase(pre, e[0])) return e[1];
         return .unknown;
@@ -351,13 +358,23 @@ pub const RefPos = enum {
     /// The canonical keyword string for this position, or `null` for `.unknown`.
     pub fn toString(self: RefPos) ?[]const u8 {
         return switch (self) {
-            .topocenter => "TOPOCENTER", .geocenter => "GEOCENTER",
-            .barycenter => "BARYCENTER", .heliocenter => "HELIOCENTER",
-            .relocatable => "RELOCATABLE", .custom => "CUSTOM",
-            .galactic => "GALACTIC", .embarycenter => "EMBARYCENTER",
-            .mercury => "MERCURY", .venus => "VENUS", .mars => "MARS",
-            .jupiter => "JUPITER", .saturn => "SATURN", .uranus => "URANUS",
-            .neptune => "NEPTUNE", .pluto => "PLUTO", .unknown => null,
+            .topocenter => "TOPOCENTER",
+            .geocenter => "GEOCENTER",
+            .barycenter => "BARYCENTER",
+            .heliocenter => "HELIOCENTER",
+            .relocatable => "RELOCATABLE",
+            .custom => "CUSTOM",
+            .galactic => "GALACTIC",
+            .embarycenter => "EMBARYCENTER",
+            .mercury => "MERCURY",
+            .venus => "VENUS",
+            .mars => "MARS",
+            .jupiter => "JUPITER",
+            .saturn => "SATURN",
+            .uranus => "URANUS",
+            .neptune => "NEPTUNE",
+            .pluto => "PLUTO",
+            .unknown => null,
         };
     }
 };
@@ -450,23 +467,31 @@ pub const TimeCoords = struct {
         return DateTime.parse(s) catch null;
     }
 
-    /// Emit the global time-coordinate cards into `h`, mirroring `fromHeader`: `TIMESYS`,
-    /// `TREFPOS`, `TIMEUNIT`, `MJDREFI`/`MJDREFF`, `DATE-OBS`, `MJD-OBS`, `TSTART`, `TSTOP`
+    /// Update the global time-coordinate cards into `h`, mirroring `fromHeader`: `TIMESYS`,
+    /// `TREFPOS`, `TIMEUNIT`, `MJDREFI`/`MJDREFF`, `TIMEOFFS`, the DATE/MJD observation
+    /// and exposure-window fields, `TSTART`, and `TSTOP`
     /// (FR-WCS-4 SHOULD). Only fields that are set are written. The split `MJDREFI`/`MJDREFF`
     /// pair preserves the full precision of `mjdref` and round-trips through `fromHeader`.
     pub fn toHeader(self: *const TimeCoords, a: Allocator, h: *Header) (HeaderError || Allocator.Error)!void {
-        if (self.timesys.toString()) |s| try h.appendValue(a, "TIMESYS", .{ .string = s }, "time scale");
-        if (self.trefpos.toString()) |s| try h.appendValue(a, "TREFPOS", .{ .string = s }, "time reference position");
-        if (self.timeunit) |u| try h.appendValue(a, "TIMEUNIT", .{ .string = u }, "time unit");
+        if (self.timesys.toString()) |s| try h.update(a, "TIMESYS", .{ .string = s }, "time scale");
+        if (self.trefpos.toString()) |s| try h.update(a, "TREFPOS", .{ .string = s }, "time reference position");
+        if (self.timeunit) |u| try h.update(a, "TIMEUNIT", .{ .string = u }, "time unit");
         if (self.mjdref) |m| {
             const whole = @floor(m);
-            try h.appendValue(a, "MJDREFI", .{ .float = whole }, "[d] MJD reference, integer part");
-            try h.appendValue(a, "MJDREFF", .{ .float = m - whole }, "[d] MJD reference, fractional part");
+            try h.update(a, "MJDREFI", .{ .float = whole }, "[d] MJD reference, integer part");
+            try h.update(a, "MJDREFF", .{ .float = m - whole }, "[d] MJD reference, fractional part");
         }
-        if (self.date_obs) |dt| try appendDate(a, h, "DATE-OBS", dt, "observation date");
-        if (self.mjd_obs) |v| try h.appendValue(a, "MJD-OBS", .{ .float = v }, "[d] observation MJD");
-        if (self.tstart) |v| try h.appendValue(a, "TSTART", .{ .float = v }, "start of exposure");
-        if (self.tstop) |v| try h.appendValue(a, "TSTOP", .{ .float = v }, "end of exposure");
+        if (self.date_obs) |dt| try updateDate(a, h, "DATE-OBS", dt, "observation date");
+        if (self.mjd_obs) |v| try h.update(a, "MJD-OBS", .{ .float = v }, "[d] observation MJD");
+        if (self.tstart) |v| try h.update(a, "TSTART", .{ .float = v }, "start of exposure");
+        if (self.tstop) |v| try h.update(a, "TSTOP", .{ .float = v }, "end of exposure");
+        if (self.timeoffs) |v| try h.update(a, "TIMEOFFS", .{ .float = v }, "time offset");
+        if (self.date_beg) |dt| try updateDate(a, h, "DATE-BEG", dt, "start date");
+        if (self.date_avg) |dt| try updateDate(a, h, "DATE-AVG", dt, "average date");
+        if (self.date_end) |dt| try updateDate(a, h, "DATE-END", dt, "end date");
+        if (self.mjd_beg) |v| try h.update(a, "MJD-BEG", .{ .float = v }, "[d] start MJD");
+        if (self.mjd_avg) |v| try h.update(a, "MJD-AVG", .{ .float = v }, "[d] average MJD");
+        if (self.mjd_end) |v| try h.update(a, "MJD-END", .{ .float = v }, "[d] end MJD");
     }
 
     /// Alias of `toHeader`: write the global time-coordinate cards into `h` (FR-WCS-4).
@@ -474,12 +499,12 @@ pub const TimeCoords = struct {
         return self.toHeader(a, h);
     }
 
-    /// Format `dt` as an ISO-8601 string and append it as the value of card `name`.
-    fn appendDate(a: Allocator, h: *Header, name: []const u8, dt: DateTime, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
+    /// Format `dt` as an ISO-8601 string and update the value of card `name`.
+    fn updateDate(a: Allocator, h: *Header, name: []const u8, dt: DateTime, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
         var buf: [40]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         dt.format(&w) catch unreachable; // 40 bytes is ample for any FITS date string
-        try h.appendValue(a, name, .{ .string = w.buffered() }, comment_text);
+        try h.update(a, name, .{ .string = w.buffered() }, comment_text);
     }
 
     /// Release the optional allocator-owned time-unit string.
@@ -661,15 +686,40 @@ test "TimeCoords toHeader/writeTime round-trips through fromHeader" {
         .tstart = 0.0,
         .tstop = 1200.0,
         .date_obs = try DateTime.parse("2018-08-13T09:30:15"),
+        .timeoffs = 1.25,
+        .date_beg = try DateTime.parse("2018-08-13T09:30:15.125"),
+        .date_avg = try DateTime.parse("2018-08-13T09:40:15.250"),
+        .date_end = try DateTime.parse("2018-08-13T09:50:15.375"),
+        .mjd_beg = 58001.1,
+        .mjd_avg = 58001.2,
+        .mjd_end = 58001.3,
     };
     src.timeunit = try a.dupe(u8, "s"); // owned per the field contract
     defer src.deinit(a);
 
     var h = Header.initEmpty();
     defer h.deinit(a);
+    try h.appendValue(a, "TIMEOFFS", .{ .float = 99 }, null);
+    try h.ensureEnd(a);
     try src.writeTime(a, &h);
+    try testing.expectEqual(.end, h.at(h.count() - 1).kind);
+    const count = h.count();
+    try src.writeTime(a, &h);
+    try testing.expectEqual(count, h.count());
 
-    var tc = try TimeCoords.fromHeader(a, &h);
+    // Reparse physical cards so a value appended after END cannot pass the round trip.
+    const blk = @import("../io/block.zig");
+    const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
+    var mem = MemoryDevice.init(a);
+    defer mem.deinit();
+    var writer = try blk.BlockWriter.init(a, mem.device(), 0, 0);
+    defer writer.deinit();
+    try h.writeTo(&writer);
+    var reader = try blk.BlockReader.init(a, mem.device(), 0);
+    defer reader.deinit();
+    var parsed = try Header.parse(a, &reader, 0, 36);
+    defer parsed.header.deinit(a);
+    var tc = try TimeCoords.fromHeader(a, &parsed.header);
     defer tc.deinit(a);
     try testing.expectEqual(TimeSys.tt, tc.timesys);
     try testing.expectEqual(RefPos.geocenter, tc.trefpos);
@@ -679,6 +729,13 @@ test "TimeCoords toHeader/writeTime round-trips through fromHeader" {
     try testing.expect(@abs(tc.tstop.? - 1200.0) < 1e-9);
     try testing.expectEqual(@as(i32, 2018), tc.date_obs.?.year);
     try testing.expectEqual(@as(u8, 15), tc.date_obs.?.second);
+    try testing.expectEqual(src.timeoffs, tc.timeoffs);
+    try testing.expectEqualDeep(src.date_beg, tc.date_beg);
+    try testing.expectEqualDeep(src.date_avg, tc.date_avg);
+    try testing.expectEqualDeep(src.date_end, tc.date_end);
+    try testing.expectEqual(src.mjd_beg, tc.mjd_beg);
+    try testing.expectEqual(src.mjd_avg, tc.mjd_avg);
+    try testing.expectEqual(src.mjd_end, tc.mjd_end);
 }
 
 test "TimeSys deprecated synonyms, LOCAL, and UT() qualifier" {

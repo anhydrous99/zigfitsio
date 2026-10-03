@@ -1,9 +1,9 @@
 """Hatchling build hook: compile the ``zigfitsio_capi`` shared library with Zig and bundle it
 into the wheel as package data.
 
-Zig is obtained from the ``ziglang`` build dependency (``python -m ziglang``); a system ``zig``
-on ``PATH`` is used as a fallback. Set ``ZIG_TARGET`` to cross-compile (e.g. for cibuildwheel
-emitting wheels for another platform).
+The caller supplies Zig 0.16.0 on ``PATH``. A compatible, already-installed ``ziglang`` package
+is also supported; the hook does not install a toolchain. Set ``ZIG_TARGET`` to cross-compile
+(e.g. for cibuildwheel emitting wheels for another platform).
 """
 
 from __future__ import annotations

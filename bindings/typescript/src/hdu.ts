@@ -47,11 +47,8 @@ export function isStructuralKeyword(kw: string): boolean {
   return STRUCTURAL.has(up) || up.startsWith("NAXIS");
 }
 
-// Keywords the table write path itself produces, which must NOT be copied back
-// from the source header or they would duplicate / conflict with the freshly
-// written cards. Matched (skipped): TFIELDS, THEAP, and TFORMn/TTYPEn/TUNITn/
-// TBCOLn/TSCALn/TZEROn. Not matched (preserved as user metadata): everything
-// else, notably TNULLn/TDISPn/TDIMn.
+// Table layout/scaling keywords are emitted afresh. Indexed null/display/shape/range
+// and table WCS metadata are handled separately by table.ts using column provenance.
 //   - column descriptors (TFORMn/TTYPEn/TUNITn/TBCOLn) are emitted by zf_create_tbl;
 //   - the scaling pair (TSCALn/TZEROn) is skipped like image BSCALE/BZERO, because
 //     scaled columns are read as physical f64 and re-written physical, so copying
@@ -59,10 +56,9 @@ export function isStructuralKeyword(kw: string): boolean {
 //   - THEAP is skipped ON PURPOSE (it is derived from the default heap layout the
 //     write path uses; a stale source THEAP would point at the wrong offset) — this
 //     is why it sits with the skipped group and NOT with the preserved TNULL/TDISP/TDIM.
-// Filtering TNULLn/TDISPn/TDIMn would re-create the very keyword-loss bug, since
-// the write path never emits them. Argument is already uppercased.
+// Argument is already uppercased.
 export function isTableStructuralKeyword(up: string): boolean {
-  return up === "TFIELDS" || up === "THEAP" || /^T(FORM|TYPE|UNIT|BCOL|SCAL|ZERO)\d+$/.test(up);
+  return up === "TFIELDS" || up === "THEAP" || up === "ZIMAGE" || /^T(FORM|TYPE|UNIT|BCOL|SCAL|ZERO)\d+$/.test(up);
 }
 
 // A tile-compressed image is stored as a BINTABLE carrying the ZIMAGE

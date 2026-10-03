@@ -91,25 +91,9 @@ pub const Celestial = struct {
         const n: usize = w.axes;
         if (n < 2 or w.ctype.len < n) return error.BadWcs;
 
-        var lon_axis: ?usize = null;
-        var lat_axis: ?usize = null;
-        var lon_family: ?CelestialFamily = null;
-        var lat_family: ?CelestialFamily = null;
-        for (w.ctype[0..n], 0..) |ctype, i| {
-            if (longitudeFamily(ctype)) |family| {
-                if (lon_axis != null) return error.BadWcs;
-                lon_axis = i;
-                lon_family = family;
-            }
-            if (latitudeFamily(ctype)) |family| {
-                if (lat_axis != null) return error.BadWcs;
-                lat_axis = i;
-                lat_family = family;
-            }
-        }
-        const lon = lon_axis orelse return error.BadWcs;
-        const lat = lat_axis orelse return error.BadWcs;
-        if (lon_family.? != lat_family.?) return error.BadWcs;
+        const axes = try w.celestialAxes();
+        const lon = axes.lon;
+        const lat = axes.lat;
 
         const lon_code = w.ctype[lon][w.ctype[lon].len - 3 ..];
         const lat_code = w.ctype[lat][w.ctype[lat].len - 3 ..];
@@ -133,20 +117,7 @@ pub const Celestial = struct {
                     .{ w.cdelt[lat] * pc[lat][lon], w.cdelt[lat] * pc[lat][lat] },
                 };
             },
-            .none => {
-                // No PCi_j/CDi_j: honour the legacy CROTAi rotation (AIPS convention), taken
-                // from the latitude axis (the classic CROTA2). With ρ = CROTA[lat]:
-                //   M = [ CDELT_lon·cosρ,  −CDELT_lat·sinρ ;
-                //         CDELT_lon·sinρ,   CDELT_lat·cosρ ].
-                // ρ = 0 reduces to the plain diagonal CDELT scaling.
-                const rho = w.crota[lat] * DEG2RAD;
-                const cr = std.math.cos(rho);
-                const sr = std.math.sin(rho);
-                m = .{
-                    .{ w.cdelt[lon] * cr, -w.cdelt[lat] * sr },
-                    .{ w.cdelt[lon] * sr, w.cdelt[lat] * cr },
-                };
-            },
+            .none => m = w.legacyCd(lon, lat),
         }
         const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
         if (det == 0) return error.NonInvertible;
@@ -158,7 +129,7 @@ pub const Celestial = struct {
         const crval: [2]f64 = .{ w.crval[lon], w.crval[lat] };
         // Resolve the spherical-rotation pole from the projection's fiducial point, applying
         // the projection-correct LONPOLE/LATPOLE defaults (Paper II eqs 8–10).
-        const pole = computePole(proj, crval, w.lonpole, w.latpole);
+        const pole = try computePole(proj, crval, w.lonpole, w.latpole);
 
         return .{
             .proj = proj,
@@ -291,8 +262,11 @@ fn referencePoint(proj: Projection) struct { phi0: f64, theta0: f64 } {
 /// `(φ0, θ0)` / `(α0, δ0)=CRVAL` and the optional `LONPOLE`/`LATPOLE`, per Paper II eqs (8)–(10).
 /// Projection-correct defaults are applied: `LONPOLE = 0°` if `δ0 ≥ θ0` else `180°`; `LATPOLE
 /// = +90°` (which disambiguates the pole toward the north when eq (8) has two roots). Pure trig,
-/// never fails — a fully degenerate configuration falls back to `LATPOLE`.
-fn computePole(proj: Projection, crval: [2]f64, lonpole: ?f64, latpole: ?f64) Pole {
+/// rejects configurations without a valid pole; a degenerate solution uses `LATPOLE`.
+fn computePole(proj: Projection, crval: [2]f64, lonpole: ?f64, latpole: ?f64) WcsError!Pole {
+    if (!std.math.isFinite(crval[0]) or !std.math.isFinite(crval[1]) or @abs(crval[1]) > 90) return error.BadWcs;
+    if (lonpole) |v| if (!std.math.isFinite(v)) return error.BadWcs;
+    if (latpole) |v| if (!std.math.isFinite(v)) return error.BadWcs;
     const ref = referencePoint(proj);
     const phi0 = ref.phi0 * DEG2RAD;
     const theta0 = ref.theta0 * DEG2RAD;
@@ -317,13 +291,16 @@ fn computePole(proj: Projection, crval: [2]f64, lonpole: ?f64, latpole: ?f64) Po
 
     // Solve sin δ0 = sinθ0·sinδp + cosθ0·cosδp·cos(φp−φ0) for δp (Paper II eq 8):
     //   = R·cos(δp − ψ),  R = hypot(sinθ0, cosθ0·cos(φp−φ0)),  ψ = arg(cosθ0·cos·, sinθ0).
-    var delta_p: f64 = latpole_rad;
+    var delta_p: f64 = clamp(latpole_rad, -std.math.pi / 2.0, std.math.pi / 2.0);
     const mu = sin_t0;
     const lam = cos_t0 * std.math.cos(dphi);
     const rr = std.math.hypot(mu, lam);
-    if (rr != 0) {
+    const tolerance = 1e-12;
+    const sin_delta0 = std.math.sin(delta0);
+    if (@abs(sin_delta0) > rr + tolerance) return error.BadWcs;
+    if (rr > tolerance) {
         const psi = std.math.atan2(mu, lam);
-        const omega = std.math.acos(clamp(std.math.sin(delta0) / rr, -1, 1));
+        const omega = std.math.acos(clamp(sin_delta0 / rr, -1, 1));
         const c1 = wrapPi(psi + omega);
         const c2 = wrapPi(psi - omega);
         const half_pi = std.math.pi / 2.0;
@@ -337,7 +314,8 @@ fn computePole(proj: Projection, crval: [2]f64, lonpole: ?f64, latpole: ?f64) Po
             delta_p = c1;
         } else if (v2) {
             delta_p = c2;
-        }
+        } else return error.BadWcs;
+        delta_p = clamp(delta_p, -half_pi, half_pi);
     }
 
     // Solve for α_p from the fiducial point (Paper II eq 10):
@@ -355,26 +333,6 @@ fn wrapPi(a: f64) f64 {
     var x = @mod(a + std.math.pi, two_pi);
     if (x < 0) x += two_pi;
     return x - std.math.pi;
-}
-
-const CelestialFamily = enum { equatorial, galactic, ecliptic };
-
-fn longitudeFamily(ctype: []const u8) ?CelestialFamily {
-    if (ctype.len < 5) return null;
-    const prefix = ctype[0..5];
-    if (std.ascii.eqlIgnoreCase(prefix, "RA---")) return .equatorial;
-    if (std.ascii.eqlIgnoreCase(prefix, "GLON-")) return .galactic;
-    if (std.ascii.eqlIgnoreCase(prefix, "ELON-")) return .ecliptic;
-    return null;
-}
-
-fn latitudeFamily(ctype: []const u8) ?CelestialFamily {
-    if (ctype.len < 5) return null;
-    const prefix = ctype[0..5];
-    if (std.ascii.eqlIgnoreCase(prefix, "DEC--")) return .equatorial;
-    if (std.ascii.eqlIgnoreCase(prefix, "GLAT-")) return .galactic;
-    if (std.ascii.eqlIgnoreCase(prefix, "ELAT-")) return .ecliptic;
-    return null;
 }
 
 fn couplesOmittedPixelAxis(matrix: [][]f64, lon: usize, lat: usize, axes: usize) bool {
@@ -792,4 +750,28 @@ test "Celestial.fromWcs keeps matching unsupported projection as a typed error" 
     });
     defer cleanup(testing.allocator, p);
     try testing.expectError(error.UnsupportedProjection, Celestial.fromWcs(&p.w));
+}
+
+test "CAR rejects impossible poles and accepts rounding-boundary solutions" {
+    var p = try wcsFromCards(testing.allocator, &.{
+        "WCSAXES =                    2",
+        "CTYPE1  = 'RA---CAR'",
+        "CTYPE2  = 'DEC--CAR'",
+        "CRVAL1  =                120.0",
+        "CRVAL2  =                 80.0",
+        "LONPOLE =                 60.0",
+    });
+    defer cleanup(testing.allocator, p);
+    try testing.expectError(error.BadWcs, Celestial.fromWcs(&p.w));
+    // sin(30°) == cos(60°), within floating-point rounding of the root boundary.
+    p.w.crval[1] = 30;
+    const boundary = try Celestial.fromWcs(&p.w);
+    const world = try boundary.pixelToWorld(.{ 0, 0 });
+    try testing.expectApproxEqAbs(@as(f64, 120), world[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 30), world[1], 1e-6);
+    p.w.lonpole = 90;
+    p.w.crval[1] = 0; // degenerate equation: LATPOLE selects among valid solutions
+    _ = try Celestial.fromWcs(&p.w);
+    p.w.crval[1] = 0.01;
+    try testing.expectError(error.BadWcs, Celestial.fromWcs(&p.w));
 }

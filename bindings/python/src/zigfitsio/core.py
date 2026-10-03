@@ -12,6 +12,9 @@ from __future__ import annotations
 import ctypes as c
 import math
 import os
+import re
+import stat
+from uuid import uuid4
 from typing import Any, Sequence
 
 import numpy as np
@@ -21,6 +24,132 @@ from . import lowlevel as ll
 from .header import Header, _Card, _wrap_commentary
 
 _VOID = c.c_void_p
+
+
+def _atomic_write(path, write, overwrite):
+    """Publish complete bytes from an exclusively created sibling temporary file."""
+    mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else None
+    tmp = os.path.join(os.path.dirname(os.path.abspath(path)),
+                       f".{os.path.basename(path)}.zigfitsio-{uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                 mode if mode is not None else 0o666)
+    fh = None
+    try:
+        fh = os.fdopen(fd, "w+b")
+        with fh:
+            write(fh)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        if overwrite:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)  # fails rather than replacing a concurrently created destination
+    finally:
+        if fh is None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def _table_structural(up):
+    return up in ("TFIELDS", "THEAP", "ZIMAGE") or re.fullmatch(r"T(FORM|TYPE|UNIT|BCOL|SCAL|ZERO)\d+", up) is not None
+
+
+def _comp_structural(up):
+    return _table_structural(up) or re.fullmatch(
+        r"Z(IMAGE|SIMPLE|EXTEND|BITPIX|NAXIS\d*|PCOUNT|GCOUNT|TILE\d+|CMPTYPE|NAME\d+|VAL\d+|MASKCMP|QUANTIZ|DITHER0|BLANK|HECKSUM|DATASUM|THEAP)", up
+    ) is not None
+
+
+# FITS 4.0 Table 22: n/k are table columns; i/j are axes and m is a parameter.
+# Each entry identifies only the capture groups that contain column numbers.
+_META_COL = r"([1-9][0-9]{0,2})"
+_META_AXIS = r"([1-9][0-9]?)"
+_META_PARAM = r"(0|[1-9][0-9]?)"
+_TABLE_METADATA = [
+    (re.compile(r"(TNULL|TDISP|TDIM|TLMIN|TLMAX|TDMIN|TDMAX|TDBIN)" + _META_COL), (2,), None, None),
+    (re.compile(r"(TCTYP|TCUNI|TCRVL|TCDLT|TCRPX|TCROT|TCZPH|TCPER)" + _META_COL), (2,), "pixel", None),
+    (re.compile(r"(TCTY|TCUN|TCRV|TCDE|TCRP|TCNA|TCRD|TCSY|TCZP|TCPR)" + _META_COL + r"([A-Z]?)"), (2,), "pixel", 3),
+    (re.compile(r"(TPC|TP|TCD|TC)" + _META_COL + "_" + _META_COL + r"([A-Z]?)"), (2, 3), "pixel", 4),
+    (re.compile(r"(TPV|TV|TPS|TS)" + _META_COL + "_" + _META_PARAM + r"([A-Z]?)"), (2,), "pixel", 4),
+    (re.compile(_META_AXIS + r"(CTYP|CUNI|CRVL|CDLT|CRPX|CROT|CZPH|CPER|CRDE|CSYE)" + _META_COL), (3,), "array", None),
+    (re.compile(_META_AXIS + r"(CTY|CUN|CRV|CDE|CRP|CNA|CRD|CSY|CZP|CPR)" + _META_COL + r"([A-Z]?)"), (3,), "array", 4),
+    (re.compile(r"((?:[1-9][0-9]?){2})(PC|CD)" + _META_COL + r"([A-Z]?)"), (3,), "array", 4),
+    (re.compile(_META_AXIS + r"(PV|V|PS|S)" + _META_COL + "_" + _META_PARAM + r"([A-Z]?)"), (3,), "array", 5),
+    (re.compile(_META_AXIS + r"V" + _META_COL + r"_X([A-Z]?)"), (2,), "array", 3),
+    (re.compile(r"(WCAX|WCST|WCSX)" + _META_COL + r"([A-Z]?)"), (2,), "array", 3),
+    (re.compile(r"(WCSN|WCS|TWCS|LONP|LATP|EQUI|RADE|RFRQ|RWAV|SPEC|SOBS|SSRC|VSYS|ZSOU|VANG)" + _META_COL + r"([A-Z]?)"), (2,), "shared", 3),
+    (re.compile(r"(OBSGX|OBSGY|OBSGZ|DOBS|MJDOB|DAVG|MJDA|TRPOS|TRDIR)" + _META_COL), (2,), "column", None),
+]
+
+
+def _table_metadata_key(up):
+    if len(up) > 8:  # HIERARCH/custom names are not this reserved keyword grammar.
+        return None
+    for pattern, column_groups, kind, alternate_group in _TABLE_METADATA:
+        match = pattern.fullmatch(up)
+        if match is not None:
+            return match, column_groups, kind, match[alternate_group] if alternate_group else ""
+    return None
+
+
+def _table_metadata_ops(header, ncols, source_indices):
+    """Remap known column cards, dropping incomplete WCS versions and inherited measurements."""
+    column_map = {i + 1: i + 1 for i in range(ncols)} if source_indices is None else {
+        old + 1: new + 1 for new, old in enumerate(source_indices) if old is not None
+    }
+    parsed = []
+    for key, value, comment in header.cards():
+        metadata = _table_metadata_key(key.upper())
+        if metadata is not None:
+            parsed.append((key, value, comment, metadata))
+    array_columns = {
+        (int(match[groups[0]]), alternate)
+        for _, _, _, (match, groups, kind, alternate) in parsed if kind == "array"
+    }
+
+    def wcs_group(metadata):
+        match, groups, kind, alternate = metadata
+        column = int(match[groups[0]])
+        if kind == "shared":
+            kind = "array" if (column, alternate) in array_columns else "pixel"
+        return (kind, alternate, column if kind in ("array", "column") else None)
+
+    dropped_wcs = {
+        wcs_group(metadata) for _, _, _, metadata in parsed
+        if metadata[2] is not None and any(int(metadata[0][g]) not in column_map for g in metadata[1])
+    }
+    # WCST/WCSX resolve by their case-sensitive string labels, even across alternates.
+    targets = [(value, wcs_group(metadata)) for _, value, _, metadata in parsed
+               if metadata[0][1] == "WCST" and isinstance(value, str)]
+    known_labels = {label for label, _ in targets}
+    surviving_labels = {label for label, group in targets if group not in dropped_wcs}
+    for _, value, _, metadata in parsed:
+        if metadata[0][1] == "WCSX" and isinstance(value, str) and value in known_labels and value not in surviving_labels:
+            dropped_wcs.add(wcs_group(metadata))
+    ops = []
+    for key, value, comment, metadata in parsed:
+        match, groups, kind, _ = metadata
+        if any(int(match[g]) not in column_map for g in groups):
+            continue
+        if kind is not None and wcs_group(metadata) in dropped_wcs:
+            continue
+        # ponytail: flush fingerprints are mutable baselines, so reconstructed inherited
+        # measurements are dropped; retain them only with immutable content provenance.
+        if source_indices is not None and match[1] in ("TDMIN", "TDMAX"):
+            continue
+        renamed = match.string
+        for group in reversed(groups):
+            start, end = match.span(group)
+            renamed = renamed[:start] + str(column_map[int(match[group])]) + renamed[end:]
+        if len(renamed) > 8 and renamed.startswith(("TPC", "TCD")):
+            renamed = renamed[:2] + renamed[3:]  # permitted short TP/TC matrix aliases
+        if len(renamed) > 8:
+            raise ll.FitsHeaderError(207, f"remapped table WCS keyword {renamed!r} exceeds eight characters")
+        ops.append(("upsert", renamed, value, comment))
+    return {key.upper() for key, _, _, _ in parsed}, ops
 
 # BZERO values that encode the unsigned-integer convention for each signed BITPIX.
 _UNSIGNED_BZERO = {16: 32768, 32: 2147483648, 64: 9223372036854775808}
@@ -158,6 +287,12 @@ def _vla_elem_dtype(fmt: str):
     marker = "P" if "P" in fmt else "Q"
     letter = next((ch for ch in fmt.split(marker, 1)[1] if ch.isalpha()), "")
     return dt.bin_elem_dtype(ord(letter)) if letter else (np.dtype("f8"), False)
+
+
+def _without_vla_max(fmt: str) -> str:
+    """Keep the VLA storage type, dropping a maximum that materialized cells may exceed."""
+    match = re.fullmatch(r"([0-9]*[PQ][A-Z])\([0-9]+\)", fmt.strip().upper())
+    return match[1] if match else fmt
 
 
 def _array_chunks(arr):
@@ -646,6 +781,25 @@ class _HDU:
             raise ll.FitsIOError(104, "operation on a detached or closed HDU")
         return _apply_header_batch(hl._handle, self._index, ops, expected_revision)
 
+    def _apply_user_keys(self, handle, skip=None, trailing_ops=()):
+        """Copy logical user metadata, leaving layout/scaling to the emitter."""
+        ops = []
+        for kw, value, comment in self.header.cards():
+            up = kw.upper()
+            if up in _STRUCTURAL or up.startswith("NAXIS") or up in ("CHECKSUM", "DATASUM"):
+                continue
+            if skip is not None and skip(up):
+                continue
+            if up in ("COMMENT", "HISTORY", ""):
+                ops.extend(("append_commentary", up, chunk) for chunk in _wrap_commentary(value))
+            else:
+                ops.append(("upsert", kw, value, comment))
+        if self._name:
+            ops.append(("upsert", "EXTNAME", self._name, ""))
+        ops.extend(trailing_ops)
+        if ops:
+            _apply_header_batch(handle, _header_current_index(handle), ops)
+
     def _write_key(self, key: str, value: Any, comment: str | None):
         up = key.upper()
         if up in ("COMMENT", "HISTORY", ""):
@@ -882,33 +1036,6 @@ class ImageHDU(_HDU):
             ll.check(ll.lib.zf_write_img(h, dt.zf_code(native.dtype), 1, n, None, scref, _ptr(native)))
         self._data_fingerprint = fp
 
-    def _apply_user_keys(self, handle, skip=None):
-        ops = []
-        for kw, value, comment in self.header.cards():
-            up = kw.upper()
-            if up in _STRUCTURAL or up.startswith("NAXIS"):
-                continue
-            if skip is not None and skip(up):
-                continue
-            # A scanned header's CHECKSUM/DATASUM describe the ORIGINAL bytes; copying them onto
-            # a reconstructed HDU yields cards that no longer verify. Drop them (as astropy strips
-            # them on modification) — correct values are regenerated by zf_write_chksum only when
-            # writeto(checksum=True) is requested. Mirrors the TS _applyUserKeys behavior.
-            if up in ("CHECKSUM", "DATASUM"):
-                continue
-            if up in ("COMMENT", "HISTORY", ""):
-                # Wrap so a >72-char commentary card (e.g. built via Header._from_cards) spans
-                # multiple records instead of truncating; set-time cards are already ≤72.
-                for chunk in _wrap_commentary(value):
-                    ops.append(("append_commentary", up, chunk))
-                continue
-            ops.append(("upsert", kw, value, comment))
-        if self._name:
-            ops.append(("upsert", "EXTNAME", self._name, ""))
-        if ops:
-            _apply_header_batch(handle, _header_current_index(handle), ops)
-
-
 class PrimaryHDU(ImageHDU):
     """The primary image HDU at the start of a FITS file."""
 
@@ -983,18 +1110,12 @@ class CompImageHDU(ImageHDU):
             handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(comp), q, 1,
             0.0 if qlevel is None else qlevel, 0 if qlevel is None else 1,
             hscale, int(hsmooth), _ptr(data), int(data.size)))
-        # Preserve EXTNAME (the general image path writes it via _apply_user_keys, which this
-        # override does not call because the scanned header carries the compression machinery).
-        nm = self.name
-        if nm and nm != "PRIMARY":
-            nb = _enc(nm)
-            kb = _enc("EXTNAME")
-            ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), nb, len(nb), None, 0))
+        self._apply_user_keys(handle, skip=_comp_structural)
 
 
 class _TableHDU(_HDU):
     _table_type = ll.BINARY_TBL
-    _columns: list = []
+    _columns: list | None = None
     _nrows: int = 0
     _col_fingerprints = None  # per-column baselines for update-mode in-place write-back
 
@@ -1108,7 +1229,7 @@ class _TableHDU(_HDU):
     def columns(self):
         """Return the table's column names or detached :class:`Column` specifications."""
 
-        return self._read_columns_meta() if self._hdulist is not None else self._columns
+        return self._read_columns_meta() if self._hdulist is not None else (self._columns or [])
 
     def _read_columns_meta(self):
         h = self._select()
@@ -1295,12 +1416,14 @@ class _TableHDU(_HDU):
         """(columns, nrows) to serialize: the builder columns when present, columns synthesized
         from an assigned record array for a detached HDU, or columns reconstructed from the live
         table for an attached one (so a copied table keeps its rows)."""
-        if self._columns:
+        if self._hdulist is None and self._data is _UNSET and self._columns is not None:
             _assert_unique_column_names([col.name for col in self._columns])
-            return list(self._columns), self._nrows
+            cols = [Column(col.name, _without_vla_max(col.format), array=col.array, unit=col.unit)
+                    for col in self._columns]
+            return cols, self._nrows, None
         data = self.data
         if data is None:
-            return [], 0
+            return [], 0, []
         data_names = data.dtype.names
         data_fields = data.dtype.fields
         if data_names is None or data_fields is None:  # unreachable post-validation; defense in depth
@@ -1309,17 +1432,32 @@ class _TableHDU(_HDU):
         if self._hdulist is None:
             # A detached HDU carrying a record array: synthesize every TFORM from the dtype
             # (there is no file column to reuse; unsigned/subarray/string fields all map).
-            if self._table_type == ll.ASCII_TBL:
-                raise NotImplementedError(
-                    "cannot synthesize ASCII-table formats from a record array; "
-                    "build the table with AsciiTableHDU.from_columns(...)"
-                )
-            cols = [
-                Column(n, _binary_tform_for(None, data_fields[n][0]), array=data[n])
-                for n in data_names
-            ]
-            return cols, nrows
+            specs = {col.name: (i, col) for i, col in enumerate(self._columns or [])}
+            cols, source_indices = [], []
+            for name in data_names:
+                entry = specs.get(name)
+                spec = None if entry is None else entry[1]
+                if self._table_type == ll.ASCII_TBL:
+                    if spec is None:
+                        raise NotImplementedError("assigned ASCII-table data requires an existing Column format for every field")
+                    fmt = spec.format
+                elif data_fields[name][0] == np.dtype(object) and spec is not None and re.search(r"[PQ]", spec.format.upper()):
+                    fmt = _without_vla_max(spec.format)
+                    elem_dtype, _ = _vla_elem_dtype(fmt.strip().upper())
+                    if any(np.asarray(cell).dtype.newbyteorder("=") != elem_dtype for cell in data[name]):
+                        raise ll.FitsTypeError(410, f"assigned VLA field {name!r} does not match its Column element format")
+                else:
+                    fmt = _binary_tform_for(None, data_fields[name][0])
+                    if spec is not None and not re.search(r"[PQ]", spec.format.upper()) and _tform_interchangeable(spec.format.strip().upper(), fmt):
+                        fmt = spec.format
+                col = Column(name, fmt, array=data[name], unit=None if spec is None else spec.unit)
+                cols.append(col)
+                compatible = spec is not None and fmt == _without_vla_max(spec.format) and _unsigned_col_tzero(col) == _unsigned_col_tzero(spec)
+                source_indices.append(entry[0] if compatible else None)
+            return cols, nrows, source_indices if self._columns is not None else None
         h = self._select()
+        # Structural edits on a read-only public Header do not change the source layout.
+        source_header = self._read_header()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
         try:
@@ -1337,26 +1475,37 @@ class _TableHDU(_HDU):
                 ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
                 # `or f"col{j+1}"` matches _read_table's name for a column lacking TTYPE, so an
                 # unnamed column reuses its file format instead of collapsing under the "" key.
-                file_info[file_names[j]] = info
-            cols = []
+                file_info[file_names[j]] = (j, info)
+            cols, source_indices = [], []
             for name in data_names:
-                info = file_info.get(name)
+                entry = file_info.get(name)
+                old_index, info = entry if entry is not None else (None, None)
+                actual_fmt = source_header.get(f"TFORM{old_index + 1}") if old_index is not None else None
                 if self._table_type == ll.ASCII_TBL:
                     if info is None:
                         raise NotImplementedError(
                             "writeto() cannot add or rename an ASCII-table column from a reassigned "
                             "recarray; rebuild the table with AsciiTableHDU.from_columns(...)"
                         )
-                    fmt = _ascii_tform_of(info)
+                    fmt = actual_fmt if isinstance(actual_fmt, str) else _ascii_tform_of(info)
                 else:
                     fmt = _binary_tform_for(info, data_fields[name][0])
-                cols.append(Column(name, fmt, array=data[name]))
-            return cols, nrows
+                    if info is not None and fmt == _tform_of(info) and isinstance(actual_fmt, str):
+                        fmt = _without_vla_max(actual_fmt)
+                unit = self.header.get(f"TUNIT{old_index + 1}") if old_index is not None else None
+                col = Column(name, fmt, array=data[name], unit=unit if isinstance(unit, str) else None)
+                cols.append(col)
+                old_fmt = actual_fmt if isinstance(actual_fmt, str) else (
+                    None if info is None else _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
+                )
+                compatible = info is not None and fmt == _without_vla_max(old_fmt) and info.tscal == 1.0 and info.tzero == (_unsigned_col_tzero(col) or 0)
+                source_indices.append(old_index if compatible else None)
+            return cols, nrows, source_indices
         finally:
             ll.lib.zf_table_close(t)
 
     def _write_to(self, handle, primary: bool):
-        cols, nrows = self._emit_columns()
+        cols, nrows, source_indices = self._emit_columns()
         n = len(cols)
         ttype = (c.c_char_p * n)(*[_enc(col.name) for col in cols])
         tform = (c.c_char_p * n)(*[_enc(col.format) for col in cols])
@@ -1378,6 +1527,10 @@ class _TableHDU(_HDU):
                     ll.check(ll.lib.zf_write_key_lng(handle, kw, len(kw), tz, None, 0))
                 else:
                     ll.check(ll.lib.zf_write_key_dbl(handle, kw, len(kw), float(tz), None, 0))
+
+        indexed_keys, remapped = _table_metadata_ops(self.header, n, source_indices)
+        self._apply_user_keys(handle, skip=lambda up: _table_structural(up) or up in indexed_keys,
+                              trailing_ops=remapped)
 
         t = _VOID()
         ll.check(ll.lib.zf_table_open(handle, c.byref(t)))
@@ -1510,7 +1663,12 @@ class HDUList(list):
         hl._mode = mode
         hl._owns = True
         hl._checksum_on_close = bool(checksum_on_close)
-        hl._scan()
+        try:
+            hl._scan()
+        except BaseException:
+            hl._handle = None  # destructor must not flush this partially scanned file
+            ll.lib.zf_close(handle)
+            raise
         return hl
 
     def _scan(self):
@@ -1532,7 +1690,10 @@ class HDUList(list):
             # A ZIMAGE BINTABLE is a tile-compressed image.
             name = _enc("ZIMAGE")
             if ll.lib.zf_key_exists(self._handle, name, len(name)) == 1:
-                return CompImageHDU()
+                logical = c.c_int()
+                ll.check(ll.lib.zf_read_key_log(self._handle, name, len(name), c.byref(logical)))
+                if logical.value:
+                    return CompImageHDU()
             return BinTableHDU()
         if kind == ll.HDU_ASCII_TABLE:
             return AsciiTableHDU()
@@ -1725,8 +1886,13 @@ class HDUList(list):
     def _copy_source_to(self, fh) -> None:
         """Copy the current raw FITS bytes to a binary file without materializing the whole file."""
         self.flush()
+        self._copy_handle_to(self._handle, fh)
+
+    @staticmethod
+    def _copy_handle_to(handle, fh) -> None:
+        """Stream the exact bytes of an already flushed handle."""
         size = c.c_uint64()
-        ll.check(ll.lib.zf_data_size(self._handle, c.byref(size)))
+        ll.check(ll.lib.zf_data_size(handle, c.byref(size)))
         chunk_size = min(int(size.value), 4 * 1024 * 1024)
         if not chunk_size:
             return
@@ -1737,7 +1903,7 @@ class HDUList(list):
         while offset < size.value:
             want = min(chunk_size, int(size.value) - offset)
             got = c.c_size_t()
-            ll.check(ll.lib.zf_read_bytes(self._handle, offset, raw, want, c.byref(got)))
+            ll.check(ll.lib.zf_read_bytes(handle, offset, raw, want, c.byref(got)))
             if not got.value:
                 raise ll.FitsIOError(107, f"short raw FITS read at byte {offset}")
             pending = view[: got.value]
@@ -1789,30 +1955,28 @@ class HDUList(list):
         # Write to a temp file in the same directory, then atomically rename into place: a failure
         # never leaves a partial/corrupt file at `path`, and overwrite=True does not destroy the
         # existing file until the new one is complete.
-        tmp = path + ".zigfitsio.tmp"
-        try:
+        def write(fh):
             if not checksum and self._is_pristine_attached():
-                with __import__("builtins").open(tmp, "wb") as fh:
-                    self._copy_source_to(fh)
+                self._copy_source_to(fh)
             else:
                 opts = ll.ZfOpenOpts()
                 if checksum:
                     opts.checksum_on_close = 1
                 handle = _VOID()
-                pb = _enc(tmp)
-                ll.check(ll.lib.zf_create_file(pb, len(pb), c.byref(opts) if checksum else None, c.byref(handle)))
+                create = getattr(ll.lib, "zf_create_file_handle_v1", None)
+                if create is None:
+                    raise ll.FitsIOError(112, "disk reconstruction requires zf_create_file_handle_v1; rebuild the native library")
+                native_file = fh.fileno()
+                if os.name == "nt":
+                    import msvcrt
+                    native_file = msvcrt.get_osfhandle(native_file)
+                ll.check(create(native_file, c.byref(opts) if checksum else None, c.byref(handle)))
                 try:
                     self._emit(handle.value)
                     ll.check(ll.lib.zf_flush(handle))
                 finally:
                     ll.lib.zf_close(handle)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
+        _atomic_write(path, write, overwrite)
 
     def to_bytes(self) -> bytes:
         """Serialize the HDU list to an in-memory FITS byte string."""

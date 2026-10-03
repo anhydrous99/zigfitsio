@@ -32,6 +32,7 @@ typedef struct ZfFits ZfFits;
 typedef struct ZfTable ZfTable;
 typedef struct ZfFindings ZfFindings;
 typedef struct ZfFingerprint128StateV1 ZfFingerprint128StateV1;
+typedef struct ZfMemoryBuilder ZfMemoryBuilder;
 
 /* ── Element datatype codes (ZfType) ─────────────────────────────────────────────────────── */
 #define ZF_UINT8      1
@@ -217,7 +218,19 @@ void zf_fingerprint128_free_v1(ZfFingerprint128StateV1* state);
 /* ── Lifecycle ───────────────────────────────────────────────────────────────────────────── */
 int  zf_open_file(const uint8_t* path, size_t path_len, int mode, const ZfOpenOpts* opts, ZfFits** out);
 int  zf_create_file(const uint8_t* path, size_t path_len, const ZfOpenOpts* opts, ZfFits** out);
+/* Borrow an empty blocking buffered seekable read/write regular file: POSIX fd, Windows HANDLE
+ * (not a CRT fd). The caller keeps it open without concurrent I/O through zf_close.
+ * Success/failure/close never close or truncate the caller's file. Invalid or unsuitable
+ * handles return 112; a null out returns 104. Freestanding/WASM returns 112. */
+int  zf_create_file_handle_v1(uintptr_t native_handle, const ZfOpenOpts* opts, ZfFits** out);
 int  zf_open_memory(const uint8_t* buf, size_t buf_len, int mode, const ZfOpenOpts* opts, ZfFits** out);
+/* Fill the final owned buffer directly. v1 uses default limits; v2 checks opts before
+ * allocation. Commit consumes the builder on success or failure and rechecks its opts.
+ * Abort releases an uncommitted builder. Returned data is borrowed until commit/abort. */
+int  zf_wopen_memory_begin_v1(size_t len, ZfMemoryBuilder** builder, uint8_t** data);
+int  zf_wopen_memory_begin_v2(size_t len, const ZfOpenOpts* opts, ZfMemoryBuilder** builder, uint8_t** data);
+int  zf_wopen_memory_commit_v1(ZfMemoryBuilder* builder, int mode, const ZfOpenOpts* opts, ZfFits** out);
+void zf_wopen_memory_abort_v1(ZfMemoryBuilder* builder);
 int  zf_create_memory(const ZfOpenOpts* opts, ZfFits** out);
 int  zf_open_gzip(const uint8_t* buf, size_t buf_len, const ZfOpenOpts* opts, ZfFits** out);
 int  zf_flush(ZfFits* h);
@@ -242,6 +255,8 @@ int  zf_img_param(ZfFits* h, int* bitpix, int* naxis, long* axes, int axes_cap, 
 /* ── Images ──────────────────────────────────────────────────────────────────────────────── */
 int  zf_create_img(ZfFits* h, int bitpix, int naxis, const long* axes);
 int  zf_resize_img(ZfFits* h, int bitpix, int naxis, const long* axes);
+/* Compressed images support full-image reads only (firstelem=1, nelem=element count).
+ * Unsupported partial reads fail before modifying array. Zero elements are a no-op. */
 int  zf_read_img(ZfFits* h, int dtype, long long firstelem, long long nelem, const void* nulval, const ZfScaling* scaling, void* array);
 int  zf_write_img(ZfFits* h, int dtype, long long firstelem, long long nelem, const void* nulval, const ZfScaling* scaling, const void* array);
 int  zf_read_subset(ZfFits* h, int dtype, int naxis, const long* lower, const long* upper, const long* inc, long long nelem, const void* nulval, const ZfScaling* scaling, void* array);

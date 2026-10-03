@@ -71,7 +71,7 @@ skip = "*-musllinux_i686 *_i686 *-win32 pp*"
 build-frontend = "build"
 test-requires = ["pytest", "numpy", "astropy"]
 # The bundled library is import-time loaded; run the suite against the installed wheel.
-test-command = "pytest {project}/bindings/python/tests -q"
+test-command = "pytest --installed-package {project}/bindings/python/tests -q"
 # Two lanes skip only their in-CI test (the wheel is still built and shipped in both):
 #   • *-musllinux_aarch64 — astropy ships no musllinux/aarch64 wheel for some built CPythons, so
 #     the test-deps install source-builds astropy there, which fails to compile under the

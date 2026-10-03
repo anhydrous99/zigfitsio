@@ -3,7 +3,7 @@
  * behind an open file, with the atomic `writeTo` (pristine byte-copy fast
  * path + reconstruction), `toBytes`, and the flush-on-close lifecycle.
  */
-import { existsSync, renameSync, rmSync, writeFile } from "./fsbridge.js";
+import { atomicWrite, existsSync, writeFile } from "./fsbridge.js";
 import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import { BaseHDU, CompImageHDU, DATA_UNSET, ImageHDU, PrimaryHDU, dataFingerprint } from "./hdu.js";
@@ -89,7 +89,9 @@ export class HDUList implements Iterable<AnyHDU> {
       // A ZIMAGE BINTABLE is a tile-compressed image.
       const name = enc("ZIMAGE");
       if (Number(ll.lib.zf_key_exists(this._handle as bigint, name, name.length)) === 1) {
-        return new CompImageHDU();
+        const logical = ll.outI32();
+        ll.check(ll.lib.zf_read_key_log(this._handle as bigint, name, name.length, logical));
+        if (logical[0] !== 0) return new CompImageHDU();
       }
       return new BinTableHDU();
     }
@@ -404,7 +406,7 @@ export class HDUList implements Iterable<AnyHDU> {
   }
 
   /** Write a borrowed Wasm view synchronously, falling back to a stable JS copy. */
-  private _writeHandleBytes(handle: bigint, path: string): void {
+  private _writeHandleBytes(handle: bigint, path: string | number): void {
     const direct = ll.native.withMemoryBytes;
     if (direct) {
       ll.check(direct(handle, (bytes) => writeFile(path, bytes)));
@@ -422,7 +424,9 @@ export class HDUList implements Iterable<AnyHDU> {
     try {
       if (this._mode !== ll.READONLY) {
         this.flush();
-        if (this._path !== null) this._writeHandleBytes(this._handle, this._path);
+        if (this._path !== null) {
+          atomicWrite(this._path, (fd) => this._writeHandleBytes(this._handle as bigint, fd), { followSymlink: true });
+        }
       }
     } finally {
       ll.lib.zf_close(this._handle);
@@ -440,24 +444,15 @@ export class HDUList implements Iterable<AnyHDU> {
     // Write to a temp file in the same directory, then atomically rename into
     // place: a failure never leaves a partial/corrupt file at `path`, and
     // overwrite does not destroy the existing file until the new one is complete.
-    const tmp = path + ".zigfitsio.tmp";
-    try {
+    atomicWrite(path, (fd) => {
       const precomputed: DataFingerprints = new Map();
       if (!checksum && this._isPristineAttachedWith(precomputed)) {
         this._flush(precomputed);
-        this._writeHandleBytes(this._handle as bigint, tmp);
+        this._writeHandleBytes(this._handle as bigint, fd);
       } else {
-        this._emitTo(tmp, checksum);
+        this._emitTo(fd, checksum);
       }
-      renameSync(tmp, path);
-    } catch (e) {
-      try {
-        rmSync(tmp);
-      } catch {
-        /* tmp may not exist */
-      }
-      throw e;
-    }
+    }, { overwrite });
   }
 
   /** Serialize the HDU list to an in-memory FITS byte buffer. */
@@ -479,7 +474,7 @@ export class HDUList implements Iterable<AnyHDU> {
     return this._withEmittedHandle(checksum, (handle) => this._copyHandleBytes(handle));
   }
 
-  private _emitTo(path: string, checksum: boolean): void {
+  private _emitTo(path: string | number, checksum: boolean): void {
     this._withEmittedHandle(checksum, (handle) => this._writeHandleBytes(handle, path));
   }
 

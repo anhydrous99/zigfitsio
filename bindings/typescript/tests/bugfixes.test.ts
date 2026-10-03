@@ -5,18 +5,220 @@
  * exist) and the pathlib test (paths are strings). The numpy-scalar keyword
  * tests become bigint/number keyword tests.
  */
-import { afterAll, describe, expect, test } from "./_harness/index.js";
+import { afterAll, describe, expect, test, testIf } from "./_harness/index.js";
 import * as zf from "../src/index.js";
 import * as ll from "../src/lowlevel/index.js";
 import { colFp } from "../src/table.js";
 import { enc } from "../src/util.js";
 import { fill, tmpFits } from "./_fixtures.js";
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, chmodSync, statSync, symlinkSync, lstatSync, readdirSync, appendFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { dirname } from "node:path";
+import { gzipSync } from "node:zlib";
+import { readFile as boundedReadFile } from "../src/fsbridge.js";
 
 const tmp = tmpFits();
 afterAll(() => tmp.cleanup());
 
 const asNums = (a: ArrayLike<number | bigint>): number[] => Array.from(a, (v) => Number(v));
+
+describe("atomic persistence and detached builder replacement", () => {
+  const tableData = (values: number[]) => new zf.TableData(
+    ["X"], new Map<string, zf.ColumnData>([["X", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from(values) }]]), values.length,
+  );
+
+  for (const [type, format] of [[zf.BinTableHDU, "1J"], [zf.AsciiTableHDU, "I8"]] as const) {
+    test(`${format} builder replacement and clearing use assigned data`, () => {
+      const table = type.fromColumns([new zf.Column("X", format, { array: Int32Array.of(1, 2), unit: "s" })]);
+      const replacement = tableData([41, 42, 43]);
+      table.data = replacement;
+      expect(() => { table.data = [1, 2] as unknown as zf.TableData; }).toThrow(zf.FitsTypeError);
+      expect(table.data).toBe(replacement);
+      const saved = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        expect(asNums((saved.get(1).data as zf.TableData).numeric("X"))).toEqual([41, 42, 43]);
+        expect(saved.get(1).header.get("TFORM1")).toBe(format);
+        expect(saved.get(1).header.get("TUNIT1")).toBe("s");
+      } finally { saved.close(); }
+      table.data = null;
+      const cleared = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        expect(cleared.get(1).header.get("TFIELDS")).toBe(0);
+        expect(cleared.get(1).header.get("NAXIS2")).toBe(0);
+      } finally { cleared.close(); }
+    });
+
+    test(`${format} explicitly empty builder keeps rows`, () => {
+      const table = type.fromColumns([], { nrows: 3 });
+      const saved = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        expect(saved.get(1).header.get("TFIELDS")).toBe(0);
+        expect(saved.get(1).header.get("NAXIS2")).toBe(3);
+      } finally { saved.close(); }
+    });
+  }
+
+  for (const format of ["1L", "1X"]) {
+    test(`${format} blueprint survives compatible byte data replacement`, () => {
+      const table = zf.BinTableHDU.fromColumns([new zf.Column("X", format, { array: Uint8Array.of(0), unit: "s" })]);
+      table.data = new zf.TableData(["X"], new Map<string, zf.ColumnData>([
+        ["X", { kind: "numeric", dtype: "u1", repeat: 1, values: Uint8Array.of(1, 0, 1) }],
+      ]), 3);
+      const saved = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        expect(saved.get(1).header.get("TFORM1")).toBe(format);
+        expect(saved.get(1).header.get("TUNIT1")).toBe("s");
+        expect(asNums((saved.get(1).data as zf.TableData).numeric("X"))).toEqual([1, 0, 1]);
+      } finally { saved.close(); }
+    });
+  }
+
+  test("VLA blueprint survives replacement", () => {
+    const table = zf.BinTableHDU.fromColumns([new zf.Column("X", "1PJ", { unit: "m" })]);
+    table.data = new zf.TableData(["X"], new Map<string, zf.ColumnData>([
+      ["X", { kind: "vla", dtype: "i4", repeat: 1, values: [Int32Array.of(7, 8), Int32Array.of(9)] }],
+    ]), 2);
+    const saved = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+    try {
+      expect(saved.get(1).header.get("TFORM1")).toBe("1PJ");
+      expect(saved.get(1).header.get("TUNIT1")).toBe("m");
+      expect((saved.get(1).data as zf.TableData).vla("X").map(asNums)).toEqual([[7, 8], [9]]);
+    } finally { saved.close(); }
+  });
+
+  test("unsigned blueprint replacement regenerates its offset", () => {
+    const table = zf.BinTableHDU.fromColumns([new zf.Column("X", "1I", { array: Uint16Array.of(0), unit: "s" })]);
+    table.data = new zf.TableData(["X"], new Map<string, zf.ColumnData>([
+      ["X", { kind: "numeric", dtype: "u2", repeat: 1, values: Uint16Array.of(0, 32768, 65535) }],
+    ]), 3);
+    const saved = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+    try {
+      expect(saved.get(1).header.get("TFORM1")).toBe("1I");
+      expect(saved.get(1).header.get("TZERO1")).toBe(32768);
+      expect(asNums((saved.get(1).data as zf.TableData).numeric("X"))).toEqual([0, 32768, 65535]);
+    } finally { saved.close(); }
+  });
+
+  for (const format of ["F12.5", "E16.8", "D20.12"]) {
+    test(`${format} source precision survives reconstruction`, () => {
+      const table = zf.AsciiTableHDU.fromColumns([new zf.Column("X", format, { array: Float64Array.of(1.23456, 9.87654), unit: "s" })]);
+      const source = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        const original = asNums((source.get(1).data as zf.TableData).numeric("X"));
+        source.get(1).header.set("NOTE", "force reconstruction");
+        const saved = zf.fromBytes(source.toBytes());
+        try {
+          expect(saved.get(1).header.get("TFORM1")).toBe(format);
+          expect(saved.get(1).header.get("TUNIT1")).toBe("s");
+          expect(asNums((saved.get(1).data as zf.TableData).numeric("X"))).toEqual(original);
+        } finally { saved.close(); }
+      } finally { source.close(); }
+    });
+  }
+
+  test("Q VLA descriptor and display metadata survive reconstruction", () => {
+    const table = zf.BinTableHDU.fromColumns([new zf.Column("X", "1QJ", { array: [Int32Array.of(1, 2), Int32Array.of(3)], unit: "m" })]);
+    table.header.set("TDISP1", "I8", "display comment");
+    const source = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+    try {
+      source.get(1).header.set("NOTE", "force reconstruction");
+      const saved = zf.fromBytes(source.toBytes());
+      try {
+        expect(saved.get(1).header.get("TFORM1")).toBe("1QJ");
+        expect(saved.get(1).header.get("TUNIT1")).toBe("m");
+        expect(saved.get(1).header.get("TDISP1")).toBe("I8");
+        expect(saved.get(1).header.commentOf("TDISP1")).toBe("display comment");
+        expect((saved.get(1).data as zf.TableData).vla("X").map(asNums)).toEqual([[1, 2], [3]]);
+      } finally { saved.close(); }
+    } finally { source.close(); }
+  });
+
+  test("ZIMAGE false remains a binary table; malformed logical raises a typed error", () => {
+    const source = (bad: boolean) => bytesFrom((handle) => {
+      ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+      ll.check(ll.lib.zf_create_tbl(handle, ll.BINARY_TBL, 0n, 0, [], [], [], null));
+      const key = enc("ZIMAGE");
+      if (bad) {
+        const value = enc("bad");
+        ll.check(ll.lib.zf_write_key_str(handle, key, key.length, value, value.length, null, 0));
+      } else {
+        ll.check(ll.lib.zf_write_key_log(handle, key, key.length, 0, null, 0));
+      }
+    });
+    const saved = zf.fromBytes(source(false));
+    try { expect(saved.get(1)).toBeInstanceOf(zf.BinTableHDU); } finally { saved.close(); }
+    expect(() => zf.fromBytes(source(true))).toThrow(zf.FitsTypeError);
+  });
+
+  for (const throughSymlink of [false, true]) {
+    testIf(!throughSymlink || process.platform !== "win32")(
+      `update close preserves mode and exact flushed bytes${throughSymlink ? " through a symlink" : ""}`, () => {
+        const path = tmp.path(), source = throughSymlink ? tmp.path() : path;
+        new zf.HDUList([new zf.PrimaryHDU(), new zf.ImageHDU({ data: new zf.FitsArray(Int16Array.of(4, 5), [2]) })]).writeTo(path);
+        chmodSync(path, 0o640);
+        const expectedMode = statSync(path).mode & 0o777;
+        if (throughSymlink) symlinkSync(path, source);
+        const hdul = zf.open(source, "update");
+        hdul.get(0).header.set("OBSERVER", "Ada");
+        hdul.hdus.splice(1, 1);
+        const expected = hdul._sourceBytes();
+        hdul.close();
+        if (throughSymlink) expect(lstatSync(source).isSymbolicLink()).toBe(true);
+        expect(statSync(path).mode & 0o777).toBe(expectedMode);
+        expect(new Uint8Array(readFileSync(path))).toEqual(expected);
+      },
+    );
+  }
+
+  test("failed close keeps the original file and releases the handle", () => {
+    const path = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU()]).writeTo(path);
+    const before = readFileSync(path);
+    const hdul = zf.open(path, "update");
+    hdul.get(0).header.set("NOTE", "edited");
+    const injected = hdul as unknown as { _writeHandleBytes: (handle: bigint, fd: number) => void };
+    injected._writeHandleBytes = (_handle, fd) => {
+      writeFileSync(fd, "partial");
+      throw new Error("injected save failure");
+    };
+    expect(() => hdul.close()).toThrow("injected save failure");
+    expect(hdul._handle).toBe(null);
+    expect(readFileSync(path)).toEqual(before);
+    expect(readdirSync(dirname(path)).filter((name) => name.includes(".zigfitsio-"))).toEqual([]);
+  });
+
+  test("file input and gzip inflation respect allocation budgets", () => {
+    const path = tmp.path();
+    const bytes = new zf.HDUList([new zf.PrimaryHDU()]).toBytes();
+    writeFileSync(path, bytes);
+    expect(() => zf.open(path, "readonly", { maxOpenAlloc: BigInt(bytes.length - 1) })).toThrow(zf.FitsMemoryError);
+    const exact = zf.open(path, "readonly", { maxOpenAlloc: BigInt(bytes.length) });
+    exact.close();
+    const compressed = path + ".gz";
+    writeFileSync(compressed, gzipSync(bytes));
+    expect(() => zf.open(compressed, "readonly", { maxOpenAlloc: 1024n })).toThrow(zf.FitsMemoryError);
+  });
+
+  testIf(!process.versions.bun)("file growth after stat fails without allocating more input", () => {
+    const path = tmp.path();
+    writeFileSync(path, Uint8Array.of(1, 2));
+    const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+    const original = fs.readSync;
+    let grew = false;
+    fs.readSync = ((...args: Parameters<typeof original>) => {
+      if (!grew) { grew = true; appendFileSync(path, Uint8Array.of(3)); }
+      return Reflect.apply(original, fs, args);
+    }) as typeof original;
+    syncBuiltinESMExports();
+    try {
+      expect(() => boundedReadFile(path, 3n)).toThrow(zf.FitsIOError);
+      expect(grew).toBe(true);
+    } finally {
+      fs.readSync = original;
+      syncBuiltinESMExports();
+    }
+  });
+});
 
 /** Run `build(handle)` against a fresh in-memory FITS handle; return the serialized bytes. */
 function bytesFrom(build: (handle: bigint) => void): Uint8Array {
@@ -2508,4 +2710,286 @@ describe("BLANK/ZBLANK semantics: int images with BLANK read as NaN-masked float
       hl.close();
     }
   });
+});
+
+describe("indexed table metadata", () => {
+  const sourceBytes = (): Uint8Array => {
+    const table = zf.BinTableHDU.fromColumns([
+      new zf.Column("A", "1J", { array: Int32Array.of(1, 2), unit: "s" }),
+      new zf.Column("B", "1J", { array: Int32Array.of(101, 102), unit: "s" }),
+      new zf.Column("C", "1J", { array: Int32Array.of(201, 202), unit: "s" }),
+    ]);
+    const cards = {
+      TNULL1: -99, TDISP2: "I8", TDIM3: "(1)", TLMIN1: 0, TLMAX2: 109, TDBIN2: 0.5, TDMIN1: 1, TDMAX1: 2,
+      TCTYP1: "LINEAR", TCTYP2: "LINEAR", TCUNI1: "s", TCRVL2: 20,
+      TCTY1A: "LINEAR", TCTY2A: "LINEAR", TCRP1A: 2, TCDE2A: 0.1,
+      TP1_2A: 0.25, TCD1_2D: 0.5, TPV1_0A: 4, TPS2_1A: "parameter",
+      TCTY3B: "LINEAR", TCRD3B: 0.01, EQUI3B: 2000,
+      "1CTYP3": "LINEAR", "1CUNI3": "m", "1CTY3C": "LINEAR", "2CNA3C": "axis two",
+      "12PC3C": 0.125, "21CD3D": 0.25, "1PV3_0C": 3, "2S3_1C": "lookup",
+      "1V3_XC": 7, WCAX3C: 2, WCSN3C: "array coordinates", LONP3C: 180,
+      DOBS3: "2026-09-30", TRPOS3: "TOPOCENTER",
+      TLMIN0: 7, TLMIN01: 8, "1000PC1": 9, TCTYP1A: "custom", PC1_2A: 0.75, "OBS CAMERA": "camera",
+    };
+    for (const [key, value] of Object.entries(cards)) table.header.set(key, value, `comment for ${key}`);
+    table.header.addHistory("metadata provenance");
+    return new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes();
+  };
+
+  test("reordering maps columns while retaining axis and parameter indices", () => {
+    const source = zf.fromBytes(sourceBytes());
+    try {
+      const table = source.get(1) as zf.TableHDU;
+      const data = table.data as zf.TableData;
+      table.data = new zf.TableData(["C", "A", "B"], data.columns, data.nrows);
+      const saved = zf.fromBytes(source.toBytes());
+      try {
+        const header = saved.get(1).header;
+        const expected = {
+          TNULL2: -99, TDISP3: "I8", TDIM1: "(1)", TLMIN2: 0, TLMAX3: 109, TDBIN3: 0.5,
+          TCTYP2: "LINEAR", TCUNI2: "s", TCRVL3: 20, TCRP2A: 2, TCDE3A: 0.1,
+          TP2_3A: 0.25, TCD2_3D: 0.5, TPV2_0A: 4, TPS3_1A: "parameter",
+          TCTY1B: "LINEAR", TCRD1B: 0.01, EQUI1B: 2000,
+          "1CTYP1": "LINEAR", "1CUNI1": "m", "1CTY1C": "LINEAR", "2CNA1C": "axis two",
+          "12PC1C": 0.125, "21CD1D": 0.25, "1PV1_0C": 3, "2S1_1C": "lookup",
+          "1V1_XC": 7, WCAX1C: 2, WCSN1C: "array coordinates", LONP1C: 180,
+          DOBS1: "2026-09-30", TRPOS1: "TOPOCENTER",
+          TLMIN0: 7, TLMIN01: 8, "1000PC1": 9, TCTYP1A: "custom", PC1_2A: 0.75, "OBS CAMERA": "camera",
+        };
+        for (const [key, value] of Object.entries(expected)) expect(header.get(key)).toBe(value);
+        expect(header.commentOf("TP2_3A")).toBe("comment for TP1_2A");
+        expect(header.commentOf("12PC1C")).toBe("comment for 12PC3C");
+        for (const key of ["TDMIN1", "TDMAX1", "TP1_2A", "1PV3_0C"]) expect(header.get(key)).toBeUndefined();
+        expect((saved.get(1).data as zf.TableData).names).toEqual(["C", "A", "B"]);
+      } finally { saved.close(); }
+    } finally { source.close(); }
+  });
+
+  test("ASCII ranges and pixel-list WCS follow reordered columns", () => {
+    const table = zf.AsciiTableHDU.fromColumns([
+      new zf.Column("A", "I8", { array: Int32Array.of(1, 2) }),
+      new zf.Column("B", "I8", { array: Int32Array.of(101, 102) }),
+    ]);
+    for (const [key, value] of Object.entries({ TLMIN1: 0, TLMIN2: 100, TCTY1A: "LINEAR", TCTY2A: "LINEAR", TP1_2A: 0.25 })) {
+      table.header.set(key, value);
+    }
+    const source = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+    try {
+      const hdu = source.get(1) as zf.TableHDU;
+      const data = hdu.data as zf.TableData;
+      hdu.data = new zf.TableData(["B", "A"], data.columns, data.nrows);
+      const saved = zf.fromBytes(source.toBytes());
+      try {
+        expect(saved.get(1).header.get("TLMIN1")).toBe(100);
+        expect(saved.get(1).header.get("TLMIN2")).toBe(0);
+        expect(saved.get(1).header.get("TP2_1A")).toBe(0.25);
+        expect(saved.get(1).header.get("TP1_2A")).toBeUndefined();
+      } finally { saved.close(); }
+    } finally { source.close(); }
+  });
+
+  for (const change of ["remove", "retype", "rename", "clear"]) {
+    test(`${change} drops incomplete WCS and stale metadata`, () => {
+      const source = zf.fromBytes(sourceBytes());
+      try {
+        const table = source.get(1) as zf.TableHDU;
+        const data = table.data as zf.TableData;
+        if (change === "remove") table.data = new zf.TableData(["A", "C"], data.columns, data.nrows);
+        else if (change === "clear") table.data = null;
+        else {
+          const middle = change === "rename" ? "D" : "B";
+          table.data = new zf.TableData(["A", middle, "C"], new Map<string, zf.ColumnData>([
+            ["A", data.column("A")],
+            [middle, { kind: "numeric", dtype: "f8", repeat: 1, values: Float64Array.of(101, 102) }],
+            ["C", data.column("C")],
+          ]), data.nrows);
+        }
+        const saved = zf.fromBytes(source.toBytes());
+        try {
+          const header = saved.get(1).header;
+          for (const key of ["TCTYP1", "TCTYP2", "TCTY1A", "TCTY2A", "TP1_2A", "TCD1_2D", "TPV1_0A", "TPS2_1A", "TLMAX2", "TDISP2"]) {
+            expect(header.get(key)).toBeUndefined();
+          }
+          if (change !== "clear") {
+            const index = change === "remove" ? 2 : 3;
+            expect(header.get(`TCTY${index}B`)).toBe("LINEAR");
+            expect(header.get(`1CTY${index}C`)).toBe("LINEAR");
+            expect(header.get(`WCSN${index}C`)).toBe("array coordinates");
+          } else {
+            expect(header.get("TFIELDS")).toBe(0);
+            expect(header.get("TCTY3B")).toBeUndefined();
+            expect(header.get("1CTY3C")).toBeUndefined();
+          }
+          expect(header.get("1000PC1")).toBe(9);
+          expect(header.get("OBS CAMERA")).toBe("camera");
+        } finally { saved.close(); }
+      } finally { source.close(); }
+    });
+  }
+
+  for (const attached of [false, true]) {
+    test(`scaling change invalidates metadata provenance (${attached ? "attached" : "builder"})`, () => {
+      const table = zf.BinTableHDU.fromColumns([new zf.Column("X", "1I", { array: Uint16Array.of(1, 2), unit: "s" })]);
+      table.header.set("TNULL1", -99);
+      table.header.set("TLMIN1", 0);
+      table.header.set("TCTYP1", "LINEAR");
+      let hdul = new zf.HDUList([new zf.PrimaryHDU(), table]);
+      if (attached) hdul = zf.fromBytes(hdul.toBytes());
+      try {
+        (hdul.get(1) as zf.TableHDU).data = new zf.TableData(["X"], new Map<string, zf.ColumnData>([
+          ["X", { kind: "numeric", dtype: "i2", repeat: 1, values: Int16Array.of(1, 2) }],
+        ]), 2);
+        const saved = zf.fromBytes(hdul.toBytes());
+        try {
+          const header = saved.get(1).header;
+          expect(header.get("TFORM1")).toBe("1I");
+          expect(header.get("TUNIT1")).toBe("s");
+          for (const key of ["TZERO1", "TNULL1", "TLMIN1", "TCTYP1"]) expect(header.get(key)).toBeUndefined();
+        } finally { saved.close(); }
+      } finally { hdul.close(); }
+    });
+  }
+
+  test("fresh detached metadata uses the new schema and explicit measured bounds", () => {
+    const table = new zf.BinTableHDU({ data: new zf.TableData(["X"], new Map<string, zf.ColumnData>([
+      ["X", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.of(3, 4) }],
+    ]), 2) });
+    for (const [key, value] of Object.entries({ TDMIN1: 3, TDMAX1: 4, TLMIN1: 0, TNULL9: -99 })) table.header.set(key, value);
+    const saved = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+    try {
+      expect(saved.get(1).header.get("TDMIN1")).toBe(3);
+      expect(saved.get(1).header.get("TDMAX1")).toBe(4);
+      expect(saved.get(1).header.get("TLMIN1")).toBe(0);
+      expect(saved.get(1).header.get("TNULL9")).toBeUndefined();
+    } finally { saved.close(); }
+  });
+
+  test("WCS keyword growth uses a short alias or raises a typed error", () => {
+    const table = zf.BinTableHDU.fromColumns(Array.from({ length: 103 }, (_, i) =>
+      new zf.Column(`C${i}`, "1J", { array: Int32Array.of(i) })));
+    table.header.set("TPC1_2A", 0.25);
+    const source = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+    try {
+      const hdu = source.get(1) as zf.TableHDU;
+      const data = hdu.data as zf.TableData;
+      const order = ["C1", ...Array.from({ length: 99 }, (_, i) => `C${i + 2}`), "C0", "C101", "C102"];
+      hdu.data = new zf.TableData(order, data.columns, data.nrows);
+      const saved = zf.fromBytes(source.toBytes());
+      try { expect(saved.get(1).header.get("TP101_1A")).toBe(0.25); } finally { saved.close(); }
+      hdu.data = new zf.TableData([...Array.from({ length: 101 }, (_, i) => `C${i + 2}`), "C0", "C1"], data.columns, data.nrows);
+      expect(() => source.toBytes()).toThrow(zf.FitsHeaderError);
+    } finally { source.close(); }
+  });
+});
+
+describe("stored table formats", () => {
+  for (const [type, format, override, values] of [
+    [zf.BinTableHDU, "1J", "1I", Int32Array.of(40000)],
+    [zf.AsciiTableHDU, "F12.5", "I3", Float64Array.of(1.23456)],
+  ] as const) {
+    test(`attached ${format} comes from the native source layout`, () => {
+      const table = type.fromColumns([new zf.Column("X", format, { array: values, unit: "m" })]);
+      table.header.set("TDISP1", "I8");
+      const source = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        const expected = asNums((source.get(1).data as zf.TableData).numeric("X"));
+        source.get(1).header.set("TFORM1", override);
+        source.get(1).header.set("TUNIT1", "s");
+        const saved = zf.fromBytes(source.toBytes());
+        try {
+          expect(saved.get(1).header.get("TFORM1")).toBe(format);
+          expect(saved.get(1).header.get("TUNIT1")).toBe("s");
+          expect(saved.get(1).header.get("TDISP1")).toBe("I8");
+          expect(asNums((saved.get(1).data as zf.TableData).numeric("X"))).toEqual(expected);
+        } finally { saved.close(); }
+      } finally { source.close(); }
+    });
+  }
+
+  for (const descriptor of ["P", "Q"]) {
+    for (const emission of ["attached", "builder_arrays", "builder_replacement"]) {
+      test(`materialized ${descriptor} VLA omits stale maximum (${emission})`, () => {
+        const format = `1${descriptor}J(2)`;
+        const cells = [Int32Array.of(1, 2)];
+        let table: zf.TableHDU = zf.BinTableHDU.fromColumns([new zf.Column("X", format, { array: cells, unit: "m" })]);
+        table.header.set("TDISP1", "I8", "display comment");
+        let hdul = new zf.HDUList([new zf.PrimaryHDU(), table]);
+        if (emission === "attached") {
+          const raw = bytesFrom((handle) => {
+            ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+            ll.check(ll.lib.zf_create_tbl_heap(handle, ll.BINARY_TBL, 1n, 1, ["X"], [format], ["m"], null, 8n));
+            const tout = ll.outU64();
+            ll.check(ll.lib.zf_table_open(handle, tout));
+            try {
+              ll.check(ll.lib.zf_write_col_vla(tout[0], ll.ZF_INT32, 0, 1n, cells[0], 2n));
+            } finally { ll.lib.zf_table_close(tout[0]); }
+            const key = enc("TDISP1"), value = enc("I8"), comment = enc("display comment");
+            ll.check(ll.lib.zf_write_key_str(handle, key, key.length, value, value.length, comment, comment.length));
+          });
+          hdul = zf.fromBytes(raw);
+          expect(hdul.toBytes()).toEqual(raw); // pristine bounded descriptors remain exact
+          table = hdul.get(1) as zf.TableHDU;
+          (table.data!.column("X") as zf.VlaColumn).values[0] = Int32Array.of(1, 2, 3, 4, 5);
+        } else if (emission === "builder_arrays") {
+          cells[0] = Int32Array.of(1, 2, 3, 4, 5);
+        } else {
+          table.data = new zf.TableData(["X"], new Map<string, zf.ColumnData>([
+            ["X", { kind: "vla", dtype: "i4", repeat: 1, values: [Int32Array.of(1, 2, 3, 4, 5)] }],
+          ]), 1);
+        }
+        try {
+          const saved = zf.fromBytes(hdul.toBytes());
+          try {
+            expect(saved.get(1).header.get("TFORM1")).toBe(`1${descriptor}J`);
+            expect(saved.get(1).header.get("TUNIT1")).toBe("m");
+            expect(saved.get(1).header.get("TDISP1")).toBe("I8");
+            expect(saved.get(1).header.commentOf("TDISP1")).toBe("display comment");
+            expect((saved.get(1).data as zf.TableData).vla("X").map(asNums)).toEqual([[1, 2, 3, 4, 5]]);
+          } finally { saved.close(); }
+        } finally { hdul.close(); }
+      });
+    }
+  }
+});
+
+describe("table WCS cross-references", () => {
+  for (const change of ["reorder", "remove", "retype"]) {
+    test(`${change} tracks case-sensitive targets across alternate descriptors`, () => {
+      const table = zf.BinTableHDU.fromColumns(["A", "B", "C"].map((name, i) =>
+        new zf.Column(name, "1J", { array: Int32Array.of(i) })));
+      for (const [key, value] of Object.entries({
+        "1CTY1B": "LINEAR", WCST1B: "XREF", WCSX2A: "XREF", WCSX3A: "xref", "1CTY2C": "LINEAR", CUSTOM: "XREF",
+      })) table.header.set(key, value, `comment for ${key}`);
+      const source = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU(), table]).toBytes());
+      try {
+        const hdu = source.get(1) as zf.TableHDU;
+        const data = hdu.data as zf.TableData;
+        if (change === "reorder") hdu.data = new zf.TableData(["C", "B", "A"], data.columns, data.nrows);
+        else if (change === "remove") hdu.data = new zf.TableData(["B", "C"], data.columns, data.nrows);
+        else hdu.data = new zf.TableData(["A", "B", "C"], new Map<string, zf.ColumnData>([
+          ["A", { kind: "numeric", dtype: "f8", repeat: 1, values: Float64Array.of(0) }],
+          ["B", data.column("B")], ["C", data.column("C")],
+        ]), data.nrows);
+        const saved = zf.fromBytes(source.toBytes());
+        try {
+          const header = saved.get(1).header;
+          if (change === "reorder") {
+            expect(header.get("WCST3B")).toBe("XREF");
+            expect(header.get("WCSX2A")).toBe("XREF");
+            expect(header.get("1CTY3B")).toBe("LINEAR");
+            expect(header.get("WCSX1A")).toBe("xref");
+            expect(header.commentOf("WCSX2A")).toBe("comment for WCSX2A");
+          } else {
+            const [refIndex, caseIndex] = change === "remove" ? [1, 2] : [2, 3];
+            expect(header.get(`WCSX${refIndex}A`)).toBeUndefined();
+            expect(header.get("WCST1B")).toBeUndefined();
+            expect(header.get("1CTY1B")).toBeUndefined();
+            expect(header.get(`WCSX${caseIndex}A`)).toBe("xref");
+          }
+          expect(header.get(`1CTY${change === "remove" ? 1 : 2}C`)).toBe("LINEAR");
+          expect(header.get("CUSTOM")).toBe("XREF");
+        } finally { saved.close(); }
+      } finally { source.close(); }
+    });
+  }
 });

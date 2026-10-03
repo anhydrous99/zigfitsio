@@ -9,6 +9,55 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ### Changed
 - **Build**: `zig build` now installs only the static Zig library; the C-ABI shared library
   remains available through `zig build capi`, and the validation CLI through `zig build fitsverify`.
+- **CI / Packaging**: external CFITSIO/Astropy checks run for every CI event and release SHA;
+  s390x runs the full suite through a required QEMU emulator. Wheel checks require installed
+  package/library provenance and rebuild from the sdist outside the checkout. npm packages are
+  packed once, tested on Node 18.0.0/20 and in real Chrome, then published as the same archive.
+- **Validation**: fuzz harnesses carry correctly framed nonempty Smith corpora and verify complete
+  codec seed decoding. An optimized CFITSIO memory benchmark reports matching-workload medians
+  without imposing a performance release gate. Obsolete native-FFI Vitest serialization is removed.
+- **Dependencies**: refresh advisory-affected transitive brace-expansion and markdown-it releases
+  within existing ranges, preserving the TypeScript compiler aliases and direct package versions.
+
+### Fixed
+- **Core**: image reshapes validate staged geometry before relocating data and preserve following
+  HDUs. Recognizable malformed extensions and device failures propagate instead of being hidden
+  as special records, and logical read-only handles reject image mutations even on writable
+  devices. Truncated headers report a missing END card without hiding device errors.
+- **C ABI / Bindings**: flat image ranges reject out-of-bounds and overflowing transfers instead of
+  wrapping to the first pixels; partial compressed transfers fail explicitly. Memory opens check
+  allocation limits before copying or allocating, including an additive options-aware owned-buffer
+  builder entrypoint with synchronized C/Python/TypeScript declarations.
+- **Compression**: stream and tile gzip decoding share bounded member/footer validation, including
+  concatenated members and exact output-limit checks; JavaScript file reads and gzip inflation
+  enforce the configured budget before supplying bytes to wasm. Sequential materialization transfers
+  ownership of its completed buffer to `MemoryDevice` instead of making another complete copy.
+- **Python / TypeScript**: reconstructed tables and compressed images retain science/provenance
+  metadata while column metadata follows regenerated layouts. Detached table builders honor data
+  replacement and clearing, preserve compatible explicit formats, and reject unsupported ASCII
+  schema inference. Attached formats come from the native source header, so local structural
+  header edits cannot override the stored cells. Materialized variable-length arrays retain their
+  P/Q descriptor and element type while omitting optional maximum lengths that edits can invalidate.
+  `ZIMAGE = F` tables remain ordinary binary tables.
+- **Table metadata**: range and table-WCS keywords follow compatible source columns through
+  reorder/subset operations in both bindings, including alternate descriptions and matrix terms.
+  Incomplete coordinate descriptions, references whose target was removed, and unverified measured
+  bounds are removed on reconstruction.
+- **Persistence**: TypeScript update close atomically replaces the destination from exact flushed
+  bytes, preserving existing permissions and symlink targets; Python `writeto()` uses exclusive
+  sibling staging and cleans failed writes without truncating the original. Python reconstruction
+  writes directly to its borrowed file descriptor instead of buffering the entire output in RAM;
+  new files honor umask and replacements preserve existing permissions. The additive
+  `zf_create_file_handle_v1` keeps ownership of the native OS handle with its caller.
+- **WCS**: serialize legacy CROTA rotation as equivalent sparse PC terms, replace an existing WCS
+  description without duplicate/stale transform cards, and reject impossible CAR pole
+  configurations while preserving valid boundary solutions. Unrelated high axes no longer require
+  unrepresentable matrix keywords; reparsed PC descriptions omit identity defaults on later saves.
+- **Time**: serialize `TIMEOFFS`, `DATE-BEG`/`DATE-AVG`/`DATE-END`, and
+  `MJD-BEG`/`MJD-AVG`/`MJD-END`; repeated writes update existing cards instead of appending duplicates.
+- **Grouping**: resolve full logical member/group names including CONTINUE strings, widen new
+  `MEMBER_NAME` columns to 68 characters, and reject names exceeding an existing column's width
+  before adding rows or linkage cards.
 
 ## [0.1.6] - 2026-07-18
 
