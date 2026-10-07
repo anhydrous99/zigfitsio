@@ -61,7 +61,7 @@ fn fuzzOpen(_: void, smith: *Smith) anyerror!void {
 
 fn firstCoord(naxis: u16) [999]u64 {
     _ = naxis;
-    return [_]u64{0} ** 999;
+    return @as([999]u64, @splat(0));
 }
 
 // ── tile-codec decoders (X-FUZZ codec layer) ──────────────────────────────────────────────
@@ -196,10 +196,10 @@ fn sliceSeed(payload: []const u8, hash: u32) ![]u8 {
 }
 
 test "fuzz: card parser" {
-    var valid = [_]u8{' '} ** 80;
+    var valid = @as([80]u8, @splat(' '));
     @memcpy(valid[0..30], "SIMPLE  =                    T");
     _ = try fits.Card.parse(&valid);
-    try std.testing.fuzz({}, fuzzCard, .{ .corpus = &.{ &valid, &([_]u8{0xff} ** 80) } });
+    try std.testing.fuzz({}, fuzzCard, .{ .corpus = &.{ &valid, &(@as([80]u8, @splat(0xff))) } });
 }
 test "fuzz: TFORM parser" {
     const valid = try sliceSeed("1PJ(64)", 0x02);
@@ -222,7 +222,7 @@ test "fuzz: whole-file open + HDU walk" {
     try std.testing.fuzz({}, fuzzOpen, .{ .corpus = &.{ seed, seed[0 .. seed.len - 80] } });
 }
 test "fuzz: HCOMPRESS_1 decoder" {
-    const pixels = [_]i32{7} ** 64;
+    const pixels = @as([64]i32, @splat(7));
     const encoded = try fits.hcompress.compress(alloc, &pixels, 8, 8, 0);
     defer alloc.free(encoded);
     const decoded = try fits.hcompress.decompress(alloc, encoded, 64, .{});
@@ -237,7 +237,7 @@ test "fuzz: RICE_1 decoder" {
     var count: usize = 0;
     defer for (seeds[0..count]) |seed| alloc.free(seed);
     inline for (.{ 1, 2, 4 }, 0..) |bytepix, i| {
-        const pixels = [_]u8{0xff} ** (256 * bytepix);
+        const pixels = @as([(256 * bytepix)]u8, @splat(0xff));
         const encoded = try fits.rice.compress(alloc, &pixels, bytepix, 32);
         defer alloc.free(encoded);
         const decoded = try fits.rice.decompress(alloc, encoded, 256, bytepix, 32);
@@ -271,7 +271,7 @@ test "fuzz: GZIP_1/GZIP_2 decoder" {
     try std.testing.fuzz({}, fuzzGzip, .{ .corpus = &.{ seed, seed[0 .. seed.len - 1] } });
 }
 test "fuzz: compressed-HDU byte mutation" {
-    const seeds = [3][16]u8{ [_]u8{0} ** 16, .{1} ++ [_]u8{0} ** 15, .{2} ++ [_]u8{0} ** 15 };
+    const seeds = [3][16]u8{ @as([16]u8, @splat(0)), .{1} ++ @as([15]u8, @splat(0)), .{2} ++ @as([15]u8, @splat(0)) };
     // Four equal flips cancel: each codec seed must reach a successful complete tile decode.
     var decoded: usize = 0;
     for (&seeds) |*seed| {
@@ -339,7 +339,7 @@ test "seeds: hostile headers yield typed errors, never panic or huge alloc" {
 }
 
 test "seeds: a control character in a card is rejected" {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..6], "OBJECT");
     raw[20] = 0x07; // bell
     try std.testing.expectError(error.NonAsciiInHeader, fits.Card.parse(&raw));
@@ -361,7 +361,7 @@ test "seeds: hostile codec streams are typed errors, never a panic" {
     try std.testing.expectError(error.CorruptTile, fits.hcompress.decompress(alloc, &.{ 0xDD, 0x99 }, 4, .{}));
     try std.testing.expectError(error.CorruptTile, fits.hcompress.decompress(alloc, &.{ 0xDD, 0x99, 0, 0, 0, 4, 0, 0 }, 16, .{}));
     {
-        var hdr = [_]u8{ 0xDD, 0x99 } ++ [_]u8{0} ** 19;
+        var hdr = [_]u8{ 0xDD, 0x99 } ++ @as([19]u8, @splat(0));
         std.mem.writeInt(u32, hdr[2..6], 4, .big);
         std.mem.writeInt(u32, hdr[6..10], 4, .big);
         hdr[18] = 99; // nbitplanes[0] > 63

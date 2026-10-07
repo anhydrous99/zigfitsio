@@ -1277,7 +1277,7 @@ test "resizeHduData grow within one block zero-fills the new bytes" {
     try expectPattern(f.dev, h2.data_off, 8, 0x11); // original bytes preserved
     var z: [12]u8 = undefined;
     try f.dev.readAll(&z, h2.data_off + 8); // grown bytes are zero
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** 12, &z);
+    try testing.expectEqualSlices(u8, &@as([12]u8, @splat(0)), &z);
 }
 
 test "refreshGeometry recomputes data_bytes after a NAXISn edit" {
@@ -1443,7 +1443,7 @@ fn writeCardInto(blk: []u8, idx: usize, text: []const u8) void {
 // Append a single 2880-byte record after `off` that parses as a header (it ends with END) but is
 // NOT a valid extension (no XTENSION) — the §3.5 special-records signature.
 fn writeSpecialRecords(dev: Device, off: u64) !void {
-    var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var blk: [block.BLOCK]u8 = @splat(' ');
     writeCardInto(&blk, 0, "COMMENT trailing special records, not an HDU");
     writeCardInto(&blk, 1, "END");
     try dev.writeAll(&blk, off);
@@ -1460,7 +1460,7 @@ test "open rejects a sub-block / empty file instead of leaving current() out of 
 }
 
 test "absurd GCOUNT does not overflow-panic during scan (roundUpBlocks saturates)" {
-    var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var blk: [block.BLOCK]u8 = @splat(' ');
     writeCardInto(&blk, 0, "SIMPLE  =                    T");
     writeCardInto(&blk, 1, "BITPIX  =                   16");
     writeCardInto(&blk, 2, "NAXIS   =                    1");
@@ -1529,7 +1529,7 @@ test "a trailing malformed extension still errors the scan (not special records)
     const eof = try f.dev.getSize();
 
     // An extension signature with invalid BITPIX must propagate its structural error.
-    var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var blk: [block.BLOCK]u8 = @splat(' ');
     writeCardInto(&blk, 0, "XTENSION= 'IMAGE'");
     writeCardInto(&blk, 1, "BITPIX  =                    7");
     writeCardInto(&blk, 2, "NAXIS   =                    0");
@@ -1606,7 +1606,7 @@ test "distinct Fits handles run concurrently from multiple threads" {
     // checking is covered by the single-threaded tests).
     const alloc = std.heap.smp_allocator;
     const N = 8;
-    var oks = [_]bool{false} ** N;
+    var oks = @as([N]bool, @splat(false));
     var threads: [N]std.Thread = undefined;
     for (&threads, 0..) |*t, i| {
         t.* = try std.Thread.spawn(.{}, concWorker, .{ alloc, &oks[i], @as(u32, @intCast(i + 1)) });
@@ -1626,7 +1626,7 @@ test "extension signature propagates missing keywords malformed values and missi
         var b = try newHandle(testing.allocator);
         defer b.deinit(testing.allocator);
         _ = try b.f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
-        var blk = [_]u8{' '} ** block.BLOCK;
+        var blk = @as([block.BLOCK]u8, @splat(' '));
         writeCardInto(&blk, 0, "XTENSION= 'IMAGE'");
         if (case.bitpix) |card| writeCardInto(&blk, 1, card);
         writeCardInto(&blk, 2, "NAXIS   =                    0");

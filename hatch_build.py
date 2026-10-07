@@ -1,7 +1,7 @@
 """Hatchling build hook: compile the ``zigfitsio_capi`` shared library with Zig and bundle it
 into the wheel as package data.
 
-The caller supplies Zig 0.16.0 on ``PATH``. A compatible, already-installed ``ziglang`` package
+The caller supplies Zig 0.17.x on ``PATH``. A compatible, already-installed ``ziglang`` package
 is also supported; the hook does not install a toolchain. Set ``ZIG_TARGET`` to cross-compile
 (e.g. for cibuildwheel emitting wheels for another platform).
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -99,7 +100,7 @@ class ZigSharedLibraryHook(BuildHookInterface):
             build_data["infer_tag"] = True
 
     def _build(self, repo: Path) -> None:
-        args = ["build", "capi", "-Doptimize=ReleaseFast"]
+        args = ["build", "capi", "-Doptimize=fast"]
         target = os.environ.get("ZIG_TARGET")
         if not target and _host_os() == "macos":
             # A native macOS build stamps the dylib's minimum OS version with the *host*
@@ -122,10 +123,17 @@ class ZigSharedLibraryHook(BuildHookInterface):
 
         for runner in runners:
             try:
-                subprocess.run([*runner, *args], cwd=repo, check=True)
-                return
-            except FileNotFoundError:
+                version = subprocess.run(
+                    [*runner, "version"], check=True, capture_output=True, text=True
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError):
                 continue
+            if not re.fullmatch(r"0\.17\.\d+", version):
+                continue
+            print(f"zigfitsio: using {' '.join(runner)} {version}", flush=True)
+            subprocess.run([*runner, *args], cwd=repo, check=True)
+            return
         raise RuntimeError(
-            "no Zig toolchain found: add `ziglang` to the build environment or install `zig`"
+            "no compatible Zig toolchain found: install stable Zig 0.17.x on PATH "
+            "or in the ziglang package"
         )

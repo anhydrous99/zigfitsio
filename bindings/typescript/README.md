@@ -207,7 +207,7 @@ The full list, including every TS-native-surface boundary, lives in
 ## Development
 
 ```sh
-zig build wasm          # build zigfitsio.wasm into zig-out/bin/ (ReleaseSmall)
+zig build wasm          # build zigfitsio.wasm into zig-out/bin/ (small)
 cd bindings/typescript
 npm ci
 bun test tests          # Bun lane

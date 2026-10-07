@@ -78,13 +78,10 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   **4.6.4** (the version the committed bytes were authored with); it runs *informationally* so a
   distro CFITSIO version skew cannot red the build — the *semantic* interop checks (funpack
   decodes to the exact pixels; Astropy opens every file) are the authoritative gate.
-- **`zig build fuzz --fuzz` (engine mode) is broken in the Zig 0.16.0 toolchain itself** —
-  `compiler/test_runner.zig` fails to compile under `-ffuzz` (a `StackTrace` type mismatch,
-  reproduced on an unmodified tree). The *seeded* `zig build fuzz` mode — which CI's
-  `fuzz-smoke` job runs, and which executes every harness (headers, tables, all tile codecs,
-  the compressed-HDU byte-mutation target) over its deterministic corpus — is unaffected.
-  Coverage-guided exploration resumes when the upstream toolchain bug is fixed; nothing in
-  this repo blocks it.
+- **Fuzz exploration is timeboxed.** The Zig 0.16.0 `StackTrace` compiler failure no longer
+  reproduces with Zig 0.17.0. CI probes `zig build fuzz --fuzz` for 30 seconds informationally;
+  the required seeded `zig build fuzz` gate still executes every harness over deterministic
+  corpora. This probe is not evidence of a sustained fuzzing campaign.
 - **Explicit HCOMPRESS tile shapes are more permissive than CFITSIO's author.** CFITSIO's
   `imcomp_init_table` rejects HCOMPRESS tiles/images with any dimension under 4 pixels;
   zigfitsio deliberately accepts them (the repo's own fixtures use 4×3 tiles, and every tested
@@ -184,9 +181,9 @@ apply to both language bindings unless noted; TypeScript-specific ones are liste
   all widths incl. `uint64`); reading the same convention (`BZERO`/`TZEROn` → `u2/u4/u8`) is handled.
 - **Iterator and the raw `Device` vtable** are intentionally not exposed 1:1; the Python layer
   provides NumPy-native equivalents (column/section reads) and the file/memory/gzip open paths.
-- **Toolchain for wheels.** The `ziglang` PyPI package can lag the 0.16 toolchain this project
-  targets, so wheel builds use a real Zig 0.16 (CI `setup-zig` / the in-container installer); the
-  hatch build hook falls back to a system `zig` when `ziglang` is absent.
+- **Toolchain for wheels.** The `ziglang` PyPI package can lag the 0.17 toolchain this project
+  targets, so wheel builds use a real Zig 0.17 (CI `setup-zig` / the in-container installer); the
+  hatch build hook falls back to a system `zig` when `ziglang` is absent, incompatible, or fails its version probe; stable 0.17.x is required.
 - **`writeto()` of a *scanned* quantized-float compressed image re-quantizes with default
   knobs.** The FITS header records the method (`ZQUANTIZ`) but not the quantization *level*
   (CFITSIO stores `q` only in a free-text `HISTORY` card), and the Python re-emit path writes

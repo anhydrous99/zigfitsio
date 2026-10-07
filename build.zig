@@ -75,7 +75,7 @@ pub fn build(b: *std.Build) void {
     // (e.g. `zf_write_compressed2`/`zf_write_compressed3`): it reads the SSE args from `xmm6`
     // instead of `xmm0`/`xmm1`, so a real C-ABI caller (ctypes/C) passes garbage for those
     // floats. Zig↔Zig callers agree on the wrong convention, so the capi-test never sees it;
-    // only an external caller does. ReleaseFast already routed through LLVM (why the wheels are
+    // only an external caller does. fast already routed through LLVM (why the wheels are
     // correct), but a Debug `zig build capi` — the local dev + smoke-test flow — was broken.
     // LLVM emits the correct prologue (`xmm0`/`xmm1`), so pin it here at the ABI boundary.
     capi_lib.use_llvm = true;
@@ -112,17 +112,17 @@ pub fn build(b: *std.Build) void {
     const wiki_api_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     const wiki_mod = b.createModule(.{
         .root_source_file = b.path("tools/wiki/zig_api.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     wiki_mod.addImport("zigfitsio", wiki_api_mod);
     const wiki_exe = b.addExecutable(.{ .name = "zig-api-wiki", .root_module = wiki_mod });
     const run_wiki = b.addRunArtifact(wiki_exe);
-    if (b.args) |args| run_wiki.addArgs(args);
+    run_wiki.addPassthruArgs();
     const wiki_step = b.step("wiki-zig", "Generate the GitHub Wiki Zig API reference");
     wiki_step.dependOn(&run_wiki.step);
 
@@ -194,7 +194,7 @@ pub fn build(b: *std.Build) void {
     emit_mod.addImport("zigfitsio", mod);
     const emit = b.addExecutable(.{ .name = "emit-fixtures", .root_module = emit_mod });
     const run_emit = b.addRunArtifact(emit);
-    if (b.args) |args| run_emit.addArgs(args);
+    run_emit.addPassthruArgs();
     const emit_step = b.step("emit-fixtures", "Emit the zigfitsio-authored outbound interop corpus");
     emit_step.dependOn(&run_emit.step);
 
@@ -207,7 +207,7 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("zigfitsio", mod);
     const bench = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
     const run_bench = b.addRunArtifact(bench);
-    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run throughput benchmarks");
     bench_step.dependOn(&run_bench.step);
 
@@ -220,7 +220,7 @@ pub fn build(b: *std.Build) void {
     fv_mod.addImport("zigfitsio", mod);
     const fitsverify = b.addExecutable(.{ .name = "fitsverify", .root_module = fv_mod });
     const run_fv = b.addRunArtifact(fitsverify);
-    if (b.args) |args| run_fv.addArgs(args);
+    run_fv.addPassthruArgs();
     const fv_step = b.step("fitsverify", "Run the fitsverify CLI demo");
     fv_step.dependOn(&run_fv.step);
 
@@ -247,7 +247,7 @@ pub fn build(b: *std.Build) void {
     const wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/wasm_check.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const wasm_lib = b.addLibrary(.{
         .linkage = .static,
@@ -267,12 +267,12 @@ pub fn build(b: *std.Build) void {
     const wasm_capi_libmod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const wasm_capi_mod = b.createModule(.{
         .root_source_file = b.path("bindings/capi/capi.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     wasm_capi_mod.addImport("zigfitsio", wasm_capi_libmod);
     const wasm_reactor = b.addExecutable(.{

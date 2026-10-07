@@ -19,7 +19,7 @@ I/O library. The native code is a Zig-built shared library loaded via `ctypes`, 
 pip install zigfitsio
 ```
 
-Prebuilt wheels need no compiler. To build from source, install Zig 0.16.0 and put `zig` on
+Prebuilt wheels need no compiler. To build from source, install Zig 0.17.0 and put `zig` on
 `PATH` before running pip. The build hook does not install the toolchain automatically.
 
 ## Quickstart

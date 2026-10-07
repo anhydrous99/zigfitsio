@@ -1202,8 +1202,8 @@ fn expectLosslessRoundTrip(alloc: Allocator, data: []const i32, nx: usize, ny: u
 test "htrans/hinv are exact inverses across shapes (incl. odd dims and edges)" {
     const alloc = testing.allocator;
     const shapes = [_][2]usize{
-        .{ 1, 1 }, .{ 2, 2 }, .{ 2, 1 }, .{ 1, 7 }, .{ 3, 3 },
-        .{ 5, 1 }, .{ 2, 3 }, .{ 8, 8 }, .{ 16, 16 }, .{ 17, 13 },
+        .{ 1, 1 },  .{ 2, 2 }, .{ 2, 1 }, .{ 1, 7 },   .{ 3, 3 },
+        .{ 5, 1 },  .{ 2, 3 }, .{ 8, 8 }, .{ 16, 16 }, .{ 17, 13 },
         .{ 31, 5 }, .{ 9, 9 },
     };
     inline for (shapes) |sh| {

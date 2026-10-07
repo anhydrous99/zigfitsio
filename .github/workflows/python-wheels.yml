@@ -23,6 +23,7 @@ on:
       - "build.zig.zon"
       - "pyproject.toml"
       - "hatch_build.py"
+      - "test/test_hatch_build.py"
       - "tools/wiki/**"
       - ".github/workflows/python-wheels.yml"
       - ".github/workflows/publish-wiki.yml"
@@ -43,7 +44,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   # Release gate: the version literal lives in four places (build.zig.zon, src/version.zig
@@ -170,7 +171,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       # PRs build a single CPython per OS (cp312, matching the smoke job) — the bindings are
       # pure ctypes so the per-interpreter wheels differ only in tag, and this lane is the only
-      # ReleaseFast coverage in CI, so at least one wheel build+test per OS must stay. Main
+      # fast coverage in CI, so at least one wheel build+test per OS must stay. Main
       # pushes, tags, and dispatch runs skip this step, leaving CIBW_BUILD unset so the full
       # [tool.cibuildwheel].build matrix from pyproject.toml applies (env vars override the
       # config file only when defined). Do NOT refactor to an always-set env var with an empty
@@ -238,7 +239,8 @@ jobs:
           python-version: "3.12"
       - run: zig build capi
       - run: zig build capi-test --summary all
-      - run: pip install numpy astropy pytest
+      - run: pip install numpy astropy pytest hatchling
+      - run: python -m unittest test/test_hatch_build.py
       - run: pytest bindings/python/tests -q
         env:
           PYTHONPATH: bindings/python/src

@@ -632,7 +632,7 @@ test "TimeCoords parses the global time keyword set" {
     const blk = @import("../io/block.zig");
     const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
     const a = testing.allocator;
-    var buf: [blk.BLOCK]u8 = [_]u8{' '} ** blk.BLOCK;
+    var buf: [blk.BLOCK]u8 = @splat(' ');
     const cards = [_][]const u8{
         "TIMESYS = 'TT'",
         "TREFPOS = 'GEOCENTER'",

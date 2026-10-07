@@ -87,7 +87,7 @@ pub fn build(name: []const u8, v: value.KeywordValue, comment: ?[]const u8) Head
     try value.requireFinite(v);
     const tokens = try normalizedName(name);
     const cmt = nonEmptyComment(comment);
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     var w = std.Io.Writer.fixed(&raw);
     w.writeAll("HIERARCH ") catch return error.CardOverflow;
     w.writeAll(tokens) catch return error.CardOverflow;
@@ -232,7 +232,7 @@ fn buildNonStringTruncatingComment(tokens: []const u8, v: value.KeywordValue, co
     const prefix_len = hierarchPrefixLen(tokens);
     if (prefix_len > 80 or literal.len > 80 - prefix_len) return error.CardOverflow;
 
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     var w = std.Io.Writer.fixed(&raw);
     writeHierarchPrefix(&w, tokens) catch return error.CardOverflow;
     w.writeAll(literal) catch return error.CardOverflow;
@@ -248,7 +248,7 @@ fn buildEmptyStringTruncatingComment(tokens: []const u8, comment: ?[]const u8) H
     const prefix_len = hierarchPrefixLen(tokens);
     if (prefix_len > 78) return error.CardOverflow; // preserve both quotes or reject
 
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     var w = std.Io.Writer.fixed(&raw);
     writeHierarchPrefix(&w, tokens) catch return error.CardOverflow;
     w.writeAll("''") catch return error.CardOverflow;
@@ -261,7 +261,7 @@ fn buildEmptyStringTruncatingComment(tokens: []const u8, comment: ?[]const u8) H
 }
 
 fn buildStringRunCard(tokens: []const u8, first: bool, escaped_chunk: []const u8, continues: bool, comment: ?[]const u8) HeaderError!Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     var w = std.Io.Writer.fixed(&raw);
     if (first) {
         writeHierarchPrefix(&w, tokens) catch return error.CardOverflow;
@@ -280,7 +280,7 @@ fn buildStringRunCard(tokens: []const u8, first: bool, escaped_chunk: []const u8
 }
 
 fn buildDedicatedComment(comment: []const u8) HeaderError!Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     var pos: usize = 0;
     appendTruncated(&raw, &pos, "CONTINUE  '' / ");
     appendTruncated(&raw, &pos, comment);
@@ -367,7 +367,7 @@ fn tokensEqualIgnoreCase(a: []const u8, b: []const u8) bool {
 const testing = std.testing;
 
 fn card80(s: []const u8) Card {
-    var b: [80]u8 = [_]u8{' '} ** 80;
+    var b: [80]u8 = @splat(' ');
     @memcpy(b[0..s.len], s);
     return Card.parse(&b) catch unreachable;
 }
@@ -433,7 +433,7 @@ test "split keeps a short value on one card and normalizes an explicit prefix" {
 }
 
 test "split writes a long HIERARCH string as a variable-capacity CONTINUE run" {
-    const original = ("the quick brown fox " ** 12)[0..239];
+    const original = (std.mem.asBytes(&@as([12]["the quick brown fox ".len]u8, @splat("the quick brown fox ".*))))[0..239];
     const cards = try split(testing.allocator, "ESO LONG STR", .{ .string = original }, "provenance");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 3);
@@ -451,7 +451,7 @@ test "split writes a long HIERARCH string as a variable-capacity CONTINUE run" {
 test "split never cuts a doubled-quote pair across HIERARCH or CONTINUE cards" {
     var offset: usize = 0;
     while (offset < 90) : (offset += 1) {
-        var original: [150]u8 = [_]u8{'x'} ** 150;
+        var original: [150]u8 = @splat('x');
         original[offset] = '\'';
         original[149 - offset] = '&';
         const cards = try split(testing.allocator, "ESO Q W", .{ .string = &original }, null);
@@ -465,7 +465,7 @@ test "split never cuts a doubled-quote pair across HIERARCH or CONTINUE cards" {
 }
 
 test "split puts a fitting comment on the final fragment" {
-    const original = "x" ** 100;
+    const original = &@as([100]u8, @splat('x'));
     const cards = try split(testing.allocator, "ESO LONG STR", .{ .string = original }, "note");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2);
@@ -477,7 +477,7 @@ test "split puts a fitting comment on the final fragment" {
 }
 
 test "split uses a dedicated empty CONTINUE card when the comment cannot ride the data" {
-    const original = "A" ** 180;
+    const original = &@as([180]u8, @splat('A'));
     const cards = try split(testing.allocator, "ESO LONG STR", .{ .string = original }, "trailing comment");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 4);
@@ -489,7 +489,7 @@ test "split uses a dedicated empty CONTINUE card when the comment cannot ride th
 }
 
 test "split preserves an empty string and truncates only its overflowing comment" {
-    const cards = try split(testing.allocator, "ESO EMPTY", .{ .string = "" }, "c" ** 100);
+    const cards = try split(testing.allocator, "ESO EMPTY", .{ .string = "" }, &@as([100]u8, @splat('c')));
     defer testing.allocator.free(cards);
     try testing.expectEqual(@as(usize, 1), cards.len);
     const parsed = (try parseValue(testing.allocator, &cards[0])).?;
@@ -500,8 +500,8 @@ test "split preserves an empty string and truncates only its overflowing comment
 }
 
 test "split never truncates a non-string value but may truncate its comment" {
-    const name = "ESO DET " ++ "LONG NAME " ** 4;
-    const cards = try split(testing.allocator, name, .{ .int = 123456 }, "c" ** 60);
+    const name = "ESO DET " ++ std.mem.asBytes(&@as([4]["LONG NAME ".len]u8, @splat("LONG NAME ".*)));
+    const cards = try split(testing.allocator, name, .{ .int = 123456 }, &@as([60]u8, @splat('c')));
     defer testing.allocator.free(cards);
     try testing.expectEqual(@as(usize, 1), cards.len);
     const parsed = (try parseValue(testing.allocator, &cards[0])).?;
@@ -510,12 +510,12 @@ test "split never truncates a non-string value but may truncate its comment" {
 
     try testing.expectError(
         error.CardOverflow,
-        split(testing.allocator, "ESO " ++ "X" ** 76, .{ .int = 1 }, null),
+        split(testing.allocator, "ESO " ++ &@as([76]u8, @splat('X')), .{ .int = 1 }, null),
     );
 }
 
 test "split uses uppercase real exponents and rejects non-finite values" {
-    const cards = try split(testing.allocator, "HIERARCH ESO DET EXPTIME", .{ .float = 1.5e-7 }, "c" ** 70);
+    const cards = try split(testing.allocator, "HIERARCH ESO DET EXPTIME", .{ .float = 1.5e-7 }, &@as([70]u8, @splat('c')));
     defer testing.allocator.free(cards);
     try testing.expectEqual(@as(usize, 1), cards.len); // non-string comments truncate; never CONTINUE
     try testing.expect(std.mem.indexOfScalar(u8, cards[0].bytes(), 'E') != null);

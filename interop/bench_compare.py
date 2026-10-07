@@ -29,7 +29,7 @@ def main():
     if args.runs < 3:
         parser.error("at least three independent runs are required for medians")
     commands = {
-        "zigfitsio": ["zig", "build", "bench", "-Doptimize=ReleaseFast"],
+        "zigfitsio": ["zig", "build", "bench", "-Doptimize=fast"],
         "CFITSIO": [str(ROOT / "interop/build/bench_memory")],
     }
     samples = {name: [] for name in commands}

@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   test:
@@ -47,6 +47,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test --summary all
+      - name: Safety and optimized suites
+        if: matrix.os == 'linux' && matrix.arch == 'x86_64'
+        run: |
+          zig build test -Doptimize=safe --summary all
+          zig build test -Doptimize=fast --summary all
       - run: zig build        # static library artifact
 
   windows-aarch64-cross:
@@ -112,7 +117,7 @@ jobs:
       - name: Idiomatic std.Io (no lowercase std.io)
         run: |
           if grep -rnE "std\.io\." src; then
-            echo "::error::use std.Io (uppercase) per Zig 0.16"; exit 1; fi
+            echo "::error::use std.Io (uppercase) per Zig 0.17"; exit 1; fi
           echo "guards passed"
 
   fuzz-smoke:
@@ -124,6 +129,17 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build fuzz   # runs the seeded harnesses once (use --fuzz for the fuzzer)
+      - name: Timeboxed upstream fuzz-engine probe (informational)
+        continue-on-error: true
+        run: |
+          set +e
+          timeout 30s zig build fuzz --fuzz
+          result=$?
+          if [ "$result" = 124 ]; then
+            echo "fuzz engine ran for 30 seconds"
+          else
+            exit "$result"
+          fi
 
   interop:
     name: external interop & golden parity

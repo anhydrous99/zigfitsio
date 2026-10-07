@@ -633,7 +633,7 @@ def generate(output: Path, tag: str, sha: str, repository: str) -> dict[str, Any
         },
         "abiFunctionCount": len(_header_zf_symbols()),
         "tools": {
-            "zig": "0.16.0",
+            "zig": subprocess.check_output(["zig", "version"], cwd=REPO_ROOT, text=True).strip(),
             "pythonRendererSchema": 1,
             "typedoc": str(typedoc),
         },

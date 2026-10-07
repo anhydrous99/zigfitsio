@@ -123,8 +123,9 @@ fn castSentinel(comptime Elem: type, value: anytype) ?Elem {
 pub fn Iterator(comptime Cols: type, comptime E: type) type {
     const ti = @typeInfo(Cols);
     if (ti != .@"struct") @compileError("Iterator: Cols must be a struct of typed column slices");
-    const fields = ti.@"struct".fields;
-    if (fields.len == 0) @compileError("Iterator: Cols must have at least one field");
+    const field_names = ti.@"struct".field_names;
+    const field_types = ti.@"struct".field_types;
+    if (field_names.len == 0) @compileError("Iterator: Cols must have at least one field");
 
     return struct {
         const Self = @This();
@@ -167,15 +168,15 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             const total_rows = table.rowCount();
 
             // Resolve each field's column once: index, role, and per-row slot count.
-            var col_idx: [fields.len]u16 = undefined;
-            var roles: [fields.len]Role = undefined;
-            var slots: [fields.len]u64 = undefined;
-            var sentinels: [fields.len]NullSentinel = undefined;
+            var col_idx: [field_names.len]u16 = undefined;
+            var roles: [field_names.len]Role = undefined;
+            var slots: [field_names.len]u64 = undefined;
+            var sentinels: [field_names.len]NullSentinel = undefined;
             var selected_wire_bytes: u64 = 0;
             var has_read = false;
             var has_write = false;
-            inline for (fields, 0..) |f, i| {
-                const b = self.findBinding(f.name) orelse return error.NoSuchColumn;
+            inline for (field_names, 0..) |field_name, i| {
+                const b = self.findBinding(field_name) orelse return error.NoSuchColumn;
                 const idx = try table.resolve(b.ref);
                 col_idx[i] = idx;
                 roles[i] = b.role;
@@ -192,7 +193,7 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             var writes_whole_row = has_write;
             for (0..table.columns.len) |column_index| {
                 var covered = false;
-                inline for (fields, 0..) |_, i| {
+                inline for (0..field_names.len) |i| {
                     if (@as(usize, col_idx[i]) == column_index and (roles[i] == .out or roles[i] == .inout)) covered = true;
                 }
                 if (!covered) writes_whole_row = false;
@@ -202,8 +203,8 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
 
             // Choose the chunk size in rows: caller's `group`, else a memory-budgeted default.
             var per_row_bytes: u64 = 0;
-            inline for (fields, 0..) |f, i| {
-                const Elem = std.meta.Elem(f.type);
+            inline for (field_types, 0..) |field_type, i| {
+                const Elem = std.meta.Elem(field_type);
                 per_row_bytes = try limits.add(per_row_bytes, try limits.mul(slots[i], @sizeOf(Elem)));
             }
             const auto_rows: u64 = if (per_row_bytes == 0)
@@ -217,8 +218,8 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             // Validate the total buffer footprint against the per-handle ceiling BEFORE
             // allocating anything (NFR-SAFE-1).
             var total_bytes: u64 = 0;
-            inline for (fields, 0..) |f, i| {
-                const Elem = std.meta.Elem(f.type);
+            inline for (field_types, 0..) |field_type, i| {
+                const Elem = std.meta.Elem(field_type);
                 const cnt = try limits.mul(rows_per_chunk, slots[i]);
                 total_bytes = try limits.add(total_bytes, try limits.mul(cnt, @sizeOf(Elem)));
             }
@@ -237,14 +238,14 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
             var owned: Cols = undefined;
             var nready: usize = 0;
             defer {
-                inline for (fields, 0..) |f, i| {
-                    if (i < nready) alloc.free(@field(owned, f.name));
+                inline for (field_names, 0..) |field_name, i| {
+                    if (i < nready) alloc.free(@field(owned, field_name));
                 }
             }
-            inline for (fields, 0..) |f, i| {
-                const Elem = std.meta.Elem(f.type);
+            inline for (field_names, field_types, 0..) |field_name, field_type, i| {
+                const Elem = std.meta.Elem(field_type);
                 const cnt: usize = @intCast(rows_per_chunk * slots[i]);
-                @field(owned, f.name) = try alloc.alloc(Elem, cnt);
+                @field(owned, field_name) = try alloc.alloc(Elem, cnt);
                 nready = i + 1;
             }
 
@@ -265,28 +266,28 @@ pub fn Iterator(comptime Cols: type, comptime E: type) type {
                     null;
                 if (has_read) if (raw) |row_bytes| try table.readRowWindow(first_row, n, row_bytes);
                 var view: Cols = undefined;
-                inline for (fields, 0..) |f, i| {
-                    const Elem = std.meta.Elem(f.type);
+                inline for (field_names, field_types, 0..) |field_name, field_type, i| {
+                    const Elem = std.meta.Elem(field_type);
                     const want: usize = @intCast(@as(u64, n) * slots[i]);
-                    const v = @field(owned, f.name)[0..want];
+                    const v = @field(owned, field_name)[0..want];
                     if (roles[i] == .in or roles[i] == .inout) {
                         if (raw) |row_bytes|
                             try table.decodeColumnWindow(Elem, col_idx[i], n, row_bytes, v, .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
                         else
                             try table.readColumn(Elem, .{ .index = col_idx[i] }, first_row, v, .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
                     }
-                    @field(view, f.name) = v;
+                    @field(view, field_name) = v;
                 }
 
                 try work(n, &view);
 
-                inline for (fields, 0..) |f, i| {
-                    const Elem = std.meta.Elem(f.type);
+                inline for (field_names, field_types, 0..) |field_name, field_type, i| {
+                    const Elem = std.meta.Elem(field_type);
                     if (roles[i] == .out or roles[i] == .inout) {
                         if (writes_whole_row and raw != null)
-                            try table.encodeColumnWindow(Elem, col_idx[i], n, raw.?, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
+                            try table.encodeColumnWindow(Elem, col_idx[i], n, raw.?, @field(view, field_name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) })
                         else
-                            try table.writeColumn(Elem, .{ .index = col_idx[i] }, first_row, @field(view, f.name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
+                            try table.writeColumn(Elem, .{ .index = col_idx[i] }, first_row, @field(view, field_name), .{ .null_sentinel = sentinelFor(Elem, sentinels[i]) });
                     }
                 }
                 if (writes_whole_row) if (raw) |row_bytes| try table.writeRowWindow(first_row, n, row_bytes);

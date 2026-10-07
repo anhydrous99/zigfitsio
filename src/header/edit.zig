@@ -201,7 +201,7 @@ fn normalizeEndInPlace(alloc: Allocator, header: *Header) Allocator.Error!void {
 }
 
 fn endCard() Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..3], "END");
     return Card.parse(&raw) catch unreachable;
 }
@@ -624,7 +624,7 @@ fn appendCommentary(alloc: Allocator, header: *Header, op: Commentary, limits: L
 
 fn buildCommentaryCard(keyword: []const u8, text: []const u8) errors.HeaderError!Card {
     if (keyword.len > 8 or text.len > 72) return error.CardOverflow;
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..keyword.len], keyword);
     @memcpy(raw[8 .. 8 + text.len], text);
     return Card.parse(&raw);
@@ -660,7 +660,7 @@ const testing = std.testing;
 
 fn raw80(text: []const u8) [80]u8 {
     std.debug.assert(text.len <= 80);
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..text.len], text);
     return raw;
 }
@@ -708,7 +708,7 @@ test "apply clones the source and runs mixed upserts sequentially" {
     });
     defer source.deinit(testing.allocator);
 
-    const long = "long value with a quote ' and ampersand &;" ** 4;
+    const long = std.mem.asBytes(&@as([4]["long value with a quote ' and ampersand &;".len]u8, @splat("long value with a quote ' and ampersand &;".*)));
     const edits = [_]Edit{
         .{ .upsert = .{ .name = "OBS", .value = .{ .int = 2 } } }, // preserve comment
         .{ .upsert = .{ .name = "LSTR", .value = .{ .string = long }, .comment = .{ .explicit = "standard" } } },
@@ -757,7 +757,7 @@ test "delete_first is strict and delete_all removes duplicate logical runs" {
 test "rename preserves a standard long-string run and its comment" {
     var source = try headerOf(testing.allocator, &.{});
     defer source.deinit(testing.allocator);
-    const cards = try continuation.split(testing.allocator, "OLD", "z" ** 150, "note");
+    const cards = try continuation.split(testing.allocator, "OLD", &@as([150]u8, @splat('z')), "note");
     defer testing.allocator.free(cards);
     try source.cards.insertSlice(testing.allocator, 0, cards);
 
@@ -766,7 +766,7 @@ test "rename preserves a standard long-string run and its comment" {
     try testing.expect(!staged.has("OLD"));
     const got = try staged.getLongString(testing.allocator, "NEW");
     defer testing.allocator.free(got);
-    try testing.expectEqualStrings("z" ** 150, got);
+    try testing.expectEqualStrings(&@as([150]u8, @splat('z')), got);
     var snap = try logical_header.Snapshot.build(testing.allocator, staged.cards.items, .{});
     defer snap.deinit(testing.allocator);
     try testing.expectEqualStrings("note", findSnapshotEntry(&snap, "NEW").?.comment.?);
@@ -775,7 +775,7 @@ test "rename preserves a standard long-string run and its comment" {
 test "rename rebuilds transitions to and from HIERARCH without orphaning continuations" {
     var source = try headerOf(testing.allocator, &.{});
     defer source.deinit(testing.allocator);
-    const original = "a quoted ' HIERARCH value &;" ** 6;
+    const original = std.mem.asBytes(&@as([6]["a quoted ' HIERARCH value &;".len]u8, @splat("a quoted ' HIERARCH value &;".*)));
     const cards = try hierarch.split(testing.allocator, "ESO OLD LONG KEY", .{ .string = original }, "provenance");
     defer testing.allocator.free(cards);
     try source.cards.insertSlice(testing.allocator, 0, cards);
@@ -885,7 +885,7 @@ test "limits-aware apply bounds clone growth serializers and failed index" {
         error.LimitExceeded,
         applyWithFailureAndLimits(testing.allocator, &source, .primary, &.{.{ .upsert = .{
             .name = "LONG",
-            .value = .{ .string = "x" ** 200 },
+            .value = .{ .string = &@as([200]u8, @splat('x')) },
         } }}, three_cards, &failed),
     );
     try testing.expectEqual(@as(usize, 0), failed);
@@ -904,7 +904,7 @@ test "limits-aware apply bounds clone growth serializers and failed index" {
 test "append_commentary wraps at 72 bytes and accepts COMMENT HISTORY and blank" {
     var source = try headerOf(testing.allocator, &.{});
     defer source.deinit(testing.allocator);
-    const text = "0123456789" ** 10;
+    const text = std.mem.asBytes(&@as([10]["0123456789".len]u8, @splat("0123456789".*)));
     var staged = try apply(testing.allocator, &source, .primary, &.{
         .{ .append_commentary = .{ .keyword = "comment", .text = text } },
         .{ .append_commentary = .{ .keyword = "HISTORY", .text = "" } },

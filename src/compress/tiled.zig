@@ -2321,7 +2321,7 @@ test "all-empty tiled image reads one metadata window and never queries device s
 
     var out: [8]i16 = undefined;
     try image.readAll(i16, &out);
-    try testing.expectEqualSlices(i16, &([_]i16{0} ** 8), &out);
+    try testing.expectEqualSlices(i16, &(@as([8]i16, @splat(0))), &out);
     try testing.expectEqual(@as(usize, 1), probe.preads);
     try testing.expectEqual(@as(usize, 0), probe.get_sizes);
 }

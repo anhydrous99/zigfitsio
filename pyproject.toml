@@ -1,14 +1,14 @@
 # The shared library is compiled by `hatch_build.py`. It prefers the `ziglang` build package
-# when it provides Zig >= 0.16, and otherwise a system `zig` 0.16 on PATH (what CI installs).
+# when it provides stable Zig 0.17.x, and otherwise a compatible `zig` on PATH (what CI installs).
 # `ziglang` is intentionally NOT a hard build requirement because its PyPI releases can lag the
-# 0.16 toolchain this project targets.
+# 0.17 toolchain this project targets.
 [build-system]
 requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
 name = "zigfitsio"
-version = "0.1.6"
+version = "0.2.0"
 description = "Python bindings for zigfitsio — a pure-Zig FITS 4.0 I/O library"
 readme = "bindings/python/README.md"
 requires-python = ">=3.10"
@@ -82,7 +82,7 @@ test-command = "pytest --installed-package {project}/bindings/python/tests -q"
 #     wheels for the built platforms, to actually exercise the ctypes binding under no-GIL.
 test-skip = "*-musllinux_aarch64 cp314t-*"
 
-# Linux wheels build inside a manylinux container, so fetch a pinned Zig 0.16 into it and put
+# Linux wheels build inside a manylinux container, so fetch a pinned Zig 0.17 into it and put
 # it on PATH for hatch_build.py's system-`zig` fallback. macOS/Windows build on the host where
 # the workflow installs Zig directly.
 [tool.cibuildwheel.linux]

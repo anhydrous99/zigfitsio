@@ -42,7 +42,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
   BUN_VERSION: "1.3.13"
 
 jobs:
@@ -109,7 +109,7 @@ jobs:
             --out "$RUNNER_TEMP/wiki" --tag "$tag" --sha "$GITHUB_SHA" \
             --repository "$GITHUB_REPOSITORY"
 
-  # `zig build wasm` is hard-coded ReleaseSmall and byte-identical on every host, so build the
+  # `zig build wasm` is hard-coded small and byte-identical on every host, so build the
   # module once and share it via artifact instead of installing Zig and compiling in all six
   # test cells — that matrix exercises the JS layer + host engines, not the wasm bytes.
   build-wasm:
