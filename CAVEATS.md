@@ -78,10 +78,12 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   **4.6.4** (the version the committed bytes were authored with); it runs *informationally* so a
   distro CFITSIO version skew cannot red the build — the *semantic* interop checks (funpack
   decodes to the exact pixels; Astropy opens every file) are the authoritative gate.
-- **Fuzz exploration is timeboxed.** The Zig 0.16.0 `StackTrace` compiler failure no longer
-  reproduces with Zig 0.17.0. CI probes `zig build fuzz --fuzz` for 30 seconds informationally;
-  the required seeded `zig build fuzz` gate still executes every harness over deterministic
-  corpora. This probe is not evidence of a sustained fuzzing campaign.
+- **Coverage-guided fuzzing remains limited on Linux.** Zig 0.17.0 fixes the former
+  `StackTrace` compile error, and all 12 seeded harness tests pass with instrumentation.
+  The Linux engine probe then aborts with `start index 1 is larger than end index 0` after
+  those tests complete. CI retains a timeboxed engine probe and a std-only diagnostic;
+  the required seeded `zig build fuzz` gate is unaffected. A successful seeded run is not
+  evidence of sustained coverage-guided exploration.
 - **Explicit HCOMPRESS tile shapes are more permissive than CFITSIO's author.** CFITSIO's
   `imcomp_init_table` rejects HCOMPRESS tiles/images with any dimension under 4 pixels;
   zigfitsio deliberately accepts them (the repo's own fixtures use 4×3 tiles, and every tested

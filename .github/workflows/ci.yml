@@ -129,7 +129,7 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build fuzz   # runs the seeded harnesses once (use --fuzz for the fuzzer)
-      - name: Timeboxed upstream fuzz-engine probe (informational)
+      - name: Timeboxed fuzz-engine probes (informational)
         continue-on-error: true
         run: |
           set +e
@@ -137,7 +137,33 @@ jobs:
           result=$?
           if [ "$result" = 124 ]; then
             echo "fuzz engine ran for 30 seconds"
-          else
+          elif [ "$result" != 0 ]; then
+            echo "Repository fuzz engine exited $result; checking a std-only reproducer"
+            probe="$RUNNER_TEMP/zig-fuzz-probe"
+            mkdir -p "$probe"
+            cat > "$probe/build.zig" <<'ZIG'
+          const std = @import("std");
+          pub fn build(b: *std.Build) void {
+              const tests = b.addTest(.{ .root_module = b.createModule(.{
+                  .root_source_file = b.path("probe.zig"),
+                  .target = b.graph.host,
+                  .optimize = .debug,
+              }) });
+              b.step("test", "Std-only fuzz probe").dependOn(&b.addRunArtifact(tests).step);
+          }
+          ZIG
+            cat > "$probe/probe.zig" <<'ZIG'
+          const std = @import("std");
+          fn fuzz(_: void, smith: *std.testing.Smith) anyerror!void {
+              var bytes: [80]u8 = undefined;
+              smith.bytesWithHash(&bytes, 1);
+          }
+          test "std-only fuzz" {
+              try std.testing.fuzz({}, fuzz, .{ .corpus = &.{"seed"} });
+          }
+          ZIG
+            (cd "$probe" && timeout 30s zig build test --fuzz)
+            echo "Std-only fuzz probe exited $?"
             exit "$result"
           fi
 

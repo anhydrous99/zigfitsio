@@ -240,7 +240,7 @@ jobs:
       - run: zig build capi
       - run: zig build capi-test --summary all
       - run: pip install numpy astropy pytest hatchling
-      - run: python -m unittest test/test_hatch_build.py
+      - run: python -m unittest discover -s test -p 'test_hatch_build.py'
       - run: pytest bindings/python/tests -q
         env:
           PYTHONPATH: bindings/python/src
