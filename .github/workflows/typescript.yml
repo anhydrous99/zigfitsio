@@ -298,7 +298,7 @@ jobs:
           node-version: "24"
           registry-url: https://registry.npmjs.org
       - name: Dry-run publish the exact tested archive
-        run: npm publish package/*.tgz --access public --dry-run
+        run: npm publish ./package/*.tgz --access public --dry-run
 
   publish-npm:
     name: publish to npm
@@ -324,7 +324,7 @@ jobs:
       - name: Publish the exact tested archive
         run: |
           set -euo pipefail
-          archive=(package/*.tgz)
+          archive=(./package/*.tgz)
           test "${#archive[@]}" -eq 1
           ver="$(tar -xOf "${archive[0]}" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
           if npm view "zigfitsio@${ver}" version >/dev/null 2>&1; then
