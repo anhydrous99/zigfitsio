@@ -220,6 +220,7 @@ test {
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
     _ = @import("table/common.zig");
+    _ = @import("table/batch.zig");
     _ = @import("table/binary.zig");
     _ = @import("table/ascii.zig");
     _ = @import("table/heap.zig");
