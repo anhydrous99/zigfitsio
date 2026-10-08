@@ -90,7 +90,7 @@ pub const HttpDevice = struct {
             .headers = identityHeaders(),
             .extra_headers = &.{.{ .name = "range", .value = range }},
         }) catch return error.ReadFailed;
-        defer req.deinit();
+        defer deinitRequest(&req);
         req.sendBodiless() catch return error.ReadFailed;
         var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
         if (resp.head.content_encoding != .identity) return error.ReadFailed;
@@ -142,7 +142,7 @@ pub const HttpDevice = struct {
                 .keep_alive = true,
                 .headers = identityHeaders(),
             }) catch return error.ReadFailed;
-            defer req.deinit();
+            defer deinitRequest(&req);
             req.sendBodiless() catch return error.ReadFailed;
             const resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
             if (resp.head.content_encoding != .identity) return error.ReadFailed;
@@ -162,7 +162,7 @@ pub const HttpDevice = struct {
                 .headers = identityHeaders(),
                 .extra_headers = &.{.{ .name = "range", .value = range }},
             }) catch return error.ReadFailed;
-            defer req.deinit();
+            defer deinitRequest(&req);
             req.sendBodiless() catch return error.ReadFailed;
             var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
             if (resp.head.content_encoding != .identity) return error.ReadFailed;
@@ -213,6 +213,17 @@ pub const HttpDevice = struct {
 
     // ── Helpers ────────────────────────────────────────────────────────────────────────
 
+    /// Request.deinit drains an unread GET body to reuse its connection. Header rejection
+    /// and metadata-only reads must not download or wait for that body. Mark it closing and
+    /// let the client pool destroy it normally. Consumed responses and bodyless HEADs retain
+    /// the standard cleanup/reuse behavior; partially read bodies already close in deinit.
+    fn deinitRequest(req: *std.http.Client.Request) void {
+        if (req.method.responseHasBody() and req.reader.state == .received_head) {
+            if (req.connection) |connection| connection.closing = true;
+        }
+        req.deinit();
+    }
+
     /// Issue a plain (un-ranged) GET and buffer the whole body into `self.cache`.
     fn fetchFull(self: *HttpDevice) IoError!void {
         const u = try self.uri();
@@ -220,7 +231,7 @@ pub const HttpDevice = struct {
             .keep_alive = true,
             .headers = identityHeaders(),
         }) catch return error.ReadFailed;
-        defer req.deinit();
+        defer deinitRequest(&req);
         req.sendBodiless() catch return error.ReadFailed;
         var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
         if (resp.head.status != .ok or resp.head.content_encoding != .identity)
@@ -460,6 +471,19 @@ const LoopbackScript = enum {
     truncated_chunked,
     truncated_fixed,
     range_limited,
+    oversized_read,
+    oversized_size,
+    oversized_full,
+    invalid_range,
+    invalid_length,
+    conflicting_size,
+    invalid_encoding,
+    invalid_status,
+    size_without_body,
+    empty_size_without_body,
+    eof_without_body,
+    streaming_over_limit,
+    cache_limit_boundary,
 };
 
 const LoopbackContext = struct {
@@ -469,6 +493,7 @@ const LoopbackContext = struct {
     head_count: usize = 0,
     get_count: usize = 0,
     err_name: ?[]const u8 = null,
+    request_done: std.Io.Event = .unset,
 };
 
 fn requestHeader(req: *const std.http.Server.Request, name: []const u8) ?[]const u8 {
@@ -497,6 +522,25 @@ fn serveLoopback(ctx: *LoopbackContext) void {
     serveLoopbackFallible(ctx) catch |err| {
         ctx.err_name = @errorName(err);
     };
+}
+
+/// Withhold the response body until the device operation returns. A draining cleanup would
+/// deadlock here; the watchdog closes the server stream and reports a failure instead. Use
+/// one absolute deadline because Event.waitTimeout can also report spurious wakeups.
+fn waitForHttpReturn(ctx: *LoopbackContext) !void {
+    const deadline: std.Io.Timeout = .{ .deadline = .fromNow(ctx.io, .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    }) };
+    while (!ctx.request_done.isSet()) {
+        ctx.request_done.waitTimeout(ctx.io, deadline) catch |err| switch (err) {
+            error.Timeout => {
+                if (deadline.deadline.durationFromNow(ctx.io).raw.nanoseconds <= 0)
+                    return error.ResponseBodyDrainTimedOut;
+            },
+            else => return err,
+        };
+    }
 }
 
 fn serveLoopbackFallible(ctx: *LoopbackContext) !void {
@@ -599,6 +643,95 @@ fn serveLoopbackFallible(ctx: *LoopbackContext) !void {
                 .extra_headers = &.{.{ .name = "content-range", .value = "bytes 2-3/5" }},
             });
         },
+        .oversized_read,
+        .oversized_size,
+        .invalid_range,
+        .invalid_length,
+        .conflicting_size,
+        .invalid_encoding,
+        .invalid_status,
+        .size_without_body,
+        .empty_size_without_body,
+        .eof_without_body,
+        => {
+            switch (ctx.script) {
+                .oversized_size, .size_without_body, .empty_size_without_body => {
+                    var head = try server.receiveHead();
+                    try checkLoopbackRequest(&head, .HEAD, null);
+                    ctx.head_count += 1;
+                    try head.respond("", .{ .status = .method_not_allowed, .keep_alive = true });
+                },
+                else => {},
+            }
+            var req = try server.receiveHead();
+            const range: ?[]const u8 = if (ctx.script == .eof_without_body) "bytes=5-5" else "bytes=0-0";
+            try checkLoopbackRequest(&req, .GET, range);
+            ctx.get_count += 1;
+            const head = switch (ctx.script) {
+                .oversized_read, .oversized_size => "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n",
+                .invalid_range => "HTTP/1.1 206 Partial Content\r\ncontent-length: 1\r\ncontent-range: bytes 1-1/5\r\n",
+                .invalid_length => "HTTP/1.1 206 Partial Content\r\ncontent-length: 5\r\ncontent-range: bytes 0-0/5\r\n",
+                .conflicting_size, .size_without_body => "HTTP/1.1 206 Partial Content\r\ncontent-length: 1\r\ncontent-range: bytes 0-0/5\r\n",
+                .invalid_encoding => "HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-encoding: gzip\r\n",
+                .invalid_status => "HTTP/1.1 403 Forbidden\r\ncontent-length: 5\r\n",
+                .empty_size_without_body => "HTTP/1.1 416 Range Not Satisfiable\r\ncontent-length: 5\r\ncontent-range: bytes */0\r\n",
+                .eof_without_body => "HTTP/1.1 416 Range Not Satisfiable\r\ncontent-length: 5\r\ncontent-range: bytes */5\r\n",
+                else => unreachable,
+            };
+            try req.server.out.writeAll(head);
+            try req.server.out.writeAll("connection: keep-alive\r\n\r\n");
+            try req.server.out.flush();
+            try waitForHttpReturn(ctx);
+        },
+        .oversized_full => {
+            var head = try server.receiveHead();
+            try checkLoopbackRequest(&head, .HEAD, null);
+            ctx.head_count += 1;
+            try head.respond("", .{ .status = .method_not_allowed, .keep_alive = true });
+            var probe = try server.receiveHead();
+            try checkLoopbackRequest(&probe, .GET, "bytes=0-0");
+            ctx.get_count += 1;
+            try probe.respond("", .{ .status = .not_found, .keep_alive = false });
+
+            // Exercise fetchFull through the public getSize fallback, on a fresh connection.
+            const full_stream = try ctx.listener.accept(ctx.io);
+            defer full_stream.close(ctx.io);
+            var full_read_buf: [4096]u8 = undefined;
+            var full_write_buf: [4096]u8 = undefined;
+            var full_reader = full_stream.reader(ctx.io, &full_read_buf);
+            var full_writer = full_stream.writer(ctx.io, &full_write_buf);
+            var full_server = std.http.Server.init(&full_reader.interface, &full_writer.interface);
+            var req = try full_server.receiveHead();
+            try checkLoopbackRequest(&req, .GET, null);
+            if (requestHeader(&req, "range") != null) return error.UnexpectedRange;
+            ctx.get_count += 1;
+            try req.server.out.writeAll(
+                "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: keep-alive\r\n\r\n",
+            );
+            try req.server.out.flush();
+            try waitForHttpReturn(ctx);
+        },
+        .streaming_over_limit => {
+            var req = try server.receiveHead();
+            try checkLoopbackRequest(&req, .GET, "bytes=0-0");
+            ctx.get_count += 1;
+            // Fill one complete cache window, then cross the limit in the next read. This
+            // exercises cleanup of an already-populated temporary cache, not just a head check.
+            try req.server.out.writeAll(
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n" ++
+                    "connection: keep-alive\r\n\r\n4000\r\n",
+            );
+            const body: [16 * 1024]u8 = @splat('a');
+            try req.server.out.writeAll(&body);
+            try req.server.out.writeAll("\r\n1\r\nb\r\n0\r\n\r\n");
+            try req.server.out.flush();
+        },
+        .cache_limit_boundary => {
+            var req = try server.receiveHead();
+            try checkLoopbackRequest(&req, .GET, "bytes=0-0");
+            ctx.get_count += 1;
+            try req.respond("abcde", .{ .keep_alive = true });
+        },
     }
 }
 
@@ -611,12 +744,15 @@ fn runLoopbackScenario(script: LoopbackScript) !void {
     var ctx: LoopbackContext = .{ .io = io, .listener = &listener, .script = script };
     var thread = try std.Thread.spawn(.{}, serveLoopback, .{&ctx});
     var joined = false;
-    defer if (!joined) {
-        listener.deinit(io);
-        thread.join();
-    } else {
-        listener.deinit(io);
-    };
+    defer {
+        ctx.request_done.set(io);
+        if (!joined) {
+            listener.deinit(io);
+            thread.join();
+        } else {
+            listener.deinit(io);
+        }
+    }
 
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/data.fits", .{
@@ -664,8 +800,59 @@ fn runLoopbackScenario(script: LoopbackScript) !void {
             try testing.expectEqualStrings("abcd", &buf);
             try testing.expectEqual(@as(u64, 5), try dev.getSize());
         },
+        .oversized_read,
+        .oversized_size,
+        .oversized_full,
+        .invalid_range,
+        .invalid_length,
+        .conflicting_size,
+        .invalid_encoding,
+        .invalid_status,
+        .streaming_over_limit,
+        => {
+            const http: *HttpDevice = @ptrCast(@alignCast(dev.ptr));
+            http.max_cache_bytes = if (script == .streaming_over_limit) 16 * 1024 else 1;
+            if (script == .conflicting_size) http.known_size = 4;
+            var buf: [1]u8 = undefined;
+            switch (script) {
+                .oversized_size, .oversized_full => try testing.expectError(error.DeviceFull, dev.getSize()),
+                .oversized_read, .streaming_over_limit => try testing.expectError(error.DeviceFull, dev.pread(&buf, 0)),
+                else => try testing.expectError(error.ReadFailed, dev.pread(&buf, 0)),
+            }
+            try testing.expect(http.cache == null);
+            const expected_size: ?u64 = if (script == .conflicting_size) 4 else null;
+            try testing.expectEqual(expected_size, http.known_size);
+            try testing.expect(http.client.connection_pool.used.first == null);
+            if (script != .streaming_over_limit)
+                try testing.expect(http.client.connection_pool.free.first == null);
+        },
+        .size_without_body, .empty_size_without_body, .eof_without_body => {
+            const http: *HttpDevice = @ptrCast(@alignCast(dev.ptr));
+            const size: u64 = if (script == .empty_size_without_body) 0 else 5;
+            if (script == .eof_without_body) {
+                var buf: [1]u8 = undefined;
+                try testing.expectEqual(@as(usize, 0), try dev.pread(&buf, 5));
+            }
+            try testing.expectEqual(size, try dev.getSize());
+            try testing.expectEqual(size, try dev.getSize());
+            try testing.expect(http.cache == null);
+            try testing.expect(http.client.connection_pool.used.first == null);
+            try testing.expect(http.client.connection_pool.free.first == null);
+        },
+        .cache_limit_boundary => {
+            const http: *HttpDevice = @ptrCast(@alignCast(dev.ptr));
+            http.max_cache_bytes = 5;
+            var buf: [1]u8 = undefined;
+            try testing.expectEqual(@as(usize, 1), try dev.pread(&buf, 0));
+            try testing.expectEqualStrings("a", &buf);
+            try testing.expectEqual(@as(u64, 5), try dev.getSize());
+            try testing.expectEqual(@as(usize, 1), try dev.pread(&buf, 4));
+            try testing.expectEqualStrings("e", &buf);
+            try testing.expectEqualStrings("abcde", http.cache.?.bytes());
+        },
     }
 
+    ctx.request_done.set(io);
     thread.join();
     joined = true;
     if (ctx.err_name) |name| {
@@ -693,6 +880,27 @@ fn runLoopbackScenario(script: LoopbackScript) !void {
             try testing.expectEqual(@as(usize, 0), ctx.head_count);
             try testing.expectEqual(@as(usize, 2), ctx.get_count);
         },
+        .oversized_size, .size_without_body, .empty_size_without_body => {
+            try testing.expectEqual(@as(usize, 1), ctx.head_count);
+            try testing.expectEqual(@as(usize, 1), ctx.get_count);
+        },
+        .oversized_full => {
+            try testing.expectEqual(@as(usize, 1), ctx.head_count);
+            try testing.expectEqual(@as(usize, 2), ctx.get_count);
+        },
+        .oversized_read,
+        .invalid_range,
+        .invalid_length,
+        .conflicting_size,
+        .invalid_encoding,
+        .invalid_status,
+        .eof_without_body,
+        .streaming_over_limit,
+        .cache_limit_boundary,
+        => {
+            try testing.expectEqual(@as(usize, 0), ctx.head_count);
+            try testing.expectEqual(@as(usize, 1), ctx.get_count);
+        },
     }
 }
 
@@ -703,16 +911,44 @@ test "HTTP size is discovered once per device lifetime" {
     try runLoopbackScenario(.zero_range_size);
 }
 
-test "range reads seed size and no-range fallback reuses its response" {
+test "HTTP range reads seed size and no-range fallback reuses its response" {
     try runLoopbackScenario(.read_seeds_size);
     try runLoopbackScenario(.no_range_fallback);
 }
 
-test "truncated partial responses fail without caching their advertised size" {
+test "HTTP truncated partial responses fail without caching their advertised size" {
     try runLoopbackScenario(.truncated_chunked);
     try runLoopbackScenario(.truncated_fixed);
 }
 
-test "server-limited partial responses remain valid short reads" {
+test "HTTP server-limited partial responses remain valid short reads and reuse connections" {
     try runLoopbackScenario(.range_limited);
+}
+
+test "HTTP oversized responses reject without draining withheld bodies" {
+    try runLoopbackScenario(.oversized_read);
+    try runLoopbackScenario(.oversized_size);
+    try runLoopbackScenario(.oversized_full);
+}
+
+test "HTTP invalid headers reject without draining withheld bodies" {
+    try runLoopbackScenario(.invalid_range);
+    try runLoopbackScenario(.invalid_length);
+    try runLoopbackScenario(.conflicting_size);
+    try runLoopbackScenario(.invalid_encoding);
+    try runLoopbackScenario(.invalid_status);
+}
+
+test "HTTP metadata-only GETs return without draining withheld bodies" {
+    try runLoopbackScenario(.size_without_body);
+    try runLoopbackScenario(.empty_size_without_body);
+    try runLoopbackScenario(.eof_without_body);
+}
+
+test "HTTP streaming cache limit failures discard partial caches" {
+    try runLoopbackScenario(.streaming_over_limit);
+}
+
+test "HTTP whole-body cache accepts its exact byte limit" {
+    try runLoopbackScenario(.cache_limit_boundary);
 }
