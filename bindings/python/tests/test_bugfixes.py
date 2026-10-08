@@ -2166,7 +2166,9 @@ def test_astropy_authored_table_metadata_follows_columns(tmp_path):
     table.header["TDIM2"] = ("(2)", "B shape")
     table.header["TDISP2"] = ("I8", "B display")
     table.header["OBSERVER"] = ("Ada", "observer comment")
-    table.header["HIERARCH OBS CAMERA"] = ("camera-" * 18, "long value comment")
+    table.header["HIERARCH OBS CAMERA"] = ("camera", "camera comment")
+    # Astropy 6 can author CONTINUE strings with standard keywords.
+    table.header["ORIGIN"] = ("origin-" * 18, "long value comment")
     table.header.add_history("processing provenance")
     table.header.add_comment("science comment")
     fits.HDUList([fits.PrimaryHDU(), table]).writeto(source)
@@ -2181,8 +2183,10 @@ def test_astropy_authored_table_metadata_follows_columns(tmp_path):
         assert saved[1].header["TDIM1"] == "(2)"
         assert saved[1].header.comments["TDIM1"] == "B shape"
         assert saved[1].header["TDISP1"] == "I8"
-        assert saved[1].header["OBS CAMERA"] == "camera-" * 18
-        assert saved[1].header.comments["OBS CAMERA"] == "long value comment"
+        assert saved[1].header["OBS CAMERA"] == "camera"
+        assert saved[1].header.comments["OBS CAMERA"] == "camera comment"
+        assert saved[1].header["ORIGIN"] == "origin-" * 18
+        assert saved[1].header.comments["ORIGIN"] == "long value comment"
         assert saved[1].header["HISTORY"] == "processing provenance"
         assert saved[1].header["COMMENT"] == "science comment"
         assert saved[1].verify_checksum() == 1
