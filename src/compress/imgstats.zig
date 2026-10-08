@@ -224,7 +224,7 @@ test "quickSelect: lower-middle median convention across lengths" {
 
 test "noiseEstimates: constant image yields zero noise" {
     const alloc = testing.allocator;
-    const data = [_]i32{42} ** 256;
+    const data = @as([256]i32, @splat(42));
     const n = try noiseEstimates(alloc, &data, 16, 16);
     try testing.expectEqual(@as(f64, 0), n.noise2);
     try testing.expectEqual(@as(f64, 0), n.noise3);

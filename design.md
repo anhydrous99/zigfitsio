@@ -8,7 +8,7 @@ no C imports or C source.
 - **Companion document:** [`requirements.md`](./requirements.md). Every requirement ID
   (`FR-*`, `NFR-*`, `GC-*`) referenced here is defined there.
 - **Conformance target:** *Definition of the FITS Standard*, Version 4.0 (2018-08-13).
-- **Toolchain:** Zig **0.16.0** (`GC-3`). Standard library only (`GC-2`).
+- **Toolchain:** Zig **0.17.0** (`GC-3`). Standard library only (`GC-2`).
 - **Status:** Design baseline, revised per the adversarial review in
   [`design-review.md`](./design-review.md) (4 Majors + all Minors/Nits resolved); the
   highest-risk Zig-API and checksum claims were then validated by execution against
@@ -1145,7 +1145,7 @@ helpers of `FR-UTL-1` (`FR-WCS-4`). All `SHOULD`-tier; unsupported projections �
   // name.zig — fixed-capacity match accumulator; no allocation on the common path.
   // The inline buffer length MUST be a top-level constant: a struct's *runtime* field
   // (`Limits.max_matches`) cannot serve as a type-name-qualified comptime array bound on
-  // Zig 0.16 (`error: struct 'Limits' has no member named 'max_matches'`). So the comptime
+  // Zig 0.17 (`error: struct 'Limits' has no member named 'max_matches'`). So the comptime
   // capacity lives here as MAX_MATCHES, and `Limits.max_matches` (§7.2) is the *runtime*
   // ceiling, constrained to `<= MAX_MATCHES`.
   pub const MAX_MATCHES: usize = 4096;
@@ -1337,7 +1337,7 @@ section for the mechanism; this table is the completeness check.)
 |----|--------|
 | GC-1 No C | §1, §3 (pure-Zig modules; `std.compress`/own shuffle, §17.2) |
 | GC-2 std-only | §3, §24 (`build.zig.zon` with no deps) |
-| GC-3 Zig 0.16.0 | §24 |
+| GC-3 Zig 0.17.0 | §24 |
 | GC-4 Idiomatic API | §4.1, §6, §9.2, §21 (error unions, comptime types, tagged unions) |
 | GC-5 Big-endian | §7.1 |
 | GC-6 No UB | §4.1, §6, §7.2 |
@@ -1436,7 +1436,7 @@ section for the mechanism; this table is the completeness check.)
 | **Fuzz** | `test/fuzz/` harnesses for the **header** and **table** parsers; crashes/leaks are release blockers. Run under `zig build fuzz`; seeds from the corpus. | `NFR-SAFE-2` |
 | **Leak** | the whole suite runs under `std.testing.allocator`; zero leaks required. | `NFR-MEM-2` |
 | **Checksum parity (golden)** | committed vector: a CFITSIO-written ASCII table with `DATASUM = 1837006711`; the suite recomputes and must match, **and** must differ under zero-fill — locking the `FR-SUM-1` space-fill rule (§16). | `NFR-TEST-1`, `NFR-INTEROP-1` |
-| **API regression (Zig 0.16)** | compile-fixtures asserting the corrected snippets build and the three original defects do **not** (field/method collision, method-on-error-union, removed `std.BoundedArray`). | `GC-3`, `GC-4` |
+| **API regression (Zig 0.17)** | compile-fixtures asserting the corrected snippets build and the three original defects do **not** (field/method collision, method-on-error-union, removed `std.BoundedArray`). | `GC-3`, `GC-4` |
 
 **Realized (this branch).** The cross-validation, conformance, both interop legs, and the
 checksum-golden layers above are now implemented against a committed **CFITSIO 4.6.4 + `fpack`**
@@ -1478,7 +1478,7 @@ fixtures above:
 
 ## 24. Build, Packaging & Portability
 
-### 24.1 `build.zig` (Zig 0.16 API)
+### 24.1 `build.zig` (Zig 0.17 API)
 
 ```zig
 pub fn build(b: *std.Build) void {
@@ -1508,8 +1508,8 @@ pub fn build(b: *std.Build) void {
 ```zig
 .{
     .name = .zigfitsio,
-    .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .version = "0.2.0",
+    .minimum_zig_version = "0.17.0",
     // .fingerprint is REQUIRED but MUST be the value `zig build` prints on first run — its
     // low 32 bits checksum `.name`, so a hand-picked literal is rejected (and 0x0 is reserved).
     .fingerprint = 0x0, // PLACEHOLDER: run `zig build` once and paste the value it reports here

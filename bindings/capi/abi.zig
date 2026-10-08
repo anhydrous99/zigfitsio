@@ -228,9 +228,9 @@ pub const header_apply_check_revision: u32 = 1 << 0;
 /// the single-slot, thread-local equivalent, populated by `fail` and read by `zf_errmsg` etc.
 pub const ErrState = struct {
     status: c_int = 0,
-    msg: [256]u8 = [_]u8{0} ** 256,
+    msg: [256]u8 = @splat(0),
     msg_len: usize = 0,
-    keyword: [9]u8 = [_]u8{0} ** 9,
+    keyword: [9]u8 = @splat(0),
     keyword_len: usize = 0,
     byte_offset: i64 = -1,
     hdu_index: i64 = -1,

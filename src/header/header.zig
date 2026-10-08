@@ -335,7 +335,7 @@ pub const Header = struct {
     /// before serialization.
     pub fn ensureEnd(self: *Header, alloc: Allocator) (HeaderError || Allocator.Error)!void {
         if (self.cards.items.len > 0 and self.cards.items[self.cards.items.len - 1].kind == .end) return;
-        var raw: [80]u8 = [_]u8{' '} ** 80;
+        var raw: [80]u8 = @splat(' ');
         @memcpy(raw[0..3], "END");
         try self.cards.append(alloc, try Card.parse(&raw));
     }
@@ -473,7 +473,7 @@ pub const Header = struct {
     pub fn reserveSpace(self: *Header, alloc: Allocator, n: usize) (HeaderError || Allocator.Error)!void {
         if (n == 0) return;
         const pos = self.endIndex() orelse self.cards.items.len;
-        const blank: [80]u8 = [_]u8{' '} ** 80;
+        const blank: [80]u8 = @splat(' ');
         const card = try Card.parse(&blank);
         const slots = try self.cards.addManyAt(alloc, pos, n);
         @memset(slots, card);
@@ -496,7 +496,7 @@ const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
 // Assemble a minimal in-memory header (cards then END, space-padded to a block) and return a
 // MemoryDevice holding it.
 fn buildHeaderDevice(alloc: Allocator, cards: []const []const u8) !MemoryDevice {
-    var buf: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var buf: [block.BLOCK]u8 = @splat(' ');
     for (cards, 0..) |c, i| {
         @memcpy(buf[i * 80 ..][0..c.len], c);
     }
@@ -535,7 +535,7 @@ test "parse scans to END and reads values with conversion" {
 }
 
 test "missing END within budget is an error" {
-    var buf: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var buf: [block.BLOCK]u8 = @splat(' ');
     @memcpy(buf[0..6], "SIMPLE");
     var mem = try MemoryDevice.initBytes(testing.allocator, &buf);
     defer mem.deinit();
@@ -668,7 +668,7 @@ test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)"
     const before = h.count();
     try h.update(testing.allocator, "BITPIX", .{ .int = 8 }, null);
     try testing.expectEqual(before, h.count()); // filled a blank, no net growth
-    try h.update(testing.allocator, "LONGSTR", .{ .string = "x" ** 150 }, null);
+    try h.update(testing.allocator, "LONGSTR", .{ .string = &@as([150]u8, @splat('x')) }, null);
     try testing.expectEqual(before, h.count()); // a multi-card value consumes multiple blanks
 }
 
@@ -742,7 +742,7 @@ test "getLongString reassembles a multi-card CONTINUE value parsed from real car
 }
 
 fn raw80(s: []const u8) [80]u8 {
-    var b: [80]u8 = [_]u8{' '} ** 80;
+    var b: [80]u8 = @splat(' ');
     @memcpy(b[0..s.len], s);
     return b;
 }
@@ -751,7 +751,7 @@ test "delete removes the full CONTINUE run of a long string (BUGHUNT 34)" {
     var h = Header.initEmpty();
     defer h.deinit(testing.allocator);
     try h.appendValue(testing.allocator, "BEFORE", .{ .int = 1 }, null);
-    try h.appendLongString(testing.allocator, "LONGSTR", "x" ** 150, "c");
+    try h.appendLongString(testing.allocator, "LONGSTR", &@as([150]u8, @splat('x')), "c");
     try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
     try h.ensureEnd(testing.allocator);
     try testing.expect(h.count() >= 6); // BEFORE + base + ≥2 CONTINUE + AFTER + END
@@ -805,7 +805,7 @@ test "Astropy split quote pair is assembled, commented, and deleted as one logic
 test "update of a long-string base to a short value removes its CONTINUE run (BUGHUNT 24)" {
     var h = Header.initEmpty();
     defer h.deinit(testing.allocator);
-    try h.appendLongString(testing.allocator, "LSTR", "z" ** 150, null);
+    try h.appendLongString(testing.allocator, "LSTR", &@as([150]u8, @splat('z')), null);
     try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
     try h.ensureEnd(testing.allocator);
 
@@ -838,7 +838,7 @@ test "fixed-card builders and leading blanks remain strict (BUGHUNT 62)" {
     defer h.deinit(testing.allocator);
     try testing.expectError(error.BadKeywordName, h.appendValue(testing.allocator, "AB CD", .{ .int = 1 }, null));
     try testing.expectError(error.BadKeywordName, h.appendValue(testing.allocator, " XKEY", .{ .int = 1 }, null));
-    try testing.expectError(error.BadKeywordName, h.appendLongString(testing.allocator, "AB CD", "z" ** 150, null));
+    try testing.expectError(error.BadKeywordName, h.appendLongString(testing.allocator, "AB CD", &@as([150]u8, @splat('z')), null));
 
     try h.appendValue(testing.allocator, "GOODKEY", .{ .int = 7 }, null);
     try testing.expectError(error.BadKeywordName, h.rename(testing.allocator, "GOODKEY", " XKEY"));
@@ -907,10 +907,10 @@ test "direct HIERARCH update and modify preserve the convention (BUGHUNT 33)" {
     try testing.expectEqualStrings("com", h.comment("ESO A").?);
 
     const before = h.at(0).raw;
-    try testing.expectError(error.CardOverflow, h.modify("ESO A", .{ .string = "x" ** 80 }, null));
+    try testing.expectError(error.CardOverflow, h.modify("ESO A", .{ .string = &@as([80]u8, @splat('x')) }, null));
     try testing.expectEqualSlices(u8, &before, h.at(0).bytes());
 
-    try h.update(testing.allocator, "ESO A", .{ .string = "quoted ' value " ** 8 }, null);
+    try h.update(testing.allocator, "ESO A", .{ .string = std.mem.asBytes(&@as([8]["quoted ' value ".len]u8, @splat("quoted ' value ".*))) }, null);
     try testing.expect(h.valueRunCount(0) > 1);
     try h.modify("ESO A", .{ .string = "short" }, null);
     try testing.expectEqual(@as(usize, 1), h.valueRunCount(0));
@@ -923,7 +923,7 @@ test "direct HIERARCH update and modify preserve the convention (BUGHUNT 33)" {
 test "direct rename rebuilds HIERARCH transitions and continued strings (BUGHUNT 33)" {
     var h = Header.initEmpty();
     defer h.deinit(testing.allocator);
-    const original = ("a quoted ' HIERARCH value " ** 7) ++ "END";
+    const original = (std.mem.asBytes(&@as([7]["a quoted ' HIERARCH value ".len]u8, @splat("a quoted ' HIERARCH value ".*)))) ++ "END";
     try h.update(testing.allocator, "ESO OLD LONG KEY", .{ .string = original }, "provenance");
     try h.ensureEnd(testing.allocator);
 

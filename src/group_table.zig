@@ -767,7 +767,7 @@ test "addMember/removeMember are rejected on a read-only handle" {
 
 test "group member names use full logical values and reject narrow cells before mutation" {
     const alloc = testing.allocator;
-    const name = "continued-member-name-" ** 5;
+    const name = std.mem.asBytes(&@as([5]["continued-member-name-".len]u8, @splat("continued-member-name-".*)));
     for ([_]usize{ 68, 48, 120 }) |width| {
         var b = try newHandle(alloc);
         defer b.deinit(alloc);

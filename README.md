@@ -3,7 +3,7 @@
 [![CI](https://github.com/anhydrous99/zigfitsio/actions/workflows/ci.yml/badge.svg)](https://github.com/anhydrous99/zigfitsio/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/zigfitsio)](https://pypi.org/project/zigfitsio/)
 [![npm](https://img.shields.io/npm/v/zigfitsio)](https://www.npmjs.com/package/zigfitsio)
-[![Zig 0.16](https://img.shields.io/badge/zig-0.16-f7a41d)](https://ziglang.org)
+[![Zig 0.17](https://img.shields.io/badge/zig-0.17-f7a41d)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 **FITS 4.0 I/O in pure Zig — zero C dependencies — with Python and TypeScript/WebAssembly bindings.**
@@ -37,7 +37,7 @@ and tune stretch, color, orientation, zoom, and pan. Processing stays entirely i
 
 ## Install
 
-### Zig (requires Zig 0.16)
+### Zig (requires Zig 0.17)
 
 ```sh
 zig fetch --save git+https://github.com/anhydrous99/zigfitsio

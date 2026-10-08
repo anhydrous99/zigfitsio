@@ -596,10 +596,10 @@ test "quantizeTile: not_quantized on tiny/constant/Inf tiles" {
     // 1-pixel tile.
     try testing.expect((try quantizeTile(f32, alloc, &.{1.5}, 1, 1, 4.0, .none, null, 1, 0, idata[0..1])) == .not_quantized);
     // Constant tile: zero noise → delta == 0 on the noise-based path.
-    const flat = [_]f32{3.25} ** 64;
+    const flat = @as([64]f32, @splat(3.25));
     try testing.expect((try quantizeTile(f32, alloc, &flat, 8, 8, 4.0, .none, null, 1, 0, &idata)) == .not_quantized);
     // ±Inf tile: the fail-safe guard.
-    var with_inf = [_]f32{1.0} ** 64;
+    var with_inf = @as([64]f32, @splat(1.0));
     with_inf[10] = std.math.inf(f32);
     try testing.expect((try quantizeTile(f32, alloc, &with_inf, 8, 8, -1.0, .none, null, 1, 0, &idata)) == .not_quantized);
 }
@@ -623,7 +623,7 @@ test "quantizeTile: noise-based default (qlevel 0) equals qlevel 4 (delta = sigm
 
 test "fnNoise5: constant image yields zero noise; f64 variant matches structure" {
     const alloc = testing.allocator;
-    const flat = [_]f32{42.5} ** 256;
+    const flat = @as([256]f32, @splat(42.5));
     const n = try fnNoise5(f32, alloc, &flat, 16, 16);
     try testing.expectEqual(@as(f64, 0), n.noise2);
     try testing.expectEqual(@as(f64, 0), n.noise3);
@@ -632,7 +632,7 @@ test "fnNoise5: constant image yields zero noise; f64 variant matches structure"
     try testing.expectEqual(@as(f32, 42.5), n.maxval);
     try testing.expectEqual(@as(usize, 256), n.ngood);
 
-    const flat64 = [_]f64{-1.25} ** 100;
+    const flat64 = @as([100]f64, @splat(-1.25));
     const n64 = try fnNoise5(f64, alloc, &flat64, 10, 10);
     try testing.expectEqual(@as(f64, 0), n64.noise3);
     try testing.expectEqual(@as(usize, 100), n64.ngood);

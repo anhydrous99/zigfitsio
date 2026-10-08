@@ -347,8 +347,8 @@ const Generator = struct {
     }
 
     fn emitReflectedRootErrorMembers(g: *Generator, decl: DeclRef, prefix: []const u8, depth: usize) !void {
-        inline for (std.meta.fields(reflected_api.Error)) |error_field| {
-            const path = try std.fmt.allocPrint(g.alloc, "{s}.{s}", .{ prefix, error_field.name });
+        inline for (@typeInfo(reflected_api.Error).error_set.error_names.?) |error_name| {
+            const path = try std.fmt.allocPrint(g.alloc, "{s}.{s}", .{ prefix, error_name });
             if (!g.emitted.contains(path)) {
                 try g.emitted.put(g.alloc, path, {});
                 const line = decl.file.tree.tokenLocation(0, decl.file.tree.firstToken(decl.node)).line + 1;
@@ -362,7 +362,7 @@ const Generator = struct {
 
                 try writeHeading(&g.page.writer, depth, path);
                 try g.page.writer.writeAll("_Included through a compiler-reflected composed error set._\n\n");
-                const member_sig = try std.fmt.allocPrint(g.alloc, "error.{s}", .{error_field.name});
+                const member_sig = try std.fmt.allocPrint(g.alloc, "error.{s}", .{error_name});
                 try writeCodeBlock(&g.page.writer, member_sig);
                 try g.writeSourceLinkAt(decl.file, line);
             }
@@ -480,8 +480,8 @@ const Generator = struct {
             g.alloc,
             .limited(max_source_bytes),
         );
-        const source = try g.alloc.dupeZ(u8, bytes);
-        const tree = try Ast.parse(g.alloc, source, .zig);
+        const source = try g.alloc.dupeSentinel(u8, bytes, 0);
+        const tree = try Ast.parse(g.alloc, source, .{ .mode = .zig });
         if (tree.errors.len != 0) {
             std.debug.print("wiki-zig: {s} has {d} parse error(s)\n", .{ path, tree.errors.len });
             return error.InvalidZigSource;
@@ -495,7 +495,7 @@ const Generator = struct {
     }
 
     fn validateRootCoverage(g: *Generator, root: *SourceFile) !void {
-        const compiler_decls = @typeInfo(reflected_api).@"struct".decls;
+        const compiler_decls = @typeInfo(reflected_api).@"struct".decl_names;
         if (g.root_discovered != compiler_decls.len or g.root_emitted != compiler_decls.len) {
             std.debug.print(
                 "wiki-zig: root coverage mismatch: AST={d}, compiler={d}, emitted={d}\n",
@@ -505,12 +505,12 @@ const Generator = struct {
         }
 
         inline for (compiler_decls) |compiler_decl| {
-            const ast_decl = findTopLevelDecl(root, compiler_decl.name) orelse {
-                std.debug.print("wiki-zig: compiler declaration '{s}' was not found in the AST\n", .{compiler_decl.name});
+            const ast_decl = findTopLevelDecl(root, compiler_decl) orelse {
+                std.debug.print("wiki-zig: compiler declaration '{s}' was not found in the AST\n", .{compiler_decl});
                 return error.RootCoverageMismatch;
             };
-            if (!isPublicDecl(root, ast_decl.node) or !g.emitted.contains(compiler_decl.name)) {
-                std.debug.print("wiki-zig: compiler declaration '{s}' was not emitted\n", .{compiler_decl.name});
+            if (!isPublicDecl(root, ast_decl.node) or !g.emitted.contains(compiler_decl)) {
+                std.debug.print("wiki-zig: compiler declaration '{s}' was not emitted\n", .{compiler_decl});
                 return error.RootCoverageMismatch;
             }
         }
@@ -523,46 +523,46 @@ const Generator = struct {
             error{Callback},
         );
         const iterator_info = @typeInfo(ReflectedIterator).@"struct";
-        g.generic_return_compiler = iterator_info.decls.len + iterator_info.fields.len;
-        inline for (iterator_info.decls) |decl| {
-            const path = try std.fmt.allocPrint(g.alloc, "Iterator.{s}", .{decl.name});
+        g.generic_return_compiler = iterator_info.decl_names.len + iterator_info.field_names.len;
+        inline for (iterator_info.decl_names) |decl| {
+            const path = try std.fmt.allocPrint(g.alloc, "Iterator.{s}", .{decl});
             if (!g.emitted.contains(path)) {
                 std.debug.print("wiki-zig: generic returned declaration '{s}' was not emitted\n", .{path});
                 return error.GenericReturnCoverageMismatch;
             }
             g.generic_return_emitted += 1;
         }
-        inline for (iterator_info.fields) |field| {
-            const path = try std.fmt.allocPrint(g.alloc, "Iterator.{s}", .{field.name});
+        inline for (iterator_info.field_names) |field| {
+            const path = try std.fmt.allocPrint(g.alloc, "Iterator.{s}", .{field});
             if (!g.emitted.contains(path)) {
                 std.debug.print("wiki-zig: generic returned field '{s}' was not emitted\n", .{path});
                 return error.GenericReturnCoverageMismatch;
             }
             g.generic_return_emitted += 1;
         }
-        inline for (std.meta.fields(ReflectedIterator.Role)) |field| {
+        inline for (@typeInfo(ReflectedIterator.Role).@"enum".field_names) |field| {
             g.generic_return_compiler += 1;
-            const path = try std.fmt.allocPrint(g.alloc, "Iterator.Role.{s}", .{field.name});
+            const path = try std.fmt.allocPrint(g.alloc, "Iterator.Role.{s}", .{field});
             if (!g.emitted.contains(path)) {
                 std.debug.print("wiki-zig: nested generic enum member '{s}' was not emitted\n", .{path});
                 return error.GenericReturnCoverageMismatch;
             }
             g.generic_return_emitted += 1;
         }
-        inline for (std.meta.fields(ReflectedIterator.Binding)) |field| {
+        inline for (@typeInfo(ReflectedIterator.Binding).@"struct".field_names) |field| {
             g.generic_return_compiler += 1;
-            const path = try std.fmt.allocPrint(g.alloc, "Iterator.Binding.{s}", .{field.name});
+            const path = try std.fmt.allocPrint(g.alloc, "Iterator.Binding.{s}", .{field});
             if (!g.emitted.contains(path)) {
                 std.debug.print("wiki-zig: nested generic struct field '{s}' was not emitted\n", .{path});
                 return error.GenericReturnCoverageMismatch;
             }
             g.generic_return_emitted += 1;
         }
-        inline for (std.meta.fields(ReflectedIterator.RunError)) |error_field| {
+        inline for (@typeInfo(ReflectedIterator.RunError).error_set.error_names.?) |error_name| {
             // Callback belongs to the representative caller error set, not to zigfitsio.
-            if (comptime std.mem.eql(u8, error_field.name, "Callback")) continue;
+            if (comptime std.mem.eql(u8, error_name, "Callback")) continue;
             g.generic_return_compiler += 1;
-            const path = try std.fmt.allocPrint(g.alloc, "Iterator.RunError.{s}", .{error_field.name});
+            const path = try std.fmt.allocPrint(g.alloc, "Iterator.RunError.{s}", .{error_name});
             if (!g.emitted.contains(path)) {
                 std.debug.print("wiki-zig: nested generic error member '{s}' was not emitted\n", .{path});
                 return error.GenericReturnCoverageMismatch;
@@ -595,7 +595,7 @@ const Generator = struct {
             .undocumented_symbols = g.symbols.items.len - g.documented,
             .coverage = .{
                 .ast_root_exports = g.root_discovered,
-                .compiler_root_exports = @typeInfo(reflected_api).@"struct".decls.len,
+                .compiler_root_exports = @typeInfo(reflected_api).@"struct".decl_names.len,
                 .emitted_root_exports = g.root_emitted,
                 .root_percent = 100,
                 .compiler_generic_return_members = g.generic_return_compiler,
@@ -832,13 +832,16 @@ test "normalizes imports relative to the declaring source" {
 
 test "extracts attached declaration documentation" {
     const alloc = std.testing.allocator;
-    const source = try alloc.dupeZ(u8,
+    const source = try alloc.dupeSentinel(
+        u8,
         \\/// First line.
         \\/// Second line.
         \\pub const Thing = struct {};
+    ,
+        0,
     );
     defer alloc.free(source);
-    var tree = try Ast.parse(alloc, source, .zig);
+    var tree = try Ast.parse(alloc, source, .{ .mode = .zig });
     defer tree.deinit(alloc);
     var file = SourceFile{ .path = "fixture.zig", .source = source, .tree = tree };
     const doc = try docForNode(alloc, &file, file.tree.rootDecls()[0]);

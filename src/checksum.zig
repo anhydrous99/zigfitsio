@@ -213,7 +213,7 @@ fn headerSum(header: *const Header) u32 {
     const used: u64 = @as(u64, header.count()) * block.CARD;
     const pad_len: usize = @intCast(block.roundUpBlocks(used) - used);
     if (pad_len > 0) {
-        var spaces: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+        var spaces: [block.BLOCK]u8 = @splat(' ');
         sum = sumBytes(sum, spaces[0..pad_len]);
     }
     return sum;
@@ -412,7 +412,7 @@ test "sumBytes: zero buffer, known group, carry fold, accumulation, tail" {
     // A single big-endian 4-byte group is itself.
     try testing.expectEqual(@as(u32, 0x12345678), sumBytes(0, &[_]u8{ 0x12, 0x34, 0x56, 0x78 }));
     // Two all-ones groups fold the end-around carry back to all-ones.
-    const ones = [_]u8{0xFF} ** 8;
+    const ones = @as([8]u8, @splat(0xFF));
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), sumBytes(0, &ones));
     // Continuing the accumulation equals summing the concatenation.
     const a = [_]u8{ 1, 2, 3, 4 };
@@ -472,9 +472,9 @@ test "encodeChecksum/decodeChecksum round-trip and produce a clean ASCII alphabe
 test "decodeChecksum does not panic on a blank / out-of-alphabet 16-byte field" {
     // Regression: a blank CHECKSUM field sums each byte-column to 4*0x20 = 0x80 < 0xC0, so the
     // `s - 0xC0` subtraction underflowed u32 and panicked. It must now return a value, not crash.
-    _ = decodeChecksum(&[_]u8{' '} ** 16);
-    _ = decodeChecksum(&[_]u8{0} ** 16);
-    _ = decodeChecksum(&[_]u8{0xFF} ** 16); // high end: must not overflow the <<24 reconstruction
+    _ = decodeChecksum(&@as([16]u8, @splat(' ')));
+    _ = decodeChecksum(&@as([16]u8, @splat(0)));
+    _ = decodeChecksum(&@as([16]u8, @splat(0xFF))); // high end: must not overflow the <<24 reconstruction
 }
 
 test "encodeChecksum matches the FITS Appendix J.3 reference vector" {
@@ -552,7 +552,7 @@ test "datasum over a created HDU's data unit matches a direct sum (create→writ
     try f.dev.writeAll(&data, hdu.data_off);
 
     // Expected: the padded 2880-byte unit — 100 data bytes then zero fill.
-    var padded: [block.BLOCK]u8 = [_]u8{0} ** block.BLOCK;
+    var padded: [block.BLOCK]u8 = @splat(0);
     @memcpy(padded[0..100], &data);
     try testing.expectEqual(sumBytes(0, &padded), try datasum(&f, hdu));
 }

@@ -124,7 +124,7 @@ fn isShuffleWidth(w: usize) bool {
 const testing = std.testing;
 
 test "GZIP_1 encode→decode round-trips" {
-    const original = "SIMPLE  =                    T / FITS tile payload " ** 30;
+    const original = std.mem.asBytes(&@as([30]["SIMPLE  =                    T / FITS tile payload ".len]u8, @splat("SIMPLE  =                    T / FITS tile payload ".*)));
     const enc = try gzipEncode(testing.allocator, original);
     defer testing.allocator.free(enc);
     try testing.expect(enc.len < original.len);
@@ -146,7 +146,7 @@ test "GZIP_2 shuffles numeric widths and round-trips" {
 }
 
 test "GZIP_2 with width 1 is plain gzip (no shuffle)" {
-    const data = "byte column data, no shuffle for A/B/L" ** 4;
+    const data = std.mem.asBytes(&@as([4]["byte column data, no shuffle for A/B/L".len]u8, @splat("byte column data, no shuffle for A/B/L".*)));
     const enc = try gzip2Encode(testing.allocator, data, 1);
     defer testing.allocator.free(enc);
     const dec = try gzip2Decode(testing.allocator, enc, 1, 1 << 20);
@@ -155,7 +155,7 @@ test "GZIP_2 with width 1 is plain gzip (no shuffle)" {
 }
 
 test "decode enforces the output ceiling" {
-    const original = "x" ** 5000;
+    const original = &@as([5000]u8, @splat('x'));
     const enc = try gzipEncode(testing.allocator, original);
     defer testing.allocator.free(enc);
     try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, enc, 100));

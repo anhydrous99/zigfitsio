@@ -160,7 +160,7 @@ pub fn endsWithSentinel(field: []const u8) bool {
 // trailing `&` (inside the quotes) is added when `continues`; a `/ comment` suffix when given.
 // `chunk` is pre-escaped text (quotes already doubled) written verbatim between the quotes.
 fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: bool, comment: ?[]const u8) HeaderError!Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     if (first.*) {
         const nm = @import("name.zig").Name.parseStrict(name) catch return error.BadKeywordName;
         @memcpy(raw[0..8], &nm.bytes);
@@ -186,7 +186,7 @@ fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: 
 const testing = std.testing;
 
 fn card80(s: []const u8) Card {
-    var b: [80]u8 = [_]u8{' '} ** 80;
+    var b: [80]u8 = @splat(' ');
     @memcpy(b[0..s.len], s);
     return Card.parse(&b) catch unreachable;
 }
@@ -281,7 +281,7 @@ test "split keeps a short string in one card" {
 test "split preserves the comment when the final data chunk would fill the card (no silent drop)" {
     // 135 chars: greedy 67-char chunking leaves a full 68-char final chunk, so the old code wrote
     // a full value field and then dropped the comment via `catch {}`. The comment must survive.
-    const long = "x" ** 135;
+    const long = &@as([135]u8, @splat('x'));
     const cards = try split(testing.allocator, "DESC", long, "units");
     defer testing.allocator.free(cards);
     const a = try assemble(testing.allocator, cards, 0, 1 << 20);
@@ -295,7 +295,7 @@ test "split preserves the comment when the final data chunk would fill the card 
 test "split with a comment that overflows a single card falls through to multi-card" {
     // A 68-char string fits one card alone but not with a comment; it must split, not be rejected
     // with CardOverflow (regression: the single-card threshold ignored the comment).
-    const s = "y" ** 68;
+    const s = &@as([68]u8, @splat('y'));
     const cards = try split(testing.allocator, "DESC", s, "note");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2);
@@ -311,7 +311,7 @@ test "split escapes embedded quotes and round-trips (BUGHUNT 22/23)" {
     // The old multi-card path wrote chunks verbatim with no '' escaping, emitting malformed
     // cards for any continued string containing a quote. Every card must also parse as a
     // well-formed string on its own, since `assemble` un-escapes per card.
-    const long = "it's a 'quoted' tale: " ++ "pad " ** 30 ++ "the 'end'";
+    const long = "it's a 'quoted' tale: " ++ std.mem.asBytes(&@as([30]["pad ".len]u8, @splat("pad ".*))) ++ "the 'end'";
     const cards = try split(testing.allocator, "STORY", long, "with 'quotes'");
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2);
@@ -347,7 +347,7 @@ test "single-card threshold counts the escaped width (was spurious CardOverflow)
     // 67 raw chars with two quotes render as 69 escaped + 2 delimiters = 71 > 70: the old
     // threshold (raw length) chose the single-card path and buildValue then failed with
     // CardOverflow; the string must split instead.
-    const s = "''" ++ "z" ** 65;
+    const s = "''" ++ &@as([65]u8, @splat('z'));
     const cards = try split(testing.allocator, "EDGE", s, null);
     defer testing.allocator.free(cards);
     try testing.expect(cards.len >= 2);
@@ -360,7 +360,7 @@ test "single-card threshold counts the escaped width (was spurious CardOverflow)
 test "short string with a huge comment splits instead of CardOverflow (BUGHUNT 38)" {
     // "ab" renders as 8 padded chars, so 2+8+3+60 = 73 > 70: the old threshold (raw length,
     // no padding) chose the single-card path and buildValue rejected it.
-    const comment = "c" ** 60;
+    const comment = &@as([60]u8, @splat('c'));
     const cards = try split(testing.allocator, "AB", "ab", comment);
     defer testing.allocator.free(cards);
     const a = try assemble(testing.allocator, cards, 0, 1 << 20);

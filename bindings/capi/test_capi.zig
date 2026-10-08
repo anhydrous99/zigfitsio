@@ -27,11 +27,11 @@ test "foreign scratch allocator rejects zero and overflowing lengths (BUGHUNT 50
 
 test "ABI constants stay in sync with bindings/c/zigfitsio.h" {
     // ZfType codes (#define ZF_* in the header).
-    try testing.expectEqual(@as(c_int, 1), @intFromEnum(abi.ZfType.uint8));
-    try testing.expectEqual(@as(c_int, 9), @intFromEnum(abi.ZfType.float32));
-    try testing.expectEqual(@as(c_int, 10), @intFromEnum(abi.ZfType.float64));
-    try testing.expectEqual(@as(c_int, 13), @intFromEnum(abi.ZfType.string));
-    try testing.expectEqual(@as(c_int, 15), @intFromEnum(abi.ZfType.complex128));
+    try testing.expectEqual(@as(c_int, 1), @backingInt(abi.ZfType.uint8));
+    try testing.expectEqual(@as(c_int, 9), @backingInt(abi.ZfType.float32));
+    try testing.expectEqual(@as(c_int, 10), @backingInt(abi.ZfType.float64));
+    try testing.expectEqual(@as(c_int, 13), @backingInt(abi.ZfType.string));
+    try testing.expectEqual(@as(c_int, 15), @backingInt(abi.ZfType.complex128));
     // HDU kind codes.
     try testing.expectEqual(@as(c_int, 0), abi.kindCode(.primary));
     try testing.expectEqual(@as(c_int, 3), abi.kindCode(.binary_table));
@@ -330,7 +330,7 @@ test "binary table create, write columns, read back" {
 
     // Versioned strided reads accept deliberately unaligned packed-record fields and leave every
     // padding/guard byte untouched.
-    var strided_num = [_]u8{0xa5} ** 24;
+    var strided_num = @as([24]u8, @splat(0xa5));
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_strided_v1(
         th,
         I32,
@@ -351,7 +351,7 @@ test "binary table create, write columns, read back" {
     try testing.expectEqual(@as(u8, 0xa5), strided_num[0]);
     try testing.expectEqual(@as(u8, 0xa5), strided_num[19]);
 
-    var strided_text = [_]u8{0xa5} ** 34;
+    var strided_text = @as([34]u8, @splat(0xa5));
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_str_strided_v1(
         th,
         2,
@@ -985,7 +985,7 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     // zf_read_key_longstr is allocate-and-return; verify the round-trip and release with
     // zf_free.
     const name = "LONGSTR";
-    const longval = "x" ** 100;
+    const longval = &@as([100]u8, @splat('x'));
     try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_str(hh, name, name.len, longval, longval.len, null, 0));
     try testing.expectEqual(@as(c_int, 0), capi.zf_key_exists(hh, name, name.len));
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, longval, longval.len, null, 0));
@@ -1008,7 +1008,7 @@ test "invalid keyword names are rejected with status 207 on the write path (BUGH
     const bad = " XKEY";
     try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_lng(hh, bad, bad.len, 5, null, 0));
     try testing.expectEqual(@as(c_int, 207), capi.zf_last_status());
-    const longval = "x" ** 100;
+    const longval = &@as([100]u8, @splat('x'));
     try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_longstr(hh, bad, bad.len, longval, longval.len, null, 0));
     const bad_hierarch = " ESO A";
     try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_lng(hh, bad_hierarch, bad_hierarch.len, 5, null, 0));
@@ -1087,7 +1087,7 @@ test "BLANK integer nulls substitute a caller-supplied NaN nulval, before scalin
 }
 
 fn putRecord(hh: *Handle, text: []const u8) !void {
-    var card: [80]u8 = [_]u8{' '} ** 80;
+    var card: [80]u8 = @splat(' ');
     @memcpy(card[0..text.len], text);
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_record(hh, &card));
 }
@@ -1112,7 +1112,7 @@ test "logical header snapshot is bulk, lossless, retryable, and generation check
     const hh = h.?;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
     const long_name = "LONGSTR";
-    const long_value = "alpha 'quoted' value " ** 8;
+    const long_value = std.mem.asBytes(&@as([8]["alpha 'quoted' value ".len]u8, @splat("alpha 'quoted' value ".*)));
     const long_comment = "final comment";
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, long_name, long_name.len, long_value, long_value.len, long_comment, long_comment.len));
     try putRecord(hh, "HIERARCH ESO DET GAIN = 2.5 / detector");
@@ -1179,13 +1179,13 @@ test "logical header snapshot is bulk, lossless, retryable, and generation check
         const keyword = arena[no .. no + nl];
         if (std.mem.eql(u8, keyword, long_name)) {
             found_long = true;
-            try testing.expectEqual(@intFromEnum(abi.HeaderValueType.string), entry.value_type);
+            try testing.expectEqual(@backingInt(abi.HeaderValueType.string), entry.value_type);
             try testing.expectEqualStrings(std.mem.trimEnd(u8, long_value, " "), arena[vo .. vo + vl]);
             try testing.expect(entry.flags & abi.header_entry_continued != 0);
         } else if (std.mem.eql(u8, keyword, "ESO DET GAIN")) {
             found_hierarch = true;
             try testing.expect(entry.flags & abi.header_entry_hierarch != 0);
-            try testing.expectEqual(@intFromEnum(abi.HeaderValueType.float64), entry.value_type);
+            try testing.expectEqual(@backingInt(abi.HeaderValueType.float64), entry.value_type);
             try testing.expectEqual(@as(f64, 2.5), entry.float_value);
         } else if (std.mem.eql(u8, keyword, "COMMENT")) {
             found_comment = true;
@@ -1239,14 +1239,14 @@ test "header apply stages mixed edits and commits once" {
     const note = try testArenaPut(&arena, "provenance");
     const standard = try testArenaPut(&arena, "LONGSTR");
     const hier_name = try testArenaPut(&arena, "ESO LONG KEY");
-    const long_value = try testArenaPut(&arena, "alpha 'quoted' payload " ** 8);
+    const long_value = try testArenaPut(&arena, std.mem.asBytes(&@as([8]["alpha 'quoted' payload ".len]u8, @splat("alpha 'quoted' payload ".*))));
     const comment_name = try testArenaPut(&arena, "COMMENT");
     const comment_text = try testArenaPut(&arena, "batch commentary");
 
     const ops = [_]abi.ZfHeaderOpV1{
         .{
-            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-            .value_type = @intFromEnum(abi.HeaderValueType.int64),
+            .opcode = @backingInt(abi.HeaderOpCode.upsert),
+            .value_type = @backingInt(abi.HeaderValueType.int64),
             .flags = abi.header_op_comment_present,
             .name_off = obs.off,
             .name_len = obs.len,
@@ -1255,16 +1255,16 @@ test "header apply stages mixed edits and commits once" {
             .int_value = 42,
         },
         .{
-            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-            .value_type = @intFromEnum(abi.HeaderValueType.string),
+            .opcode = @backingInt(abi.HeaderOpCode.upsert),
+            .value_type = @backingInt(abi.HeaderValueType.string),
             .name_off = standard.off,
             .name_len = standard.len,
             .value_off = long_value.off,
             .value_len = long_value.len,
         },
         .{
-            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-            .value_type = @intFromEnum(abi.HeaderValueType.string),
+            .opcode = @backingInt(abi.HeaderOpCode.upsert),
+            .value_type = @backingInt(abi.HeaderValueType.string),
             .name_off = hier_name.off,
             .name_len = hier_name.len,
             .value_off = long_value.off,
@@ -1274,7 +1274,7 @@ test "header apply stages mixed edits and commits once" {
             .comment_len = note.len,
         },
         .{
-            .opcode = @intFromEnum(abi.HeaderOpCode.append_commentary),
+            .opcode = @backingInt(abi.HeaderOpCode.append_commentary),
             .name_off = comment_name.off,
             .name_len = comment_name.len,
             .value_off = comment_text.off,
@@ -1308,15 +1308,15 @@ test "header apply stages mixed edits and commits once" {
     const bitpix = try testArenaPut(&arena, "BITPIX");
     const bad_ops = [_]abi.ZfHeaderOpV1{
         .{
-            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-            .value_type = @intFromEnum(abi.HeaderValueType.int64),
+            .opcode = @backingInt(abi.HeaderOpCode.upsert),
+            .value_type = @backingInt(abi.HeaderValueType.int64),
             .name_off = bitpix.off,
             .name_len = bitpix.len,
             .int_value = 16,
         },
         .{
-            .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-            .value_type = @intFromEnum(abi.HeaderValueType.int64),
+            .opcode = @backingInt(abi.HeaderOpCode.upsert),
+            .value_type = @backingInt(abi.HeaderValueType.int64),
             .name_off = good.off,
             .name_len = good.len,
             .int_value = 1,
@@ -1349,11 +1349,11 @@ test "header apply uses HDU-aware structural policy for image metadata" {
     const form_value = try testArenaPut(&arena, "1J");
     const after = try testArenaPut(&arena, "AFTER");
     const ops = [_]abi.ZfHeaderOpV1{
-        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = before.off, .name_len = before.len, .int_value = 1 },
-        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = tfields.off, .name_len = tfields.len, .int_value = 7 },
-        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.logical), .name_off = ztable.off, .name_len = ztable.len, .int_value = 1 },
-        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.string), .name_off = zform.off, .name_len = zform.len, .value_off = form_value.off, .value_len = form_value.len },
-        .{ .opcode = @intFromEnum(abi.HeaderOpCode.upsert), .value_type = @intFromEnum(abi.HeaderValueType.int64), .name_off = after.off, .name_len = after.len, .int_value = 2 },
+        .{ .opcode = @backingInt(abi.HeaderOpCode.upsert), .value_type = @backingInt(abi.HeaderValueType.int64), .name_off = before.off, .name_len = before.len, .int_value = 1 },
+        .{ .opcode = @backingInt(abi.HeaderOpCode.upsert), .value_type = @backingInt(abi.HeaderValueType.int64), .name_off = tfields.off, .name_len = tfields.len, .int_value = 7 },
+        .{ .opcode = @backingInt(abi.HeaderOpCode.upsert), .value_type = @backingInt(abi.HeaderValueType.logical), .name_off = ztable.off, .name_len = ztable.len, .int_value = 1 },
+        .{ .opcode = @backingInt(abi.HeaderOpCode.upsert), .value_type = @backingInt(abi.HeaderValueType.string), .name_off = zform.off, .name_len = zform.len, .value_off = form_value.off, .value_len = form_value.len },
+        .{ .opcode = @backingInt(abi.HeaderOpCode.upsert), .value_type = @backingInt(abi.HeaderValueType.int64), .name_off = after.off, .name_len = after.len, .int_value = 2 },
     };
     const opts: abi.ZfHeaderApplyOptsV1 = .{ .expected_revision = info.revision, .flags = abi.header_apply_check_revision };
     var result: abi.ZfHeaderApplyResultV1 = .{};
@@ -1388,8 +1388,8 @@ test "header apply rejects table layout metadata before it can stale or corrupt 
     try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 2, 0, &info));
     const arena = "TFIELDS";
     const op = [_]abi.ZfHeaderOpV1{.{
-        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-        .value_type = @intFromEnum(abi.HeaderValueType.int64),
+        .opcode = @backingInt(abi.HeaderOpCode.upsert),
+        .value_type = @backingInt(abi.HeaderValueType.int64),
         .name_len = arena.len,
         .int_value = 0,
     }};
@@ -1400,8 +1400,8 @@ test "header apply rejects table layout metadata before it can stale or corrupt 
 
     const compression_arena = "ZFORM1";
     const compression_op = [_]abi.ZfHeaderOpV1{.{
-        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-        .value_type = @intFromEnum(abi.HeaderValueType.int64),
+        .opcode = @backingInt(abi.HeaderOpCode.upsert),
+        .value_type = @backingInt(abi.HeaderValueType.int64),
         .name_len = compression_arena.len,
         .int_value = 1,
     }};
@@ -1423,8 +1423,8 @@ test "header apply rejects table layout metadata before it can stale or corrupt 
     try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 2, 0, &metadata_info));
     const metadata_arena = "TTYPE1RENAMED";
     const metadata_op = [_]abi.ZfHeaderOpV1{.{
-        .opcode = @intFromEnum(abi.HeaderOpCode.upsert),
-        .value_type = @intFromEnum(abi.HeaderValueType.string),
+        .opcode = @backingInt(abi.HeaderOpCode.upsert),
+        .value_type = @backingInt(abi.HeaderValueType.string),
         .flags = abi.header_op_comment_present,
         .name_len = 6,
         .value_off = 6,
@@ -1458,10 +1458,10 @@ test "header apply grows an earlier header once and preserves following HDU data
     var info: abi.ZfHeaderSnapshotInfoV1 = .{};
     try testing.expectEqual(@as(c_int, 0), capi.zf_header_snapshot_query_v1(hh, 1, 0, &info));
     const name = "COMMENT";
-    const text = "0123456789abcdef" ** 200; // > 40 physical commentary cards / multiple blocks
+    const text = std.mem.asBytes(&@as([200]["0123456789abcdef".len]u8, @splat("0123456789abcdef".*))); // > 40 physical commentary cards / multiple blocks
     const arena = name ++ text;
     const ops = [_]abi.ZfHeaderOpV1{.{
-        .opcode = @intFromEnum(abi.HeaderOpCode.append_commentary),
+        .opcode = @backingInt(abi.HeaderOpCode.append_commentary),
         .name_off = 0,
         .name_len = name.len,
         .value_off = name.len,
@@ -1488,7 +1488,7 @@ test "zf_write_key_longstr replace does not orphan the old CONTINUE run (BUGHUNT
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
 
     const name = "LONGSTR";
-    const longval = "x" ** 150; // base + 2 CONTINUE cards
+    const longval = &@as([150]u8, @splat('x')); // base + 2 CONTINUE cards
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, longval, longval.len, null, 0));
     try testing.expect(try countContinueCards(hh) >= 2);
     var n_before: c_long = 0;
@@ -1517,7 +1517,7 @@ test "failed long-string replacement preserves the live header and pending snaps
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
 
     const name = "LONGSTR";
-    const original = "original 'quoted' value " ** 6;
+    const original = std.mem.asBytes(&@as([6]["original 'quoted' value ".len]u8, @splat("original 'quoted' value ".*)));
     try testing.expectEqual(
         @as(c_int, 0),
         capi.zf_write_key_longstr(hh, name, name.len, original, original.len, null, 0),
@@ -1533,8 +1533,8 @@ test "failed long-string replacement preserves the live header and pending snaps
     const arena = try testing.allocator.alloc(u8, @intCast(queried.arena_bytes));
     defer testing.allocator.free(arena);
 
-    const replacement = "replacement" ** 12;
-    const oversized_comment = "c" ** 80;
+    const replacement = std.mem.asBytes(&@as([12]["replacement".len]u8, @splat("replacement".*)));
+    const oversized_comment = &@as([80]u8, @splat('c'));
     try testing.expectEqual(
         @as(c_int, 207),
         capi.zf_write_key_longstr(
@@ -1757,7 +1757,7 @@ test "rename_key and insert_record" {
     var idx_count: c_long = -1;
     try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &idx_count));
     const end_idx = idx_count - 1;
-    var card: [80]u8 = [_]u8{' '} ** 80;
+    var card: [80]u8 = @splat(' ');
     const text = "HISTORY inserted via zf_insert_record";
     @memcpy(card[0..text.len], text);
     try testing.expectEqual(@as(c_int, 0), capi.zf_insert_record(hh, end_idx, &card));
@@ -1793,7 +1793,7 @@ test "direct C ABI writes and renames preserve HIERARCH values (BUGHUNT 33)" {
     const old = "ESO OLD LONG KEY";
     const fixed = "LONGKEY";
     const renamed = "ESO NEW LONG KEY";
-    const original = ("quoted ' HIERARCH value " ** 7) ++ "END";
+    const original = (std.mem.asBytes(&@as([7]["quoted ' HIERARCH value ".len]u8, @splat("quoted ' HIERARCH value ".*)))) ++ "END";
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, old, old.len, original, original.len, "provenance", 10));
     try testing.expectEqual(@as(c_int, 0), capi.zf_rename_key(hh, old, old.len, fixed, fixed.len));
     try testing.expectEqual(@as(c_int, 0), capi.zf_rename_key(hh, fixed, fixed.len, renamed, renamed.len));
@@ -1950,7 +1950,7 @@ test "write_subset round-trips a rectangular section" {
     const hh = h.?;
     const axes = [_]c_long{ 4, 4 };
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 32, 2, &axes));
-    var zero: [16]i32 = [_]i32{0} ** 16;
+    var zero: [16]i32 = @splat(0);
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(hh, I32, 1, 16, null, null, &zero));
 
     const lo = [_]c_long{ 1, 1 };

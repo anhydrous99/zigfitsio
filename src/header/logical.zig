@@ -489,7 +489,7 @@ fn trimEndSpaces(s: []const u8) []const u8 {
 const testing = std.testing;
 
 fn card80(text: []const u8) Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..text.len], text);
     return Card.parse(&raw) catch unreachable;
 }

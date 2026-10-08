@@ -48,7 +48,7 @@ application needing to consume or produce FITS data without linking a C library.
 |----|-------------|----------|
 | GC-1 | The library **MUST** be implemented entirely in Zig. `@cImport`, C headers, C source files, and linking against CFITSIO or any C library **MUST NOT** be used. | P0 |
 | GC-2 | The library **MUST** depend only on the Zig standard library. No third-party package dependencies are permitted in the core. | P0 |
-| GC-3 | The baseline toolchain is **Zig 0.16.0**. The build **MUST** succeed with this version. | P0 |
+| GC-3 | The baseline toolchain is **Zig 0.17.0**. The build **MUST** succeed with this version. | P0 |
 | GC-4 | The public API **MUST** be idiomatic Zig: fallible operations return error unions over typed error sets; all allocation goes through a caller-supplied `std.mem.Allocator`; bulk data is exchanged via slices; FITS datatype codes are modeled as Zig `enum`/`union(enum)` and comptime type parameters, not integer "datatype" codes plus `anyopaque`. | P0 |
 | GC-5 | The library **MUST** treat the FITS byte stream as big-endian and produce/consume correct results on hosts of any endianness. | P0 |
 | GC-6 | The library **MUST NOT** invoke undefined behavior on malformed, truncated, or hostile input; parsing **MUST** fail with a typed error instead of crashing. | P0 |

@@ -208,12 +208,10 @@ success, while different bytes fail and are never overwritten.
 
 ## Failure recovery
 
-- **`version-check` fails on the tag** — delete the tag, fix, re-tag:
-
-  ```sh
-  git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z
-  # fix versions/CHANGELOG, commit, push, wait for green, re-tag
-  ```
+- **Release tags are immutable.** The active `immutable-release-tags` ruleset forbids updating
+  or deleting `v*` tags. If `version-check`, API generation, or another source gate fails after
+  tagging, fix `main` and release a fresh version (normally the next patch, such as `0.2.1`).
+  Retry transient infrastructure or publishing failures on the original tag and SHA.
 
 - **A build/publish job fails after wheels were built** — within GitHub's 30-day workflow-rerun
   window, fix the external cause, then use **"Re-run failed jobs"** on the same run (artifacts are
@@ -231,8 +229,7 @@ success, while different bytes fail and are never overwritten.
   successful publication is the durable copy for audited manual restoration; otherwise cut a new
   release. Automated restoration from another run would require a separately reviewed recovery
   path that does not yet exist.
-- Don't delete + re-push the same tag while its run is in flight (tag runs are deliberately
-  never auto-cancelled); wait for the run to stop first.
+- Never delete, move, or re-push a release tag; tag runs are deliberately never auto-cancelled.
 
 ## Renames break trusted publishing
 

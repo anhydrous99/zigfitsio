@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Install a pinned Zig 0.16 into /opt/zig inside a manylinux build container (used by
+# Install a pinned Zig 0.17 into /opt/zig inside a manylinux build container (used by
 # cibuildwheel's `before-all` on Linux). macOS/Windows builds use the host Zig from setup-zig.
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
+ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 DEST="/opt/zig"
 
 arch="$(uname -m)"
@@ -17,8 +17,8 @@ esac
 # verified against these before anything is extracted or executed — bumping ZIG_VERSION
 # requires adding its checksums here, and an unknown version fails closed.
 case "${ZIG_VERSION}-${za}" in
-  0.16.0-x86_64) expected_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00" ;;
-  0.16.0-aarch64) expected_sha256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17" ;;
+  0.17.0-x86_64) expected_sha256="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026" ;;
+  0.17.0-aarch64) expected_sha256="9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8" ;;
   *)
     echo "no pinned SHA-256 for Zig ${ZIG_VERSION} on ${za}; add it from ziglang.org/download/index.json" >&2
     exit 1

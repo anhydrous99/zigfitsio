@@ -14,7 +14,7 @@ const native_endian = builtin.cpu.arch.endian();
 fn IntOf(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .int => T,
-        .float => std.meta.Int(.unsigned, @bitSizeOf(T)),
+        .float => @Int(.unsigned, @bitSizeOf(T)),
         else => @compileError("endian: unsupported type " ++ @typeName(T)),
     };
 }
@@ -95,14 +95,12 @@ test "swapSlice is its own inverse and vectorizes past 16 lanes" {
 
 test "forced swap matches manual byte reversal for floats" {
     var fs = [_]f64{ 1.0, -2.5, 1.0e300 };
-    var manual: [3]f64 = fs;
-    for (&manual) |*m| {
-        var b: [8]u8 = @bitCast(m.*);
-        std.mem.reverse(u8, &b);
-        m.* = @bitCast(b);
-    }
+    const expected = if (native_endian == .little)
+        [_]u8{ 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x37, 0xe4, 0x3c, 0x88, 0x00, 0x75, 0x9c }
+    else
+        [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xc0, 0x9c, 0x75, 0x00, 0x88, 0x3c, 0xe4, 0x37, 0x7e };
     swapSlice(f64, &fs);
-    try testing.expectEqualSlices(f64, &manual, &fs);
+    try testing.expectEqualSlices(u8, &expected, std.mem.sliceAsBytes(&fs));
 }
 
 test "1-byte and single-byte-int elements are untouched" {

@@ -605,7 +605,7 @@ pub export fn zf_read_img(h_opt: ?*Handle, dtype: c_int, firstelem: c_longlong, 
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     const count = validateImageRange(&view, @intCast(firstelem - 1), @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
-    imgRead(&view, @enumFromInt(dtype), @intCast(firstelem - 1), array, count, nulval, sc) catch |e| return abi.fail(&h.diag, e);
+    imgRead(&view, @fromBackingInt(@intCast(dtype)), @intCast(firstelem - 1), array, count, nulval, sc) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
@@ -619,7 +619,7 @@ pub export fn zf_write_img(h_opt: ?*Handle, dtype: c_int, firstelem: c_longlong,
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     const count = validateImageRange(&view, @intCast(firstelem - 1), @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
-    imgWrite(&view, @enumFromInt(dtype), @intCast(firstelem - 1), array, count, nulval, sc) catch |e| return abi.fail(&h.diag, e);
+    imgWrite(&view, @fromBackingInt(@intCast(dtype)), @intCast(firstelem - 1), array, count, nulval, sc) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
@@ -676,7 +676,7 @@ pub export fn zf_read_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower:
     const n = fillBounds(naxis, lower, upper, inc, &lo, &hi, &stb) orelse return abi.fail(&h.diag, error.BadDimensions);
     const stride: ?[]const u64 = if (inc != null) stb[0..n] else null;
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
-    sectionDispatch(.read, &view, @enumFromInt(dtype), lo[0..n], hi[0..n], stride, array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
+    sectionDispatch(.read, &view, @fromBackingInt(@intCast(dtype)), lo[0..n], hi[0..n], stride, array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
@@ -692,7 +692,7 @@ pub export fn zf_write_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower
     const n = fillBounds(naxis, lower, upper, inc, &lo, &hi, &stb) orelse return abi.fail(&h.diag, error.BadDimensions);
     const stride: ?[]const u64 = if (inc != null) stb[0..n] else null;
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
-    sectionDispatch(.write, &view, @enumFromInt(dtype), lo[0..n], hi[0..n], stride, array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
+    sectionDispatch(.write, &view, @fromBackingInt(@intCast(dtype)), lo[0..n], hi[0..n], stride, array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
@@ -766,7 +766,7 @@ fn abiSnapshotEntry(snap: *const fits.logical_header.Snapshot, entry: fits.logic
     const name = snapshotArenaRef(snap, entry.keyword);
     const comment: SnapshotArenaRef = if (entry.comment) |c| snapshotArenaRef(snap, c) else .{ .off = 0, .len = 0 };
     var out: ZfHeaderEntryV1 = .{
-        .kind = @intFromEnum(switch (entry.kind) {
+        .kind = @backingInt(switch (entry.kind) {
             .value => abi.HeaderEntryKind.value,
             .commentary => abi.HeaderEntryKind.commentary,
             .blank => abi.HeaderEntryKind.blank,
@@ -784,38 +784,38 @@ fn abiSnapshotEntry(snap: *const fits.logical_header.Snapshot, entry: fits.logic
     };
     switch (entry.value) {
         .none => {
-            out.value_type = @intFromEnum(abi.HeaderValueType.none);
+            out.value_type = @backingInt(abi.HeaderValueType.none);
             const text = snapshotArenaRef(snap, entry.commentary_text);
             out.value_off = text.off;
             out.value_len = text.len;
         },
-        .undefined => out.value_type = @intFromEnum(abi.HeaderValueType.undefined),
+        .undefined => out.value_type = @backingInt(abi.HeaderValueType.undefined),
         .logical => |v| {
-            out.value_type = @intFromEnum(abi.HeaderValueType.logical);
+            out.value_type = @backingInt(abi.HeaderValueType.logical);
             out.int_value = if (v) 1 else 0;
         },
         .int64 => |v| {
-            out.value_type = @intFromEnum(abi.HeaderValueType.int64);
+            out.value_type = @backingInt(abi.HeaderValueType.int64);
             out.int_value = v;
         },
         .integer_text => |v| {
-            out.value_type = @intFromEnum(abi.HeaderValueType.integer_text);
+            out.value_type = @backingInt(abi.HeaderValueType.integer_text);
             const text = snapshotArenaRef(snap, v);
             out.value_off = text.off;
             out.value_len = text.len;
         },
         .float64 => |v| {
-            out.value_type = @intFromEnum(abi.HeaderValueType.float64);
+            out.value_type = @backingInt(abi.HeaderValueType.float64);
             out.float_value = v;
         },
         .string => |v| {
-            out.value_type = @intFromEnum(abi.HeaderValueType.string);
+            out.value_type = @backingInt(abi.HeaderValueType.string);
             const text = snapshotArenaRef(snap, v);
             out.value_off = text.off;
             out.value_len = text.len;
         },
         .raw_token => |v| {
-            out.value_type = @intFromEnum(abi.HeaderValueType.raw_token);
+            out.value_type = @backingInt(abi.HeaderValueType.raw_token);
             const text = snapshotArenaRef(snap, v);
             out.value_off = text.off;
             out.value_len = text.len;
@@ -1461,10 +1461,10 @@ pub export fn zf_table_col_info(t_opt: ?*TableHandle, col: c_int, info: *ZfColIn
             info.width = @intCast(c.tform.fieldBytes() catch 0);
             if (c.tform.type.isVla()) {
                 info.is_vla = 1;
-                info.typecode = @intFromEnum(binTypeCode(c.tform.vla_elem orelse .byte));
+                info.typecode = @backingInt(binTypeCode(c.tform.vla_elem orelse .byte));
                 info.repeat = -1; // variable
             } else {
-                info.typecode = @intFromEnum(binTypeCode(c.tform.type));
+                info.typecode = @backingInt(binTypeCode(c.tform.type));
                 info.repeat = @intCast(c.tform.repeat);
             }
         },
@@ -1474,7 +1474,7 @@ pub export fn zf_table_col_info(t_opt: ?*TableHandle, col: c_int, info: *ZfColIn
             info.tform_char = c.tform.type.toChar();
             info.tscal = c.tscal;
             info.tzero = c.tzero;
-            info.typecode = @intFromEnum(asciiTypeCode(c.tform.type));
+            info.typecode = @backingInt(asciiTypeCode(c.tform.type));
             info.width = @intCast(c.tform.width);
             info.repeat = if (c.tform.type == .char) @intCast(c.tform.width) else 1;
         },
@@ -1596,7 +1596,7 @@ pub export fn zf_read_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstr
     const t = liveTable(t_opt) orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
-    colDispatch(.read, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
+    colDispatch(.read, t, @fromBackingInt(@intCast(dtype)), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -1608,7 +1608,7 @@ pub export fn zf_read_col_strided_v1(t_opt: ?*TableHandle, dtype: c_int, col: c_
     if (nrows < 0 or col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     const dst = dst_opt orelse return abi.failNull();
     const ci = std.math.cast(u16, col) orelse return abi.fail(&t.owner.diag, error.NoSuchColumn);
-    colStridedDispatch(t, @enumFromInt(dtype), ci, @intCast(firstrow - 1), @intCast(nrows), dst[0..dst_len], row_stride, nulval) catch |e| return abi.fail(&t.owner.diag, e);
+    colStridedDispatch(t, @fromBackingInt(@intCast(dtype)), ci, @intCast(firstrow - 1), @intCast(nrows), dst[0..dst_len], row_stride, nulval) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -1635,7 +1635,7 @@ pub export fn zf_write_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, first
     const t = liveTable(t_opt) orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
-    colDispatch(.write, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
+    colDispatch(.write, t, @fromBackingInt(@intCast(dtype)), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -1779,7 +1779,7 @@ pub export fn zf_read_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, ro
     const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or cap < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
-    vlaRead(@enumFromInt(dtype), tbl, @intCast(col), @intCast(row - 1), array, @intCast(cap), out_nelem) catch |e| return abi.fail(&t.owner.diag, e);
+    vlaRead(@fromBackingInt(@intCast(dtype)), tbl, @intCast(col), @intCast(row - 1), array, @intCast(cap), out_nelem) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -1817,7 +1817,7 @@ pub export fn zf_write_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, r
     if (t.mgr == null) {
         t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
     }
-    vlaWrite(@enumFromInt(dtype), tbl, &t.mgr.?, @intCast(col), @intCast(row - 1), array, @intCast(nelem)) catch |e| return abi.fail(&t.owner.diag, e);
+    vlaWrite(@fromBackingInt(@intCast(dtype)), tbl, &t.mgr.?, @intCast(col), @intCast(row - 1), array, @intCast(nelem)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -1965,7 +1965,7 @@ pub export fn zf_read_col_vla_packed(
     if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
     if (cap != 0 and array == null) return abi.failNull();
     const n: usize = std.math.cast(usize, cap) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
-    vlaPackedRead(@enumFromInt(dtype), tbl, @intCast(col), @intCast(firstrow - 1), @intCast(nrows), array, n) catch |e| return abi.fail(&t.owner.diag, e);
+    vlaPackedRead(@fromBackingInt(@intCast(dtype)), tbl, @intCast(col), @intCast(firstrow - 1), @intCast(nrows), array, n) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -2007,14 +2007,14 @@ pub export fn zf_write_col_vla_packed(
     if (nr == 0 and t.mgr == null) {
         var empty_mgr = fits.heap.HeapManager.init(0);
         defer empty_mgr.deinit(gpa);
-        vlaPackedWrite(@enumFromInt(dtype), tbl, &empty_mgr, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
+        vlaPackedWrite(@fromBackingInt(@intCast(dtype)), tbl, &empty_mgr, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
         return 0;
     }
 
     if (t.mgr == null) {
         t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
     }
-    vlaPackedWrite(@enumFromInt(dtype), tbl, &t.mgr.?, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
+    vlaPackedWrite(@fromBackingInt(@intCast(dtype)), tbl, &t.mgr.?, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -2254,7 +2254,7 @@ fn writeCompressedImpl(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_in
         spec.tile = tilebuf[0..nax];
     }
     if (quantize) |q| spec.quantize = @TypeOf(spec.quantize).fromName(std.mem.span(q));
-    writeCompressedDispatch(@enumFromInt(dtype), h, spec, pixels, @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
+    writeCompressedDispatch(@fromBackingInt(@intCast(dtype)), h, spec, pixels, @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 

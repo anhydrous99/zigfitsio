@@ -16,7 +16,7 @@ const PKG_ROOT = resolve(HERE, "..");
 const REPO_ROOT = resolve(PKG_ROOT, "..", "..");
 const zig = process.env.ZIG ?? "zig";
 
-console.log("[wasm] zig build wasm (ReleaseSmall, wasm32-freestanding)");
+console.log("[wasm] zig build wasm (small, wasm32-freestanding)");
 execFileSync(zig, ["build", "wasm"], { cwd: REPO_ROOT, stdio: "inherit" });
 
 const src = join(REPO_ROOT, "zig-out", "bin", "zigfitsio.wasm");

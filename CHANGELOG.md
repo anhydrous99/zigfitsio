@@ -6,7 +6,13 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.2.0] - 2026-10-07
+
 ### Changed
+- **Toolchain**: require Zig 0.17.0; migrate build arguments, array initialization, and
+  compiler reflection while preserving the Zig, C, Python, and TypeScript APIs.
 - **Build**: `zig build` now installs only the static Zig library; the C-ABI shared library
   remains available through `zig build capi`, and the validation CLI through `zig build fitsverify`.
 - **CI / Packaging**: external CFITSIO/Astropy checks run for every CI event and release SHA;
