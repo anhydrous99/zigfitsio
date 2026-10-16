@@ -128,7 +128,7 @@ jobs:
             --out "$RUNNER_TEMP/wiki-check" --tag "$tag" --sha "$GITHUB_SHA" \
             --repository "$GITHUB_REPOSITORY"
           diff -ru "$RUNNER_TEMP/wiki" "$RUNNER_TEMP/wiki-check"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: api-wiki-preview-${{ github.sha }}
           path: ${{ runner.temp }}/wiki
@@ -185,7 +185,7 @@ jobs:
         env:
           # Forward the pin to install_zig.sh inside the manylinux container.
           CIBW_ENVIRONMENT_PASS_LINUX: ZIG_VERSION
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
@@ -218,7 +218,7 @@ jobs:
           "$work/venv/bin/python" -m pip install "$work"/wheels/*.whl pytest astropy
           cd "$work"
           env -u PYTHONPATH -u ZIGFITSIO_LIBRARY "$work/venv/bin/python" -m pytest --installed-package "$work/source/bindings/python/tests" -q
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sdist
           path: dist/*.tar.gz
