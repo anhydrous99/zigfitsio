@@ -181,7 +181,7 @@ jobs:
         shell: bash
         run: echo 'CIBW_BUILD=cp312-*' >> "$GITHUB_ENV"
       - name: Build wheels
-        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299 # v4.3.1
+        uses: pypa/cibuildwheel@f11181315571b24e4a3c67f1a828532793f2df55 # v4.3.2
         env:
           # Forward the pin to install_zig.sh inside the manylinux container.
           CIBW_ENVIRONMENT_PASS_LINUX: ZIG_VERSION
